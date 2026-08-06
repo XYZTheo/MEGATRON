@@ -7,7 +7,10 @@ stateless filter and relay — nothing more.
 
 ## The trust boundary
 
-These are hard rules, enforced by configuration and verified in CI:
+These are hard rules. "Holds DB credentials" is mechanically enforced —
+[`ci/policy_check.py`](../ci/policy_check.py) fails the build if an edge config
+names a database driver or a non-empty `db_url`. The rest are enforced by
+configuration and reviewed by hand.
 
 | | Edge tier | Core tier |
 |---|---|---|
@@ -103,9 +106,17 @@ equivalents used here:
 ## Status
 
 ⚠️ **Neither file has been validated against a running system** — no Linux host
-exists for the project yet. Module names, function signatures and parameters
-were verified against the OpenSIPS 3.6 documentation, but nothing here has been
-loaded by a live binary.
+exists for the project yet ([#2](https://github.com/XYZTheo/MEGATRON/issues/2)).
+Module names, function signatures and parameters were verified against the
+OpenSIPS 3.6 documentation, but nothing here has been loaded by a live binary.
+
+A CI workflow exists to close exactly this gap on GitHub's Linux runners, but
+**it has never executed** — Actions does not currently run in this repository
+([#15](https://github.com/XYZTheo/MEGATRON/issues/15)). So the status above is
+unchanged for now: documentation-reviewed, not machine-verified.
+
+What *does* run today is [`ci/policy_check.py`](../ci/policy_check.py), which
+enforces the credential and Kamailio-name rules locally.
 
 Before first deployment:
 

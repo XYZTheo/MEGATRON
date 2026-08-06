@@ -17,6 +17,14 @@ name: validate
 # Read ci/render_for_check.py for an honest statement of what a green run here
 # does and does not prove. Briefly: it proves the configs are valid, not that
 # the switch works.
+#
+# ⚠️ AS OF 2026-08-06 THIS WORKFLOW HAS NEVER EXECUTED. GitHub Actions does not
+# currently run in this repository — see issue #15. That is an account-level
+# condition and was proven not to be a fault in this file (a minimal
+# hello-world workflow on a clean branch also produced no run). The workflow is
+# believed correct and should start working unchanged once Actions is enabled,
+# but until a run appears, treat every check below as UNVERIFIED rather than
+# passing. Do not cite it as evidence that the configs are valid.
 
 on:
   push:
@@ -81,9 +89,15 @@ jobs:
 
       - name: Install OpenSIPS and the modules the configs load
         # Module-to-package mapping verified against the OpenSIPS Debian
-        # packaging, not guessed. The one that catches people out:
-        # rest_client lives in opensips-restclient-module, NOT in
-        # opensips-http-modules (which is the HTTP transport and MI layer).
+        # packaging, not guessed. Two that catch people out:
+        #   * rest_client is in opensips-restclient-module, NOT in
+        #     opensips-http-modules (that one is the HTTP transport and MI).
+        #   * proto_tls and tls_mgm are different packages. Loading proto_tls
+        #     without tlsmgm gets you a config that fails at startup.
+        # Everything else the configs use (tm, rr, dialog, dispatcher, pike,
+        # ratelimit, cachedb_local, permissions, auth, auth_db, usrloc,
+        # registrar, rtpengine, sipmsgops, textops, uac, mi_fifo, proto_udp,
+        # proto_tcp, topology_hiding) ships in the main opensips package.
         run: |
           set -euo pipefail
           sudo apt-get install -y --no-install-recommends \
@@ -91,7 +105,8 @@ jobs:
             opensips-postgres-module \
             opensips-json-module \
             opensips-restclient-module \
-            opensips-tls-module
+            opensips-tls-module \
+            opensips-tlsmgm-module
           opensips -V
 
       - name: Fail if we did not actually get 3.6
@@ -109,6 +124,30 @@ jobs:
             echo "have validated against the wrong major version."
             exit 1
           fi
+
+      - name: Report any module the configs load but the runner lacks
+        # opensips -C will fail on a missing module, but its message names one
+        # module and stops. This lists every missing one at once and, more
+        # usefully, tells you it is a packaging problem rather than a config
+        # error — those get diagnosed very differently.
+        run: |
+          set -euo pipefail
+          mpath="$(ls -d /usr/lib/*/opensips/modules 2>/dev/null | head -1)"
+          echo "module path: ${mpath}"
+          missing=""
+          for m in $(grep -h '^loadmodule' */opensips/*.cfg \
+                     | sed 's/loadmodule *"//; s/\.so".*//' | sort -u); do
+            if [ ! -f "${mpath}/${m}.so" ]; then
+              missing="${missing} ${m}"
+            fi
+          done
+          if [ -n "${missing}" ]; then
+            echo "::error::modules loaded by the configs but not installed:${missing}"
+            echo "This is a packaging gap in this workflow, not a config error."
+            echo "Find the providing package with: apt-file search <module>.so"
+            exit 1
+          fi
+          echo "all loaded modules are present"
 
       - name: Check every OpenSIPS config in the tree
         # Discovered rather than listed. A tier added later (a second edge

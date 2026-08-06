@@ -120,19 +120,32 @@ and why.
 
 ## Status
 
-⚠️ **Not yet run on a live host.** No lab VPS exists — see issue #2.
+⚠️ **Nothing here has been executed.** Be precise about this, because it is easy
+to look at a repository with a CI workflow in it and assume otherwise.
 
-What *is* verified, on every push, by
-[`.github/workflows/validate.yml`](../.github/workflows/validate.yml):
+| Check | State |
+|---|---|
+| `ci/policy_check.py` structural rules | ✅ **Runs and passes**, locally and on demand |
+| `opensips -C` against real OpenSIPS 3.6 | ❌ **Never run.** Workflow written, but see #15 |
+| `nft -c` on the ruleset | ❌ **Never run.** Same |
+| All three chains are `policy drop` | ❌ **Never run.** Same |
+| A call actually completing | ❌ Needs the lab VPS — #2 |
 
-- the config parses under real OpenSIPS 3.6 (`opensips -C`), with every
-  `loadmodule` resolved against actual module binaries
-- the nftables ruleset parses (`nft -c`) and all three chains are `policy drop`
-- the structural rules in [`ci/policy_check.py`](../ci/policy_check.py) hold
+[`.github/workflows/validate.yml`](../.github/workflows/validate.yml) exists and
+is believed correct, but **GitHub Actions does not currently execute in this
+repository** ([#15](https://github.com/XYZTheo/MEGATRON/issues/15) — an
+account-level condition, proven not to be the workflow file). So the OpenSIPS
+and nftables checks are written but have never produced a result.
 
-What is **not** verified and must not be assumed from a green check: that the
-addresses are right, that routing behaves correctly, that the database schema
-matches, or that a call completes. Those need the VPS and SIPp scenarios.
+The honest summary: the structural rules are genuinely enforced; the claim that
+this config parses under OpenSIPS 3.6 is currently **unverified**, resting on
+documentation review alone.
+
+When Actions is enabled, note what a green run would and would not prove. It
+would prove the config parses, every `loadmodule` resolves against real module
+binaries, and every function exists with that arity. It would **not** prove that
+the addresses are right, that routing behaves correctly, that the database
+schema matches, or that a call completes. Those need the VPS and SIPp scenarios.
 
 Local checks:
 
