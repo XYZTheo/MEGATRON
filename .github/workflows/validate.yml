@@ -110,23 +110,35 @@ jobs:
             exit 1
           fi
 
-      - name: Check the edge config
+      - name: Check every OpenSIPS config in the tree
+        # Discovered rather than listed. A tier added later (a second edge
+        # profile, a class-5 core) is checked the day it lands instead of the
+        # day somebody remembers to add it here — and the job fails if it finds
+        # nothing, so an empty glob can never be mistaken for success.
         run: |
           set -euo pipefail
           mkdir -p /tmp/fifo /tmp/rendered
-          python3 ci/render_for_check.py edge/opensips/opensips.cfg \
-            /tmp/rendered/edge.cfg /tmp/fifo
-          echo "--- opensips -C edge ---"
-          opensips -C -f /tmp/rendered/edge.cfg
-
-      - name: Check the core config
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/fifo /tmp/rendered
-          python3 ci/render_for_check.py core/opensips/opensips.cfg \
-            /tmp/rendered/core.cfg /tmp/fifo
-          echo "--- opensips -C core ---"
-          opensips -C -f /tmp/rendered/core.cfg
+          shopt -s nullglob
+          configs=(*/opensips/*.cfg)
+          if [ ${#configs[@]} -eq 0 ]; then
+            echo "::error::no OpenSIPS configs found — this job would have passed vacuously"
+            exit 1
+          fi
+          echo "found ${#configs[@]} config(s): ${configs[*]}"
+          rc=0
+          for cfg in "${configs[@]}"; do
+            tier="$(echo "${cfg}" | cut -d/ -f1)"
+            echo "::group::opensips -C ${cfg}"
+            python3 ci/render_for_check.py "${cfg}" "/tmp/rendered/${tier}.cfg" /tmp/fifo
+            if opensips -C -f "/tmp/rendered/${tier}.cfg"; then
+              echo "${cfg}: OK"
+            else
+              echo "::error file=${cfg}::opensips -C rejected this config"
+              rc=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $rc
 
   # --------------------------------------------------------------------
   # nftables rulesets. `nft -c` parses and validates without loading.
@@ -140,23 +152,44 @@ jobs:
       - name: Install nftables
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nftables
 
-      - name: Check the edge ruleset
-        run: sudo nft -c -f edge/nftables/megatron-edge.nft
+      - name: Check every nftables ruleset in the tree
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          rulesets=(*/nftables/*.nft)
+          if [ ${#rulesets[@]} -eq 0 ]; then
+            echo "::error::no nftables rulesets found — this job would have passed vacuously"
+            exit 1
+          fi
+          rc=0
+          for rs in "${rulesets[@]}"; do
+            echo "::group::nft -c ${rs}"
+            if sudo nft -c -f "${rs}"; then
+              echo "${rs}: OK"
+            else
+              echo "::error file=${rs}::nft -c rejected this ruleset"
+              rc=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $rc
 
-      - name: Check the core ruleset
-        run: sudo nft -c -f core/nftables/megatron-core.nft
-
-      - name: Assert the core ruleset is default-deny in both directions
+      - name: Assert the core ruleset is default-deny in every direction
         # The core's security claim is that it has no route from the internet.
-        # That claim rests entirely on both the input AND output chains
-        # defaulting to drop. A future edit that relaxes either one would
+        # That claim rests entirely on the input, forward AND output chains
+        # defaulting to drop. A future edit that relaxed any one of them would
         # silently dissolve the guarantee while every other check still
         # passed, so it is asserted explicitly rather than left to review.
         run: |
           set -euo pipefail
+          core=core/nftables/megatron-core.nft
+          if [ ! -f "${core}" ]; then
+            echo "core ruleset not present on this branch — nothing to assert"
+            exit 0
+          fi
           for chain in input forward output; do
-            if ! grep -qE "hook ${chain}[^;]*;\s*policy drop;" core/nftables/megatron-core.nft; then
-              echo "::error::core ${chain} chain is not 'policy drop'."
+            if ! grep -qE "hook ${chain}[^;]*;[[:space:]]*policy drop;" "${core}"; then
+              echo "::error file=${core}::core ${chain} chain is not 'policy drop'."
               echo "ARCHITECTURE.md 4.5b depends on the core being default-deny."
               exit 1
             fi
