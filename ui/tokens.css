@@ -1,0 +1,128 @@
+/* ══════════════════════════════════════════════════════════════════════════
+   MEGATRON DESIGN TOKENS
+   The single source of truth for colour, type and density across the admin
+   console, the customer portal, and the installer's TUI colour choices.
+
+   docs/ARCHITECTURE.md §6.3 requires this file to exist before screens are
+   built. Retrofitting a design system into a shipped product is the same
+   class of mistake as retrofitting the edge/core split into a live switch:
+   possible, expensive, and avoidable by spending an hour now.
+
+   THE GOVERNING RULE
+   ------------------
+   Colour means something here. The chrome is monochrome ink; the only
+   saturated pixels on the screen are traffic, call state and alarms. In a
+   NOC, decorative colour is noise — it trains operators to ignore colour,
+   which is precisely the reflex you do not want at 3am.
+
+   MagnusBilling's ExtJS 6 admin is the thing being answered: everything is
+   chrome and nothing is signal.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* ── Neutrals ───────────────────────────────────────────────────────────
+     Biased slightly blue-green rather than pure grey. A pure mid-grey reads
+     as unconsidered; this is a switchroom cast, and it was chosen. */
+  --mg-ground:      #F5F7F7;   /* page */
+  --mg-raised:      #FFFFFF;   /* panels, tiles */
+  --mg-sunken:      #ECEFEF;   /* row hover, track fills */
+  --mg-line:        #D3DADB;   /* hairline rules — the primary separator */
+  --mg-line-strong: #B7C1C3;   /* tooltip borders, emphasis */
+
+  --mg-ink:         #0F1719;   /* primary text */
+  --mg-ink-muted:   #5B6C74;   /* secondary text */
+  --mg-ink-faint:   #8B9AA0;   /* labels, axes, timestamps */
+
+  /* ── Accent ─────────────────────────────────────────────────────────────
+     Interactive affordances ONLY: links, focus rings, selection. It is
+     deliberately never used to mean "good" or "busy" or "high" — the moment
+     an accent carries state, state stops being readable. */
+  --mg-accent:      #26699F;
+  --mg-accent-soft: #E3EDF5;
+
+  /* ── Chart series ───────────────────────────────────────────────────────
+     Validated, not chosen by eye: OKLCH lightness band, chroma floor,
+     colour-vision-deficiency separation (worst adjacent ΔE 23.0 protan /
+     24.1 normal), and ≥3:1 contrast against the chart surface.
+
+     Re-run before changing either value:
+       python validate_palette.py "#2C7CBF,#9A6614" --mode light  --surface "#F5F7F7"
+       python validate_palette.py "#4A98D8,#B87C2A" --mode dark   --surface "#0E1418"
+
+     Brass rather than red for hostile traffic is a deliberate product
+     statement: absorbed attack volume is routine, not an emergency. Painting
+     it red would contradict the thing the shield is for. */
+  --mg-series-1: #2C7CBF;   /* accepted / legitimate */
+  --mg-series-2: #9A6614;   /* absorbed / hostile */
+
+  /* ── Status ─────────────────────────────────────────────────────────────
+     Reserved. Never reused as a series colour, and never the sole carrier of
+     meaning — every status ships with a label or glyph beside it. */
+  --mg-good:     #127A4E;
+  --mg-warning:  #8A5D00;
+  --mg-critical: #BE302C;
+  --mg-good-bg:     #E2F1E9;
+  --mg-warning-bg:  #F6EEDC;
+  --mg-critical-bg: #F8E5E4;
+
+  /* ── Type ───────────────────────────────────────────────────────────────
+     Two roles. The data face is not a style choice: in telephony almost
+     everything is a code — E.164 numbers, prefixes, SIP response codes,
+     Call-IDs, IP addresses, rates to four decimal places — and codes are
+     read by scanning columns. Every one of them is set in --mg-font-data
+     with tabular figures. */
+  --mg-font-ui:   "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --mg-font-data: ui-monospace, "Cascadia Mono", "SF Mono", "JetBrains Mono", Consolas, "Liberation Mono", monospace;
+
+  --mg-size-label: 10px;    /* uppercase, 0.11em tracking */
+  --mg-size-meta:  11px;
+  --mg-size-body:  14px;
+  --mg-size-data:  12.5px;
+  --mg-size-h2:    13px;
+  --mg-size-stat:  26px;
+
+  /* ── Density & shape ────────────────────────────────────────────────────
+     A carrier console is scanned, not read. Rows are tight, radii are small,
+     and separation is done with hairlines rather than shadows and cards —
+     a stack of floating rounded cards wastes vertical space that belongs to
+     call rows. */
+  --mg-radius: 3px;
+  --mg-gap:    16px;
+  --mg-row-y:  8px;
+  --mg-pad:    15px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --mg-ground: #0E1418; --mg-raised: #151D21; --mg-sunken: #0A0F12;
+    --mg-line: #243036; --mg-line-strong: #33434A;
+    --mg-ink: #E6EDEF; --mg-ink-muted: #8FA0A8; --mg-ink-faint: #6A7A82;
+    --mg-accent: #4A98D8; --mg-accent-soft: #16283A;
+    --mg-series-1: #4A98D8; --mg-series-2: #B87C2A;
+    --mg-good: #48B57F; --mg-warning: #DDA63F; --mg-critical: #E4665F;
+    --mg-good-bg: #12261D; --mg-warning-bg: #2A2113; --mg-critical-bg: #2C1717;
+  }
+}
+
+/* Dark is a designed mode, not an inversion: the steps were re-picked from
+   the same ramps and re-validated against the dark surface. An explicit user
+   choice must beat the OS preference in both directions. */
+:root[data-theme="dark"] {
+  --mg-ground: #0E1418; --mg-raised: #151D21; --mg-sunken: #0A0F12;
+  --mg-line: #243036; --mg-line-strong: #33434A;
+  --mg-ink: #E6EDEF; --mg-ink-muted: #8FA0A8; --mg-ink-faint: #6A7A82;
+  --mg-accent: #4A98D8; --mg-accent-soft: #16283A;
+  --mg-series-1: #4A98D8; --mg-series-2: #B87C2A;
+  --mg-good: #48B57F; --mg-warning: #DDA63F; --mg-critical: #E4665F;
+  --mg-good-bg: #12261D; --mg-warning-bg: #2A2113; --mg-critical-bg: #2C1717;
+}
+
+:root[data-theme="light"] {
+  --mg-ground: #F5F7F7; --mg-raised: #FFFFFF; --mg-sunken: #ECEFEF;
+  --mg-line: #D3DADB; --mg-line-strong: #B7C1C3;
+  --mg-ink: #0F1719; --mg-ink-muted: #5B6C74; --mg-ink-faint: #8B9AA0;
+  --mg-accent: #26699F; --mg-accent-soft: #E3EDF5;
+  --mg-series-1: #2C7CBF; --mg-series-2: #9A6614;
+  --mg-good: #127A4E; --mg-warning: #8A5D00; --mg-critical: #BE302C;
+  --mg-good-bg: #E2F1E9; --mg-warning-bg: #F6EEDC; --mg-critical-bg: #F8E5E4;
+}

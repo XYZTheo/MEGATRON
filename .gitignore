@@ -40,6 +40,12 @@ npm-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# --- Python (ci/ tooling) ---
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
 # --- Databases / data ---
 *.db
 *.mv.db
