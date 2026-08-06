@@ -260,8 +260,20 @@ The **real** JVM risks are different, and each has a mandatory mitigation:
 > per request, you'll see 80 ms p99 and blame the JVM.
 
 **The escape hatch — build this in deliberately.** Keep the authorizer a small
-(~3–5k LOC) single-purpose service behind a strict gRPC/protobuf contract: no shared
-libraries with the Spring app, no JVM-specific serialization on the wire. If load
+(~3–5k LOC) single-purpose service behind a strict contract: no shared
+libraries with the Spring app, no JVM-specific serialization on the wire.
+
+> **Transport correction (2026-08-06).** An earlier draft specified gRPC/protobuf for
+> this boundary. That is **wrong for the SIP hop — OpenSIPS has no gRPC client.** The
+> core calls the authorizer via the `rest_client` module, which speaks **HTTP**, and
+> must do so **asynchronously** (suspending the SIP transaction rather than blocking a
+> worker — non-negotiable, per the budget above). So this boundary is **HTTP/JSON,
+> specified contract-first in `contracts/authorizer.openapi.yaml`**. gRPC remains
+> appropriate for internal service-to-service calls elsewhere. The isolation principle
+> is unchanged, and it is the isolation — not the wire format — that preserves the
+> escape hatch.
+
+If load
 testing says Kotlin can't hold the SLA, rewriting *this one service* in Rust or Go is
 a two-month project, not a platform rewrite. **That optionality is worth more than
 picking "the fastest language" today** — and it's why we're not reaching for Rust now
