@@ -29,9 +29,23 @@
   --mg-line:        #D3DADB;   /* hairline rules — the primary separator */
   --mg-line-strong: #B7C1C3;   /* tooltip borders, emphasis */
 
-  --mg-ink:         #0F1719;   /* primary text */
-  --mg-ink-muted:   #5B6C74;   /* secondary text */
-  --mg-ink-faint:   #8B9AA0;   /* labels, axes, timestamps */
+  /* ── Ink ────────────────────────────────────────────────────────────────
+     Three steps, and every one of them clears WCAG 4.5:1 against the *worst*
+     surface it can land on (--mg-sunken, the row-hover fill). "Faint" here
+     means lower emphasis, carried by size, weight and tracking — it does not
+     mean washed out.
+
+     That is a deliberate correction, not a default. The first cut of this
+     file had --mg-ink-faint at #8B9AA0, which measures 2.70:1 on --mg-ground
+     — and that token carries the 10px axis labels and 11px timestamps, i.e.
+     small text that fails even the 3:1 non-text floor. Raising it forced
+     --mg-ink-muted darker too, to keep a visible step between them
+     (ΔL 0.09 light / 0.10 dark). Hierarchy by lightness *within* the legible
+     range, never by dropping below it — an operator reading a timestamp at
+     3am is the whole use case. Pinned by ui/test_validate_palette.py. */
+  --mg-ink:         #0F1719;   /* primary text            — 15.7:1 on sunken */
+  --mg-ink-muted:   #46545B;   /* secondary text          —  6.8:1 on sunken */
+  --mg-ink-faint:   #5F6D74;   /* labels, axes, timestamps —  4.6:1 on sunken */
 
   /* ── Accent ─────────────────────────────────────────────────────────────
      Interactive affordances ONLY: links, focus rings, selection. It is
@@ -45,9 +59,10 @@
      colour-vision-deficiency separation (worst adjacent ΔE 23.0 protan /
      24.1 normal), and ≥3:1 contrast against the chart surface.
 
-     Re-run before changing either value:
-       python validate_palette.py "#2C7CBF,#9A6614" --mode light  --surface "#F5F7F7"
-       python validate_palette.py "#4A98D8,#B87C2A" --mode dark   --surface "#0E1418"
+     Re-run before changing either value (from the repo root — CI runs these
+     too, so a hex nudged by eye fails the build rather than the operator):
+       python ui/validate_palette.py "#2C7CBF,#9A6614" --mode light --surface "#F5F7F7"
+       python ui/validate_palette.py "#4A98D8,#B87C2A" --mode dark  --surface "#0E1418"
 
      Brass rather than red for hostile traffic is a deliberate product
      statement: absorbed attack volume is routine, not an emergency. Painting
@@ -92,11 +107,29 @@
   --mg-pad:    15px;
 }
 
+/* ── Dark mode ───────────────────────────────────────────────────────────────
+   Dark is a *designed* mode, not an inversion: every step was re-picked from
+   the same ramps and re-validated against the dark surface. The chart series
+   are re-stepped lighter (L 0.658 / 0.634 vs 0.571 / 0.553) because a mark has
+   to out-contrast the surface it sits on, and the surface moved.
+
+   The two blocks below are byte-identical by design, and that is enforced
+   mechanically — ci/policy_check.py rule group THEME-BLOCKS-IN-SYNC fails the
+   build if they drift or if either one misses a token that :root defines.
+   The duplication is unavoidable in plain CSS (the OS-preference case and the
+   explicit-choice case cannot share one rule without light-dark(), which we
+   are not yet willing to require of an operator's browser), so the answer is
+   to make drift impossible rather than to trust review. It was already caught
+   once: the first edit of the ink ladder updated two of the three blocks.
+
+   An explicit user choice beats the OS preference in BOTH directions —
+   hence :not([data-theme="light"]) on the media block, rather than relying on
+   selector specificity to sort it out further down the file. */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --mg-ground: #0E1418; --mg-raised: #151D21; --mg-sunken: #0A0F12;
     --mg-line: #243036; --mg-line-strong: #33434A;
-    --mg-ink: #E6EDEF; --mg-ink-muted: #8FA0A8; --mg-ink-faint: #6A7A82;
+    --mg-ink: #E6EDEF; --mg-ink-muted: #9AABB3; --mg-ink-faint: #7C8C94;
     --mg-accent: #4A98D8; --mg-accent-soft: #16283A;
     --mg-series-1: #4A98D8; --mg-series-2: #B87C2A;
     --mg-good: #48B57F; --mg-warning: #DDA63F; --mg-critical: #E4665F;
@@ -104,23 +137,22 @@
   }
 }
 
-/* Dark is a designed mode, not an inversion: the steps were re-picked from
-   the same ramps and re-validated against the dark surface. An explicit user
-   choice must beat the OS preference in both directions. */
 :root[data-theme="dark"] {
   --mg-ground: #0E1418; --mg-raised: #151D21; --mg-sunken: #0A0F12;
   --mg-line: #243036; --mg-line-strong: #33434A;
-  --mg-ink: #E6EDEF; --mg-ink-muted: #8FA0A8; --mg-ink-faint: #6A7A82;
+  --mg-ink: #E6EDEF; --mg-ink-muted: #9AABB3; --mg-ink-faint: #7C8C94;
   --mg-accent: #4A98D8; --mg-accent-soft: #16283A;
   --mg-series-1: #4A98D8; --mg-series-2: #B87C2A;
   --mg-good: #48B57F; --mg-warning: #DDA63F; --mg-critical: #E4665F;
   --mg-good-bg: #12261D; --mg-warning-bg: #2A2113; --mg-critical-bg: #2C1717;
 }
 
+/* Explicit light. Identical to :root, and re-stated so that toggling back
+   from dark works on a dark-preferring OS. Also checked by the sync rule. */
 :root[data-theme="light"] {
   --mg-ground: #F5F7F7; --mg-raised: #FFFFFF; --mg-sunken: #ECEFEF;
   --mg-line: #D3DADB; --mg-line-strong: #B7C1C3;
-  --mg-ink: #0F1719; --mg-ink-muted: #5B6C74; --mg-ink-faint: #8B9AA0;
+  --mg-ink: #0F1719; --mg-ink-muted: #46545B; --mg-ink-faint: #5F6D74;
   --mg-accent: #26699F; --mg-accent-soft: #E3EDF5;
   --mg-series-1: #2C7CBF; --mg-series-2: #9A6614;
   --mg-good: #127A4E; --mg-warning: #8A5D00; --mg-critical: #BE302C;
