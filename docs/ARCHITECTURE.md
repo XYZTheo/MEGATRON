@@ -400,11 +400,22 @@ Design rule: **cost to reject must be far below cost to send.**
 2. **nftables** — trunk IP allowlists, connection limits, geo-blocking.
 3. **OpenSIPS, pre-transaction** — reject **before** `t_relay`, before any DB lookup,
    before transaction state is allocated. A rejected packet must never cost a malloc.
-   - `secfilter` — User-Agent/domain/header blacklists, SQLi patterns (cheap first pass)
-   - `sanity` — malformed SIP dropped immediately
-   - `pike` + `htable` — per-source rate tracking → auto-expiring in-memory blocklist
-   - `ratelimit` — **cluster-aware** global CPS ceiling; shed load rather than collapse
-   - Scanner fingerprinting — `friendly-scanner`, sipvicious, sipcli dropped silently
+   - `sipmsg_validate()` (`sipmsgops`) — malformed SIP dropped immediately,
+     with per-check flags for SDP body, header format, and Request-URI/From/To
+   - `cachedb_local` — TTL'd in-memory blocklist collections; entries expire on
+     their own so a transient false positive self-heals
+   - `pike` — per-source request density → auto-blocklist
+   - `ratelimit` (SBT algorithm) — global CPS ceiling; shed load rather than
+     collapse. SBT over TAILDROP because TAILDROP resets on an interval boundary
+     and lets clients synchronise into a thundering herd.
+   - Scanner fingerprinting via `textops`/`sipmsgops` User-Agent matching —
+     `friendly-scanner`, sipvicious, sipcli dropped silently
+
+   > **Module-name correction (verified 2026-08-06 against the OpenSIPS 3.6 docs):**
+   > OpenSIPS has **no** `htable`, `sanity`, or `secfilter` module — those are
+   > **Kamailio** names, and they propagate widely through copy-pasted advice.
+   > The mapping is `htable`→`cachedb_local`, `sanity`→`sipmsg_validate()`,
+   > `secfilter`→`textops`/`sipmsgops` matching + `permissions`.
 4. **Never become an amplifier.** Replying to spoofed sources makes us a reflection
    vector *and* doubles our load. **Silently drop** anything already classified hostile.
    Magnus's instinct to politely `403` everything is actively harmful.
