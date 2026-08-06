@@ -1,0 +1,200 @@
+#!/usr/sbin/nft -f
+#
+# MEGATRON — CORE NODE FIREWALL BASELINE
+#
+# ============================================================================
+# THIS FILE IS THE ENFORCEMENT OF THE PROJECT'S STRONGEST SECURITY CLAIM
+# ============================================================================
+# docs/ARCHITECTURE.md section 4.5b says the core has no route from the public
+# internet — that an attacker cannot flood it, scan it, or reach a single one
+# of its ports, "not because we filter well, but because there is no path."
+#
+# That claim is only true if this ruleset is loaded. Everything else in the
+# core tier — the ledger, the tariff data, the authorizer, every tenant's call
+# state — sits behind it.
+#
+# The edge ruleset (../../edge/nftables/megatron-edge.nft) is a rate-limiting
+# problem: it must stay reachable by the whole internet and survive being
+# flooded. This file is the opposite and much simpler problem: almost nothing
+# is allowed to reach this box at all, so the rules are allowlists rather than
+# rate limits, and anything not on an allowlist is dropped without reply.
+#
+# There is deliberately NO rate limiting on the SIP path here. Rate limiting is
+# the edge's job. If hostile volume is arriving at the core, the property this
+# file exists to guarantee has already failed, and shaping it would only hide
+# that. We would rather the counters show it plainly.
+#
+# ============================================================================
+# THE SETS ARE THE INTERFACE
+# ============================================================================
+# As on the edge, the named sets are the contract with the Go node agent and
+# with provisioning. The agent adds and removes elements at runtime; it never
+# rewrites this file.
+#
+#   megatron_edge_v4     edge/shield nodes — the ONLY sources of SIP
+#   megatron_mgmt_v4     management/SSH sources
+#   megatron_core_v4     sibling core nodes (clusterer, replication)
+#
+# Every one of these must contain private addresses only. A public address in
+# megatron_edge_v4 does not "add an edge node" — it dissolves the trust
+# boundary that makes an edge compromise survivable. The setup wizard refuses
+# to write one and the node agent refuses to add one at runtime.
+#
+# ============================================================================
+# STATUS: syntax-checked in CI (.github/workflows/validate.yml) on every push.
+# NOT yet loaded on a live host — see issue #2. Syntax check locally with:
+#   nft -c -f megatron-core.nft
+# ============================================================================
+
+flush ruleset
+
+table inet megatron_core {
+
+    # ------------------------------------------------------------------
+    # Sets. Note what is absent: there is no blocklist.
+    #
+    # A blocklist is a tool for a host that must accept traffic from
+    # sources it cannot enumerate. The core can enumerate every legitimate
+    # source it will ever have, so it uses an allowlist, and an allowlist
+    # makes a blocklist redundant. Nothing here needs to learn what is
+    # hostile — anything not explicitly named already is.
+    # ------------------------------------------------------------------
+
+    set megatron_edge_v4 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        comment "Edge/shield nodes. Private addresses only. Provisioning-managed."
+    }
+
+    set megatron_edge_v6 {
+        type ipv6_addr
+        flags interval
+        auto-merge
+    }
+
+    set megatron_mgmt_v4 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        comment "SSH / management sources. Must never be 0.0.0.0/0."
+    }
+
+    # Sibling core nodes: clusterer, dialog/usrloc replication, and the
+    # Postgres/Redis/ClickHouse cluster traffic.
+    set megatron_core_v4 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        comment "Sibling core nodes. Private addresses only."
+    }
+
+    # ------------------------------------------------------------------
+    # INPUT
+    # ------------------------------------------------------------------
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        ct state invalid counter drop
+        ct state established,related accept
+        iif lo accept
+
+        # ICMP, rate-limited. Useful for path MTU discovery between tiers
+        # and for the agent's own health probing.
+        ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded } limit rate 10/second accept
+        ip6 nexthdr icmpv6 icmpv6 type { echo-request, destination-unreachable, packet-too-big, time-exceeded, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } limit rate 20/second accept
+
+        # --- Management ---
+        ip saddr @megatron_mgmt_v4 tcp dport 22 ct state new limit rate 6/minute counter accept
+
+        # --- SIP from the edge tier, and from nowhere else ---
+        #
+        # This is the whole design in four rules. The core's SIP ports are
+        # reachable from edge nodes only. OpenSIPS re-checks the same thing
+        # with check_source_address() in ../opensips/opensips.cfg — not
+        # because this rule is doubted, but because a firewall
+        # misconfiguration during a provisioning change should degrade to
+        # "calls rejected", never to "core exposed".
+        ip  saddr @megatron_edge_v4 udp dport 5060 counter accept
+        ip  saddr @megatron_edge_v4 tcp dport 5060 counter accept
+        ip6 saddr @megatron_edge_v6 udp dport 5060 counter accept
+        ip6 saddr @megatron_edge_v6 tcp dport 5060 counter accept
+
+        # --- RTP media ---
+        # rtpengine anchors media for calls the edge relayed here. The range
+        # must match rtpengine's own configuration.
+        ip  saddr @megatron_edge_v4 udp dport 10000-20000 counter accept
+        ip6 saddr @megatron_edge_v6 udp dport 10000-20000 counter accept
+
+        # --- Intra-core cluster traffic ---
+        #
+        # Datastores are NOT enumerated port by port here. They bind the
+        # private interface and are reachable only from sibling core nodes;
+        # listing 5432/6379/9000/8123 individually would be a second place
+        # to keep in sync with the deployment, and the first time those
+        # drifted apart we would have either an outage or a hole.
+        ip saddr @megatron_core_v4 counter accept
+
+        # --- Everything else ---
+        # Dropped silently by policy — no ICMP port-unreachable, no TCP
+        # reset. Scanning the core must be indistinguishable from scanning
+        # an address that does not exist.
+        #
+        # This counter is one of the most important signals in the platform.
+        # It should read approximately zero forever. A rising count means
+        # something is reaching the core that has no business doing so, and
+        # that is a page, not a dashboard curiosity.
+        counter comment "unmatched input, dropped silently by policy — must stay near zero"
+    }
+
+    # ------------------------------------------------------------------
+    # FORWARD — a core node is not a router.
+    #
+    # This matters more here than on the edge. If the core could forward,
+    # a compromised edge node could use it as a pivot into the private
+    # network. It cannot.
+    # ------------------------------------------------------------------
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        counter comment "core node does not forward"
+    }
+
+    # ------------------------------------------------------------------
+    # OUTPUT
+    #
+    # Unlike the edge, the core's egress is restricted rather than merely
+    # counted. The edge holds no credentials, so egress filtering there
+    # buys detection. The core holds the ledger, the tariff data and every
+    # tenant's records, so here it buys prevention: it is the control that
+    # turns "an attacker read the database" into "an attacker read the
+    # database and could not get the contents off the box."
+    #
+    # Exfiltration over DNS remains possible if the resolver is permitted;
+    # that is why the resolver is an allowlisted core node rather than a
+    # public one.
+    # ------------------------------------------------------------------
+    chain output {
+        type filter hook output priority filter; policy drop;
+
+        ct state established,related accept
+        oif lo accept
+
+        # To the edge tier: SIP responses and requests toward edge nodes.
+        ip  daddr @megatron_edge_v4 counter accept
+        ip6 daddr @megatron_edge_v6 counter accept
+
+        # To sibling core nodes: cluster and datastore traffic.
+        ip daddr @megatron_core_v4 counter accept
+
+        # ICMP out, for the same reasons as in.
+        ip protocol icmp counter accept
+        ip6 nexthdr icmpv6 counter accept
+
+        # Deliberately absent: a general egress allowance for package
+        # updates. Patching a core node is a maintenance operation with a
+        # human present, not a standing capability of a box that holds the
+        # ledger. Open it for the window, close it after — or better, build
+        # a new node from a current image and retire the old one.
+        counter comment "unmatched output, dropped — core egress is an allowlist"
+    }
+}

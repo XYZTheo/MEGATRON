@@ -1,0 +1,184 @@
+name: validate
+
+# WHY THIS WORKFLOW EXISTS
+#
+# Until now nothing in this repository had ever been executed. The OpenSIPS
+# configs and nftables rulesets were written against documentation, on a
+# Windows box, with no Linux host available — issue #2 is still open and the
+# lab VPS is still unprovisioned.
+#
+# GitHub's runners are Linux. That means the two things most likely to be
+# wrong — a module that does not exist in OpenSIPS 3.6, and an nftables rule
+# that does not parse — can be checked today, on every push, without waiting
+# for the VPS. The project's own notes record that the Kamailio/OpenSIPS module
+# trap already cost real time once; this is the gate that makes it cost
+# nothing the second time.
+#
+# Read ci/render_for_check.py for an honest statement of what a green run here
+# does and does not prove. Briefly: it proves the configs are valid, not that
+# the switch works.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  # --------------------------------------------------------------------
+  # Structural rules from CONTRIBUTING.md. Dependency-free and fast, so it
+  # runs first and gives the clearest failure message.
+  # --------------------------------------------------------------------
+  policy:
+    name: policy gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prove the gate can fail
+        # Runs the gate's own tests before trusting its verdict. A gate that
+        # has only ever been seen passing is indistinguishable from a broken
+        # one, and this project does not ship security controls on faith.
+        run: python3 ci/test_policy_check.py
+
+      - name: Check the repository
+        run: python3 ci/policy_check.py
+
+  # --------------------------------------------------------------------
+  # The one that matters most: real OpenSIPS 3.6, real module binaries.
+  # --------------------------------------------------------------------
+  sip-config:
+    name: opensips -C
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add the OpenSIPS 3.6 apt repository
+        # Pinned to the 3.6-releases component deliberately. 3.6 is the LTS
+        # line (support to 2028-05) that ARCHITECTURE.md section 4.2 commits
+        # to; 4.0 is not LTS and carries the largest core rewrite in the
+        # project's history. Validating against 4.0 would tell us nothing
+        # about what we intend to run.
+        run: |
+          set -euo pipefail
+          sudo install -d -m 0755 /usr/share/keyrings
+          curl -fsSL https://apt.opensips.org/opensips-org.gpg \
+            -o /tmp/opensips-org.gpg
+          # The published key has been distributed both armoured and binary at
+          # different times. Normalise rather than assume.
+          if grep -q "BEGIN PGP PUBLIC KEY BLOCK" /tmp/opensips-org.gpg; then
+            sudo gpg --dearmor -o /usr/share/keyrings/opensips-org.gpg /tmp/opensips-org.gpg
+          else
+            sudo cp /tmp/opensips-org.gpg /usr/share/keyrings/opensips-org.gpg
+          fi
+          echo "deb [signed-by=/usr/share/keyrings/opensips-org.gpg] https://apt.opensips.org noble 3.6-releases" \
+            | sudo tee /etc/apt/sources.list.d/opensips.list
+          sudo apt-get update
+
+      - name: Install OpenSIPS and the modules the configs load
+        # Module-to-package mapping verified against the OpenSIPS Debian
+        # packaging, not guessed. The one that catches people out:
+        # rest_client lives in opensips-restclient-module, NOT in
+        # opensips-http-modules (which is the HTTP transport and MI layer).
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends \
+            opensips \
+            opensips-postgres-module \
+            opensips-json-module \
+            opensips-restclient-module \
+            opensips-tls-module
+          opensips -V
+
+      - name: Fail if we did not actually get 3.6
+        # Ubuntu ships its own much older opensips package. If the apt repo
+        # step silently did not take effect, apt would install that instead
+        # and this whole job would validate the configs against the wrong
+        # major version while reporting success.
+        run: |
+          set -euo pipefail
+          version="$(opensips -V | grep -oE 'opensips [0-9]+\.[0-9]+' | head -1 | awk '{print $2}')"
+          echo "detected OpenSIPS ${version}"
+          if [ "${version}" != "3.6" ]; then
+            echo "::error::expected OpenSIPS 3.6 from apt.opensips.org, got ${version}."
+            echo "The apt repository step did not take effect, so this check would"
+            echo "have validated against the wrong major version."
+            exit 1
+          fi
+
+      - name: Check the edge config
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/fifo /tmp/rendered
+          python3 ci/render_for_check.py edge/opensips/opensips.cfg \
+            /tmp/rendered/edge.cfg /tmp/fifo
+          echo "--- opensips -C edge ---"
+          opensips -C -f /tmp/rendered/edge.cfg
+
+      - name: Check the core config
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/fifo /tmp/rendered
+          python3 ci/render_for_check.py core/opensips/opensips.cfg \
+            /tmp/rendered/core.cfg /tmp/fifo
+          echo "--- opensips -C core ---"
+          opensips -C -f /tmp/rendered/core.cfg
+
+  # --------------------------------------------------------------------
+  # nftables rulesets. `nft -c` parses and validates without loading.
+  # --------------------------------------------------------------------
+  firewall:
+    name: nft -c
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nftables
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nftables
+
+      - name: Check the edge ruleset
+        run: sudo nft -c -f edge/nftables/megatron-edge.nft
+
+      - name: Check the core ruleset
+        run: sudo nft -c -f core/nftables/megatron-core.nft
+
+      - name: Assert the core ruleset is default-deny in both directions
+        # The core's security claim is that it has no route from the internet.
+        # That claim rests entirely on both the input AND output chains
+        # defaulting to drop. A future edit that relaxes either one would
+        # silently dissolve the guarantee while every other check still
+        # passed, so it is asserted explicitly rather than left to review.
+        run: |
+          set -euo pipefail
+          for chain in input forward output; do
+            if ! grep -qE "hook ${chain}[^;]*;\s*policy drop;" core/nftables/megatron-core.nft; then
+              echo "::error::core ${chain} chain is not 'policy drop'."
+              echo "ARCHITECTURE.md 4.5b depends on the core being default-deny."
+              exit 1
+            fi
+            echo "core ${chain}: policy drop — ok"
+          done
+
+  # --------------------------------------------------------------------
+  # The authorizer contract is the SIP/money boundary. If it stops being a
+  # valid OpenAPI document, every generated client downstream breaks.
+  # --------------------------------------------------------------------
+  contract:
+    name: authorizer contract
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the validator
+        run: pip install --quiet openapi-spec-validator==0.7.1
+
+      - name: Validate contracts/authorizer.openapi.yaml
+        run: python3 -m openapi_spec_validator contracts/authorizer.openapi.yaml
