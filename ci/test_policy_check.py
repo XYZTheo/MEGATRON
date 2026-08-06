@@ -211,6 +211,178 @@ class PolicyGateTest(unittest.TestCase):
         self.assertIn("LICENCE", r.stdout)
         self.assertIn("no scanner", r.stdout)
 
+    # -- THEME-SYNC and PALETTE --------------------------------------------
+    #
+    # These two guard ui/tokens.css. Both rules exist because of mistakes
+    # already made in this repository, not because of a style preference:
+    # --mg-ink-faint shipped at 2.70:1 against --mg-ground, and the commit
+    # that fixed it updated two of the three theme blocks.
+
+    # A correct tokens.css in the same shape as the real one: four blocks, the
+    # dark palette written twice. Every block is substitutable so a test can
+    # mutate exactly one and nothing else -- which is the whole point, since
+    # the bug being guarded against is one block differing from the others.
+    GOOD_TOKENS = """:root {
+%(root)s  --mg-radius: 3px;
+  --mg-font-ui: system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+%(dark1)s  }
+}
+:root[data-theme="dark"] {
+%(dark2)s}
+:root[data-theme="light"] {
+%(light)s}
+"""
+
+    DARK_BODY = """  --mg-ground: #0E1418; --mg-raised: #151D21; --mg-sunken: #0A0F12;
+  --mg-ink: #E6EDEF; --mg-ink-muted: #9AABB3; --mg-ink-faint: #7C8C94;
+  --mg-accent: #4A98D8;
+  --mg-series-1: #4A98D8; --mg-series-2: #B87C2A;
+  --mg-good: #48B57F; --mg-warning: #DDA63F; --mg-critical: #E4665F;
+  --mg-good-bg: #12261D; --mg-warning-bg: #2A2113; --mg-critical-bg: #2C1717;
+"""
+
+    LIGHT_BODY = """  --mg-ground: #F5F7F7; --mg-raised: #FFFFFF; --mg-sunken: #ECEFEF;
+  --mg-ink: #0F1719; --mg-ink-muted: #46545B; --mg-ink-faint: #5F6D74;
+  --mg-accent: #26699F;
+  --mg-series-1: #2C7CBF; --mg-series-2: #9A6614;
+  --mg-good: #127A4E; --mg-warning: #8A5D00; --mg-critical: #BE302C;
+  --mg-good-bg: #E2F1E9; --mg-warning-bg: #F6EEDC; --mg-critical-bg: #F8E5E4;
+"""
+
+    def tokens(self, *, root: str | None = None, dark1: str | None = None,
+               dark2: str | None = None, light: str | None = None,
+               light_all: str | None = None, dark_all: str | None = None) -> str:
+        """Build a tokens.css. light_all/dark_all change every block of that
+        mode at once (an intentional palette change); the per-block arguments
+        change exactly one (a drift bug)."""
+        light_body = light_all if light_all is not None else self.LIGHT_BODY
+        dark_body = dark_all if dark_all is not None else self.DARK_BODY
+        return self.GOOD_TOKENS % {
+            "root": root if root is not None else light_body,
+            "dark1": dark1 if dark1 is not None else dark_body,
+            "dark2": dark2 if dark2 is not None else dark_body,
+            "light": light if light is not None else light_body,
+        }
+
+    def with_tokens(self, css: str) -> subprocess.CompletedProcess[str]:
+        fx = self.fixture()
+        fx.write("ui/tokens.css", css)
+        return fx.run()
+
+    def test_correct_tokens_file_passes(self) -> None:
+        r = self.with_tokens(self.tokens())
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn("THEME-SYNC", r.stdout)
+        self.assertNotIn("PALETTE", r.stdout.split("note:")[0])
+
+    def test_palette_rule_actually_runs_on_the_fixture(self) -> None:
+        """Guards the guard. If the validator failed to import, or the CSS
+        parser found nothing, every other test in this section would pass
+        vacuously -- the exact failure mode these tests exist to prevent."""
+        r = self.with_tokens(self.tokens())
+        self.assertIn("chart series pass the categorical checks", r.stdout)
+
+    def test_theme_block_drift_is_rejected(self) -> None:
+        """The mistake that actually happened: one theme block updated, the
+        others left stale."""
+        stale = self.DARK_BODY.replace("--mg-ink-faint: #7C8C94", "--mg-ink-faint: #6A7A82")
+        r = self.with_tokens(self.tokens(dark1=stale))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("THEME-SYNC", r.stdout)
+        self.assertIn("--mg-ink-faint", r.stdout)
+
+    def test_explicit_light_diverging_from_root_is_rejected(self) -> None:
+        drifted = self.LIGHT_BODY.replace("--mg-accent: #26699F", "--mg-accent: #1A4E7A")
+        r = self.with_tokens(self.tokens(light=drifted))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("THEME-SYNC", r.stdout)
+
+    def test_missing_token_in_a_theme_block_is_rejected(self) -> None:
+        """A token omitted from a theme block keeps the other theme's value --
+        white-on-white, and only in one of the two dark code paths."""
+        short = self.DARK_BODY.replace("--mg-ink-faint: #7C8C94;", "")
+        r = self.with_tokens(self.tokens(dark_all=short))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("THEME-SYNC", r.stdout)
+        self.assertIn("--mg-ink-faint", r.stdout)
+
+    def test_missing_theme_block_is_rejected(self) -> None:
+        css = self.tokens()
+        css = css[:css.index(':root[data-theme="light"]')]
+        r = self.with_tokens(css)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("THEME-SYNC", r.stdout)
+
+    def test_illegible_ink_is_rejected(self) -> None:
+        """The original --mg-ink-faint, restored as a fixture: 2.70:1 against
+        --mg-ground while carrying 10px axis labels. Applied to every light
+        block, so THEME-SYNC stays quiet and this can only be PALETTE firing."""
+        bad = self.LIGHT_BODY.replace("--mg-ink-faint: #5F6D74", "--mg-ink-faint: #8B9AA0")
+        r = self.with_tokens(self.tokens(light_all=bad))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("PALETTE", r.stdout)
+        self.assertIn("--mg-ink-faint", r.stdout)
+        self.assertNotIn("THEME-SYNC", r.stdout)
+
+    def test_colour_blind_series_collapse_is_rejected(self) -> None:
+        """Red vs green as the two series: the pair a human picks by instinct
+        and the pair a protanope cannot separate. On the shield dashboard that
+        is exactly the difference between accepted and absorbed traffic."""
+        bad = self.LIGHT_BODY.replace("--mg-series-1: #2C7CBF; --mg-series-2: #9A6614",
+                                      "--mg-series-1: #C0392B; --mg-series-2: #2E8B57")
+        r = self.with_tokens(self.tokens(light_all=bad))
+        self.assertIn("PALETTE", r.stdout)
+        self.assertIn("CVD separation", r.stdout)
+        self.assertNotIn("THEME-SYNC", r.stdout)
+
+    def test_series_wearing_a_status_colour_is_rejected(self) -> None:
+        bad = self.LIGHT_BODY.replace("--mg-series-2: #9A6614", "--mg-series-2: #BE302C")
+        r = self.with_tokens(self.tokens(light_all=bad))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("PALETTE", r.stdout)
+        self.assertIn("impersonates an alarm", r.stdout)
+
+    def test_absent_tokens_file_is_a_note_not_a_failure(self) -> None:
+        """Most of the repository has no UI. The rule must stay quiet there
+        rather than failing every tree that has not grown a design system."""
+        fx = self.fixture()
+        fx.write("edge/opensips/opensips.cfg", "route { drop; }\n")
+        r = fx.run()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("not exercised", r.stdout)
+
+    # -- the CSS parser itself ---------------------------------------------
+
+    def test_parser_ignores_declarations_inside_comments(self) -> None:
+        sys.path.insert(0, str(GATE.parent))
+        try:
+            import policy_check
+        finally:
+            sys.path.pop(0)
+        blocks = policy_check.parse_css_tokens(
+            ":root {\n"
+            "  /* --mg-ink: #BADBAD; a comment describing the token */\n"
+            "  --mg-ink: #0F1719;\n"
+            "}\n")
+        self.assertEqual(blocks[":root"], {"--mg-ink": "#0F1719"})
+
+    def test_parser_reads_the_inner_block_of_an_at_rule(self) -> None:
+        sys.path.insert(0, str(GATE.parent))
+        try:
+            import policy_check
+        finally:
+            sys.path.pop(0)
+        blocks = policy_check.parse_css_tokens(
+            '@media (prefers-color-scheme: dark) {\n'
+            '  :root:not([data-theme="light"]) { --mg-ink: #E6EDEF; }\n'
+            '}\n')
+        self.assertIn(':root:not([data-theme="light"])', blocks)
+        self.assertEqual(blocks[':root:not([data-theme="light"])'],
+                         {"--mg-ink": "#E6EDEF"})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

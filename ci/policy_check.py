@@ -22,6 +22,10 @@ incumbent platforms failed, or to a mistake this project has already made once:
   NO-SHELL-OUT     CVE-2023-30258 was one exec() with a concatenated string.
   MONEY-NOT-FLOAT  Money is integer micro-units. Never a float.
   LICENCE          No GPL/AGPL code linked into a MEGATRON binary.
+  THEME-SYNC       tokens.css repeats its palette across three theme blocks,
+                   and an edit has already updated only two of them.
+  PALETTE          The colours an operator reads during an attack must clear
+                   the contrast and colour-vision floors. Measured, not judged.
 
 Exit code 0 = clean, 1 = at least one violation.
 """
@@ -382,6 +386,252 @@ def check_licence(f: Findings) -> None:
 
 
 # ---------------------------------------------------------------------------
+# THEME-SYNC and PALETTE
+#
+# ui/tokens.css declares its colour palette three times: once for light, once
+# for the OS dark preference, once for an explicit dark choice. Plain CSS
+# offers no way to share one declaration between the last two without
+# light-dark(), which we are not yet willing to require of an operator's
+# browser. So the duplication stays and the drift is made impossible instead.
+#
+# This is not hypothetical. The commit that fixed the ink ladder updated two
+# of the three blocks and left the third stale; the file looked fine in review.
+#
+# PALETTE then measures what those blocks actually say. The dashboard's whole
+# job is to be readable by a tired operator at 3am during an attack, quite
+# possibly one of the ~8% of men with a colour-vision deficiency. That is a
+# measurable property, so it gets measured rather than admired.
+# ---------------------------------------------------------------------------
+
+TOKENS_CSS = "ui/tokens.css"
+
+CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
+CSS_BLOCK_RE = re.compile(r"([^{}]+)\{([^{}]*)\}", re.S)
+CSS_DECL_RE = re.compile(r"(--[\w-]+)\s*:\s*([^;]+?)\s*(?:;|$)")
+HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+# The three blocks that must agree, keyed by the normalised selector. The
+# @media wrapper is not part of the selector — the block regex below skips
+# any construct whose body is another block, which is exactly the at-rule.
+BASE_SELECTOR = ":root"
+DARK_SELECTORS = (':root:not([data-theme="light"])', ':root[data-theme="dark"]')
+LIGHT_SELECTOR = ':root[data-theme="light"]'
+
+
+def parse_css_tokens(text: str) -> dict[str, dict[str, str]]:
+    """Return {selector: {token: value}} for every block that declares --mg-*.
+
+    Deliberately a small hand-rolled parser rather than a dependency: this gate
+    is stdlib-only on purpose (see the module docstring), and the subset of CSS
+    tokens.css uses is a flat list of custom properties.
+    """
+    text = CSS_COMMENT_RE.sub("", text)
+    blocks: dict[str, dict[str, str]] = {}
+    for selector, body in CSS_BLOCK_RE.findall(text):
+        decls = dict(CSS_DECL_RE.findall(body))
+        if not decls:
+            continue
+        key = " ".join(selector.split())
+        # A selector list or repeated block merges rather than overwrites, so a
+        # split declaration cannot hide half the tokens from the sync check.
+        blocks.setdefault(key, {}).update(decls)
+    return blocks
+
+
+def check_theme_blocks_in_sync(f: Findings) -> None:
+    path = REPO / TOKENS_CSS
+    if not path.is_file():
+        f.note(f"no {TOKENS_CSS} yet — THEME-SYNC and PALETTE not exercised")
+        return
+
+    blocks = parse_css_tokens(path.read_text(encoding="utf-8"))
+    base = blocks.get(BASE_SELECTOR)
+    if not base:
+        f.fail("THEME-SYNC", path, None,
+               f"no '{BASE_SELECTOR}' block declaring --mg-* tokens was found")
+        return
+
+    # Colour tokens are the ones a theme must restate. Type and density are
+    # mode-invariant by design and are declared once.
+    colour_tokens = {name for name, value in base.items() if HEX_RE.match(value)}
+    if not colour_tokens:
+        f.fail("THEME-SYNC", path, None, f"'{BASE_SELECTOR}' declares no colour tokens")
+        return
+
+    for selector in (*DARK_SELECTORS, LIGHT_SELECTOR):
+        block = blocks.get(selector)
+        if block is None:
+            f.fail("THEME-SYNC", path, None,
+                   f"missing theme block '{selector}'. Every theme must restate every "
+                   f"colour token, or a token silently inherits the wrong mode's value.")
+            continue
+        missing = sorted(colour_tokens - set(block))
+        if missing:
+            f.fail("THEME-SYNC", path, None,
+                   f"'{selector}' omits {', '.join(missing)} — those tokens would keep "
+                   f"the other theme's value")
+        extra = sorted(set(block) - colour_tokens)
+        if extra:
+            f.fail("THEME-SYNC", path, None,
+                   f"'{selector}' declares {', '.join(extra)}, which {BASE_SELECTOR} does "
+                   f"not declare as a colour. Type and density are mode-invariant; if that "
+                   f"is genuinely changing, change this rule deliberately.")
+
+    # The two dark blocks are the same palette written twice. Byte-identical
+    # values, or the OS-preference path and the explicit-toggle path render
+    # differently and only one of them ever gets looked at.
+    dark_a, dark_b = (blocks.get(s) or {} for s in DARK_SELECTORS)
+    if dark_a and dark_b:
+        for token in sorted(set(dark_a) & set(dark_b)):
+            if dark_a[token].lower() != dark_b[token].lower():
+                f.fail("THEME-SYNC", path, None,
+                       f"{token} is {dark_a[token]} in '{DARK_SELECTORS[0]}' but "
+                       f"{dark_b[token]} in '{DARK_SELECTORS[1]}'. The OS-preference and "
+                       f"explicit-choice dark paths must be the same palette.")
+
+    # ...and the explicit light block must match :root for the same reason.
+    light = blocks.get(LIGHT_SELECTOR) or {}
+    for token in sorted(colour_tokens & set(light)):
+        if base[token].lower() != light[token].lower():
+            f.fail("THEME-SYNC", path, None,
+                   f"{token} is {base[token]} in '{BASE_SELECTOR}' but {light[token]} in "
+                   f"'{LIGHT_SELECTOR}'. Toggling to light must return the default theme.")
+
+
+# Surfaces a token can land on, worst-case first. Ink is checked against all
+# three: measuring only against --mg-raised is how --mg-ink-faint originally
+# shipped at 2.70:1 on --mg-ground.
+SURFACE_TOKENS = ("--mg-ground", "--mg-raised", "--mg-sunken")
+INK_TOKENS = ("--mg-ink", "--mg-ink-muted", "--mg-ink-faint")
+STATUS_PAIRS = (("--mg-good", "--mg-good-bg"),
+                ("--mg-warning", "--mg-warning-bg"),
+                ("--mg-critical", "--mg-critical-bg"))
+SERIES_RE = re.compile(r"^--mg-series-(\d+)$")
+
+TEXT_CONTRAST_MIN = 4.5   # WCAG AA, small text. Every ink step carries small text.
+NONTEXT_CONTRAST_MIN = 3.0  # focus rings, link underlines, chart marks
+
+
+def load_validator():
+    """Import ui/validate_palette.py as the colour-maths library.
+
+    Resolved against the tree under test first, then against this gate's own
+    checkout. The fallback matters: ci/test_policy_check.py points the gate at
+    fixture trees that contain a tokens.css but no ui/ tooling, and without it
+    every fixture would fail for the wrong reason and mask the rule it is
+    actually testing.
+    """
+    import importlib.util
+
+    for base in (REPO / "ui", Path(__file__).resolve().parent.parent / "ui"):
+        candidate = base / "validate_palette.py"
+        if not candidate.is_file():
+            continue
+        spec = importlib.util.spec_from_file_location("megatron_validate_palette", candidate)
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    return None
+
+
+def check_palette(f: Findings) -> None:
+    path = REPO / TOKENS_CSS
+    if not path.is_file():
+        return  # already noted by THEME-SYNC
+
+    vp = load_validator()
+    if vp is None:
+        f.fail("PALETTE", path, None,
+               "ui/validate_palette.py is missing, so the palette claims in tokens.css "
+               "cannot be checked. Restore it rather than dropping the rule — a colour "
+               "gate that silently stops running is worse than no colour gate.")
+        return
+
+    blocks = parse_css_tokens(path.read_text(encoding="utf-8"))
+    modes = {"light": blocks.get(BASE_SELECTOR) or {},
+             "dark": blocks.get(DARK_SELECTORS[1]) or {}}
+
+    for mode, tokens in modes.items():
+        if not tokens:
+            continue
+        surfaces = [(t, tokens[t]) for t in SURFACE_TOKENS if HEX_RE.match(tokens.get(t, ""))]
+        if not surfaces:
+            f.fail("PALETTE", path, None, f"{mode}: no surface tokens to measure against")
+            continue
+
+        # Ink carries 10px labels and 11px timestamps — small text on every
+        # surface it can land on, so 4.5:1 on every surface. "Faint" is
+        # carried by size, weight and tracking, never by going illegible.
+        for token in INK_TOKENS:
+            value = tokens.get(token)
+            if not value or not HEX_RE.match(value):
+                continue
+            for surface_name, surface in surfaces:
+                ratio = vp.contrast(value, surface)
+                if ratio < TEXT_CONTRAST_MIN:
+                    f.fail("PALETTE", path, None,
+                           f"{mode}: {token} ({value}) is {ratio:.2f}:1 on {surface_name} "
+                           f"({surface}), below the {TEXT_CONTRAST_MIN}:1 floor for the "
+                           f"small text it carries")
+
+        accent = tokens.get("--mg-accent", "")
+        if HEX_RE.match(accent):
+            for surface_name, surface in surfaces:
+                ratio = vp.contrast(accent, surface)
+                if ratio < NONTEXT_CONTRAST_MIN:
+                    f.fail("PALETTE", path, None,
+                           f"{mode}: --mg-accent ({accent}) is {ratio:.2f}:1 on "
+                           f"{surface_name}, below the {NONTEXT_CONTRAST_MIN}:1 floor for "
+                           f"focus rings")
+
+        # Status text sits on its own tinted background and is read under
+        # pressure. Same small-text floor.
+        for fg_token, bg_token in STATUS_PAIRS:
+            fg, bg = tokens.get(fg_token, ""), tokens.get(bg_token, "")
+            if not (HEX_RE.match(fg) and HEX_RE.match(bg)):
+                continue
+            ratio = vp.contrast(fg, bg)
+            if ratio < TEXT_CONTRAST_MIN:
+                f.fail("PALETTE", path, None,
+                       f"{mode}: {fg_token} ({fg}) on {bg_token} ({bg}) is {ratio:.2f}:1, "
+                       f"below the {TEXT_CONTRAST_MIN}:1 floor")
+
+        # Chart series: the full categorical battery, against the chart
+        # surface. --mg-ground is what the panels sit on.
+        series = [tokens[name] for name in
+                  sorted((n for n in tokens if SERIES_RE.match(n)),
+                         key=lambda n: int(SERIES_RE.match(n).group(1)))
+                  if HEX_RE.match(tokens[name])]
+        if not series:
+            f.note(f"{mode}: no --mg-series-* tokens — categorical checks not exercised")
+            continue
+        surface = tokens.get("--mg-ground", "")
+        report, ok = vp.validate(series, mode, surface)
+        for name, state, detail in report:
+            if state is False or state == "fail":
+                f.fail("PALETTE", path, None, f"{mode}: series {name} — {detail}")
+            elif state in ("floor", "relief"):
+                # Both WARN bands are legal only alongside secondary encoding
+                # (direct labels, gaps, texture, or a table view). Surfaced so
+                # the obligation is visible rather than assumed.
+                f.note(f"{mode}: series {name} — {detail} [requires secondary encoding]")
+        if ok:
+            f.note(f"{mode}: {len(series)} chart series pass the categorical checks "
+                   f"against {surface}")
+
+    # A status colour that equals a series colour makes an alarm look like data.
+    for mode, tokens in modes.items():
+        status = {tokens.get(t, "").lower() for pair in STATUS_PAIRS for t in pair}
+        for name in sorted(n for n in tokens if SERIES_RE.match(n)):
+            if tokens[name].lower() in status:
+                f.fail("PALETTE", path, None,
+                       f"{mode}: {name} ({tokens[name]}) is also a status colour. Status is "
+                       f"reserved — a series wearing it impersonates an alarm.")
+
+
+# ---------------------------------------------------------------------------
 
 CHECKS = (
     check_kamailio_names,
@@ -390,6 +640,8 @@ CHECKS = (
     check_route_targets,
     check_source_rules,
     check_licence,
+    check_theme_blocks_in_sync,
+    check_palette,
 )
 
 
