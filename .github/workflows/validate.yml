@@ -281,11 +281,11 @@ jobs:
           done
 
   # --------------------------------------------------------------------
-  # The authorizer contract is the SIP/money boundary. If it stops being a
-  # valid OpenAPI document, every generated client downstream breaks.
+  # The contracts are the interfaces everything else is generated from. If
+  # one stops being a valid OpenAPI document, every downstream client breaks.
   # --------------------------------------------------------------------
   contract:
-    name: authorizer contract
+    name: contracts
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -297,5 +297,27 @@ jobs:
       - name: Install the validator
         run: pip install --quiet openapi-spec-validator==0.7.1
 
-      - name: Validate contracts/authorizer.openapi.yaml
-        run: python3 -m openapi_spec_validator contracts/authorizer.openapi.yaml
+      - name: Validate every contract in the tree
+        # Discovered rather than listed, for the same reason the OpenSIPS job
+        # is: a contract added later gets checked the day it lands instead of
+        # the day somebody remembers to add it here. Fails on an empty glob so
+        # a rename can never be mistaken for success.
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          specs=(contracts/*.openapi.yaml)
+          if [ ${#specs[@]} -eq 0 ]; then
+            echo "::error::no contracts found — this job would have passed vacuously"
+            exit 1
+          fi
+          echo "found ${#specs[@]} contract(s): ${specs[*]}"
+          rc=0
+          for spec in "${specs[@]}"; do
+            if python3 -m openapi_spec_validator "${spec}"; then
+              echo "${spec}: OK"
+            else
+              echo "::error file=${spec}::not a valid OpenAPI document"
+              rc=1
+            fi
+          done
+          exit $rc
