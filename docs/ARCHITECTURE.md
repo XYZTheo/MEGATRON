@@ -267,6 +267,71 @@ a two-month project, not a platform rewrite. **That optionality is worth more th
 picking "the fastest language" today** — and it's why we're not reaching for Rust now
 (its SIP crates — EZK, rsipstack, rvoip — are all pre-1.0 regardless).
 
+### 4.5b Edge/core isolation — the shield tier as its own machine
+
+Seth, 2026-08-06: *"use another server as a shield to absorb the attack, isolating the
+main interface from the client facing side so attacks would be impossible."*
+
+**This is correct, and it is the single most important structural decision in the
+resilience design.** Upgrading it from "tiers" to "separate machines, separate trust
+domains" throughout.
+
+**What it genuinely makes impossible.** The core — rating engine, PostgreSQL ledger,
+ClickHouse, provisioning API, other customers' call state — binds to a private
+interface and accepts traffic **only from known edge node IPs**, enforced at nftables.
+It has **no route from the public internet at all**. An attacker cannot flood it,
+scan it, or reach a single one of its ports, because there is no path. That part is not
+mitigation — it is genuine unreachability, and it is exactly what Seth described.
+
+This is also why the licence-driven design (§3) pays off twice: the edge holds **no
+database credential** and its only capability is asking the authorizer a narrow
+question. So even a *fully compromised* edge node yields no tariff data, no PII, no
+ledger access — and can be destroyed and reprovisioned in minutes because it is
+stateless.
+
+**The one caveat, stated honestly.** The shield must remain reachable by real customers
+and carriers — and anything reachable by customers is reachable by attackers. So the
+shield tier itself can still be flooded. What the split buys is **blast-radius
+containment, not immunity**:
+
+- The core survives untouched — no billing corruption, no data at risk, no cascading
+  failure.
+- Calls already established keep flowing (media is anchored at rtpengine, not the
+  signalling edge).
+- Customers homed on *other* edge nodes are completely unaffected.
+- A drowned edge is **cattle** — stateless, so we reprovision or shift its IP rather
+  than debug it under fire.
+
+That is the difference between "one operator has a bad hour" and "the whole platform
+and every customer's billing goes down," which is precisely what happens to Magnus.
+
+**The resulting topology:**
+
+| Tier | Reachability | Holds |
+|---|---|---|
+| **Honeypot nodes** | Public, unused IPs | Nothing. Pure sensor (§5.3). |
+| **Shield / edge nodes** | Public — the only public surface | Stateless. XDP/nftables/OpenSIPS filtering, TLS termination, topology hiding. **No credentials, no customer data.** |
+| **Core** | **Private only — allowlisted edge IPs, no internet route** | Registrar, LCR, dialog state, authorizer, Postgres, ClickHouse, Redis |
+| **Media (rtpengine)** | Public RTP range, private control | Media only, no business data |
+
+**Scaling the shield tier** — the part that actually addresses volumetric attacks, since
+software on one box never can:
+
+- **Multiple edge nodes on separate IPs, ideally separate providers/ASNs.** Spread
+  customers across them so no single flood takes out everyone.
+- **Anycast** for larger deployments — several POPs announcing the same IP, so a flood
+  lands in one location while the others keep serving.
+- **Cheap, disposable edges.** They're stateless and small; running several costs far
+  less than one big core, and the shield is where you want redundancy.
+- **Edge IP rotation.** Because customers reach us via FQDN and SRV records, a targeted
+  edge IP can be retired and replaced — a lever Magnus operators simply do not have.
+
+**Implication for v1:** small installs may still run everything on one box (the §1 scale
+decision stands), but **the edge/core boundary is a network and trust boundary from the
+first line of config, never a later refactor.** The wizard (§6.2b) asks "single-node or
+split?" and generates the right topology either way. Retrofitting this split into a live
+carrier platform is exactly the kind of surgery we are building MEGATRON to avoid.
+
 ### 4.5 Billing correctness — the three failure modes that lose money
 
 Magnus loses money on all three. These are design requirements, not nice-to-haves.
