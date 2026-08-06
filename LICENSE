@@ -1,0 +1,46 @@
+MEGATRON — PROPRIETARY SOFTWARE LICENSE
+Copyright (c) 2026. All rights reserved.
+
+This software and its source code are proprietary and confidential.
+
+No part of this software may be reproduced, distributed, sublicensed, publicly
+performed, or transmitted in any form or by any means, or stored in a database or
+retrieval system, without the prior written permission of the copyright holder.
+
+Unauthorized copying of this file or repository, via any medium, is strictly
+prohibited.
+
+NO WARRANTY: THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER
+BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+---
+
+THIRD-PARTY COMPONENTS
+
+MEGATRON operates alongside separately-licensed open-source components which it does
+NOT redistribute. These are installed from their upstream distribution packages at
+deployment time and run as independent processes communicating over network
+interfaces:
+
+  - OpenSIPS ......... GPLv2
+  - rtpengine ........ GPLv3
+  - FreeSWITCH ....... MPL 2.0
+  - PostgreSQL ....... PostgreSQL License
+  - Redis / Valkey ... BSD-3-Clause / BSD-3-Clause
+  - ClickHouse ....... Apache-2.0
+  - Homer / heplify .. AGPLv3 (deployed independently; not linked or redistributed)
+
+MEGATRON contains no source code derived from any of the above. No custom OpenSIPS,
+Kamailio, or rtpengine modules are authored as part of this project, and no GPL- or
+AGPL-licensed library is linked into any MEGATRON binary. This boundary is enforced
+by an automated license-scan gate in CI.
+
+See docs/ARCHITECTURE.md §3 for the full rationale and the rules this imposes on
+contributors.
+
+NOTE: This notice describes the project's engineering posture. It is not legal advice
+and has not yet been reviewed by counsel. A formal review is required before first
+customer distribution — see docs/ARCHITECTURE.md §9.

@@ -1,0 +1,71 @@
+# --- Secrets: never commit. See docs/ARCHITECTURE.md §3 and §6.1 ---
+*.env
+.env.*
+!.env.example
+run-local.ps1
+run-local.sh
+*.pem
+*.key
+*.p12
+*.jks
+secrets/
+**/application-local.*
+
+# --- JVM / Kotlin / Gradle ---
+build/
+out/
+.gradle/
+!gradle/wrapper/gradle-wrapper.jar
+*.class
+*.jar
+!gradle-wrapper.jar
+*.war
+hs_err_pid*
+replay_pid*
+
+# --- Go ---
+bin/
+dist/
+*.exe
+*.test
+vendor/
+
+# --- Node / TypeScript ---
+node_modules/
+.vite/
+.next/
+coverage/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Databases / data ---
+*.db
+*.mv.db
+*.trace.db
+*.sqlite
+pgdata/
+clickhouse-data/
+redis-data/
+
+# --- Telephony artifacts ---
+*.pcap
+*.pcapng
+recordings/
+cdr-dumps/
+# Magnus dumps used for importer testing contain real customer data
+magnus-dumps/
+*.sql.gz
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# --- Logs / temp ---
+*.log
+logs/
+tmp/
