@@ -192,6 +192,11 @@
     border-radius: var(--mg-radius);
     padding: var(--mg-pad);
     margin-top: var(--mg-gap);
+    /* The tooltip is absolutely positioned against the panel, because it is
+       shared by both charts and must be free to overhang either. Without
+       this, "nearest positioned ancestor" resolves to the initial containing
+       block and the tooltip lands somewhere near the top of the document. */
+    position: relative;
   }
   .panel-head {
     display: flex; align-items: baseline; gap: 10px;
@@ -765,7 +770,20 @@ function render(data, isDemo) {
   $("updated").setAttribute("datetime", data.generated_at);
   $("window-note").textContent = `last ${data.window} · ${data.series.length} buckets`;
 
-  const series = data.series;
+  /* A node that has just started, or one whose agent restarted inside the
+     window, legitimately has no buckets yet. Reading series[-1] there throws
+     and the page renders nothing at all — which would look identical to the
+     switch being down. Say "no data yet" and keep the rest of the page. */
+  const series = Array.isArray(data.series) ? data.series : [];
+  if (series.length === 0) {
+    $("stat-accepted").textContent = "—";
+    $("stat-absorbed").textContent = "—";
+    $("stat-blocked").textContent = grouped(data.blocks.items.length);
+    $("stat-verdict").textContent = "No data";
+    $("stat-verdict-sub").textContent = "no traffic buckets in this window yet";
+    $("window-note").textContent = `last ${data.window} · no buckets`;
+    return;
+  }
   const latest = series[series.length - 1];
 
   $("stat-accepted").textContent = compact(data.accepted.requests);
