@@ -686,6 +686,18 @@ def check_palette(f: Findings) -> None:
 # The colour half keeps the PALETTE rule meaningful. A hex literal in a
 # stylesheet routes straight around the contrast and colour-vision checks,
 # which only ever see tokens.css.
+#
+# WHAT THIS RULE DOES NOT CATCH, stated so it is not mistaken for more than
+# it is: a URL assembled at runtime from pieces ("htt" + "ps://…", new URL()
+# on a variable) is invisible to a text scan, and so is anything fetched by
+# code this gate never sees. The rule targets the realistic failure — someone
+# reaching for a CDN or a web font out of habit — not a determined insider.
+# The actual enforcement for the hostile case is a Content-Security-Policy
+# header served by the node agent, which does not exist yet (issue #4); when
+# it does, THAT is the control and this becomes the early warning.
+#
+# `data:` URIs are deliberately allowed: they are self-contained and make no
+# request, which is the property being protected.
 # ---------------------------------------------------------------------------
 
 UI_DIR = "ui"
