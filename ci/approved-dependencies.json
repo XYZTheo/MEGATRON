@@ -56,6 +56,77 @@
     "org.junit.platform:junit-platform-launcher": {
       "licence": "EPL-2.0",
       "why": "Test only, never distributed. EPL-2.0 is a weak copyleft that reaches only the EPL'd files themselves, and this is a test-runtime dependency that is not linked into any shipped artifact."
+    },
+
+    "org.jetbrains.kotlinx:kotlinx-serialization-json": {
+      "licence": "Apache-2.0",
+      "why": "JSON on the provisioning API. Compile-time code generation rather than runtime reflection, which matters on a service the authorizer sits next to."
+    },
+
+    "io.ktor:ktor-server-core": {
+      "licence": "Apache-2.0",
+      "why": "HTTP server for the provisioning API. Chosen over Spring Boot for this service because it starts in milliseconds and carries no reflective classpath scanning -- the smaller the running surface on a box that also terminates SIP, the better."
+    },
+    "io.ktor:ktor-server-netty": {
+      "licence": "Apache-2.0",
+      "why": "Ktor's Netty engine. Netty itself is Apache-2.0."
+    },
+    "io.ktor:ktor-server-content-negotiation": {
+      "licence": "Apache-2.0",
+      "why": "Binds JSON to the routes. Also how the API is kept JSON-only: MagnusBilling's CVE-2025-2609/2610 were APIs served as text/html."
+    },
+    "io.ktor:ktor-serialization-kotlinx-json": {
+      "licence": "Apache-2.0",
+      "why": "Bridges kotlinx-serialization into Ktor."
+    },
+    "io.ktor:ktor-server-status-pages": {
+      "licence": "Apache-2.0",
+      "why": "Turns exceptions into RFC 9457 problem documents instead of leaking a stack trace to a caller."
+    },
+    "io.ktor:ktor-server-auth": {
+      "licence": "Apache-2.0",
+      "why": "Bearer authentication, and the operator/customer scope split the contract requires."
+    },
+    "io.ktor:ktor-server-call-logging": {
+      "licence": "Apache-2.0",
+      "why": "Request logging. Needed to answer 'who moved this balance' at all."
+    },
+    "io.ktor:ktor-server-test-host": {
+      "licence": "Apache-2.0",
+      "why": "Test only. Runs the real routes in-process so the API is tested as an API rather than as a pile of functions."
+    },
+    "io.ktor:ktor-client-content-negotiation": {
+      "licence": "Apache-2.0",
+      "why": "Test only. The test client's JSON support."
+    },
+
+    "org.slf4j:slf4j-simple": {
+      "licence": "MIT",
+      "why": "SLF4J binding, required because Ktor logs through SLF4J. Chosen over Logback deliberately -- see the note below."
+    },
+    "org.slf4j:slf4j-api": {
+      "licence": "MIT",
+      "why": "The logging facade Ktor is written against."
     }
-  }
+  },
+
+  "_logback_note": [
+    "LOGBACK WAS CONSIDERED AND REJECTED, and the reasoning is recorded so it",
+    "does not get quietly reversed by the next person who reaches for the",
+    "familiar default.",
+    "",
+    "Logback is dual-licensed EPL-1.0 OR LGPL-2.1. Dual licensing means the",
+    "user elects, and electing EPL-1.0 would make it usable here -- EPL is a",
+    "weak, file-scoped copyleft. But it is an election MEGATRON would then be",
+    "carrying, documenting, and defending in every licensing conversation with",
+    "an operator we sell to, for a logging backend.",
+    "",
+    "slf4j-simple is MIT and adequate. The cost of avoiding the question",
+    "entirely was one line of configuration, which is a better trade than a",
+    "paragraph in a licence review.",
+    "",
+    "If structured logging or async appenders are needed later, evaluate",
+    "permissively-licensed options FIRST. Do not add Logback without",
+    "revisiting this note."
+  ]
 }

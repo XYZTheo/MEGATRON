@@ -122,7 +122,7 @@ jobs:
   # runner, years before there is a switch to run it on.
   # --------------------------------------------------------------------
   rating:
-    name: rating engine
+    name: jvm services
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -132,15 +132,15 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Run the rating engine tests
-        run: ./gradlew :rating:test --console=plain
+      - name: Run the JVM test suite
+        run: ./gradlew test --console=plain
 
       - name: Publish the report when it fails
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: rating-test-report
-          path: rating/build/reports/tests/test
+          name: jvm-test-reports
+          path: "*/build/reports/tests/test"
 
   # --------------------------------------------------------------------
   # The one that matters most: real OpenSIPS 3.6, real module binaries.
