@@ -105,24 +105,49 @@ equivalents used here:
 
 ## Status
 
-⚠️ **Neither file has been validated against a running system** — no Linux host
-exists for the project yet ([#2](https://github.com/XYZTheo/MEGATRON/issues/2)).
-Module names, function signatures and parameters were verified against the
-OpenSIPS 3.6 documentation, but nothing here has been loaded by a live binary.
+✅ **Validated against real OpenSIPS 3.6.7 on 2026-08-07** — an Ubuntu 24.04
+lab box, the first time any MEGATRON config had ever been executed.
 
-A CI workflow exists to close exactly this gap on GitHub's Linux runners, but
-**it has never executed** — Actions does not currently run in this repository
-([#15](https://github.com/XYZTheo/MEGATRON/issues/15)). So the status above is
-unchanged for now: documentation-reviewed, not machine-verified.
-
-What *does* run today is [`ci/policy_check.py`](../ci/policy_check.py), which
-enforces the credential and Kamailio-name rules locally.
-
-Before first deployment:
-
-```sh
-opensips -C -f /etc/opensips/opensips.cfg   # config check
-nft -c -f megatron-edge.nft                 # syntax check
+```
+opensips -C -f edge/opensips/opensips.cfg   PASSES
+nft -c -f edge/nftables/megatron-edge.nft   PASSES
 ```
 
-Then the Phase 1 goal: one call in, one call out, media anchored, CDR emitted.
+**It did not pass first time, and what it caught is the point.** Seven distinct
+defects, every one of which would have blocked the first call, and none of
+which any amount of re-reading had found:
+
+| What was wrong | Why it mattered |
+|---|---|
+| `shm_mem_size=` / `pkg_mem_size=` | Not OpenSIPS directives at all — a Kamailio-ism. Rejected with a bare "syntax error" that never says why. Memory comes from `-m`/`-M`, or `S_MEMORY`/`P_MEMORY` in `/etc/default/opensips`. |
+| `modparam("tm", "wt_timeout", …)` | No such parameter in OpenSIPS tm. Kamailio has it. |
+| `modparam("dispatcher", "partition", …)` | Not a 3.6 dispatcher parameter. |
+| `ds_select_dst("core", "4")` | Takes **integers**, not quoted strings. |
+| `mf_process_maxfwd_header("10")`, `check_source_address("1")` | Same: 3.6 refuses quoted integers. |
+| dispatcher with an empty `db_url` | Hard-requires *some* sqldb module — see below. |
+
+The dispatcher one is the interesting one. It needs a database module, and the
+edge is defined by **holding no credentials**. The answer is `db_text`: a flat
+file, no server, no host, no username, no password. It satisfies the dependency
+while leaving a compromised edge worth nothing to an attacker. Do not "fix" it
+by loading `db_postgres` — that hands whoever owns an edge node a route to the
+ledger, and [`ci/policy_check.py`](../ci/policy_check.py) will reject it.
+
+### The false failure that cost the most time
+
+`loadmodule "proto_udp.so"` and `proto_tcp.so` are **required**, and the files
+**do not exist**. No `.so` in the module directory, no package ships one — UDP
+and TCP are compiled into the core. The `loadmodule` line is what *enables* the
+built-in transport; without it OpenSIPS refuses to start with "no transport
+protocol loaded".
+
+So a check that verifies every `loadmodule` has a matching file on disk reports
+these two as missing **on a correct config**. Acting on that deletes the lines
+and produces an error that points somewhere else entirely. The CI job now skips
+them explicitly, with the reasoning attached, so nobody re-derives this.
+
+### Still not verified
+
+Passing `-C` proves the config **parses and its modules load**. It does not
+prove a call works. Phase 1 remains: one call in, one call out, media anchored,
+CDR emitted.

@@ -107,6 +107,11 @@
     "org.slf4j:slf4j-api": {
       "licence": "MIT",
       "why": "The logging facade Ktor is written against."
+    },
+
+    "org.xerial:sqlite-jdbc": {
+      "licence": "Apache-2.0",
+      "why": "Durable storage for a single node, and the only database that can be TESTED on the machine this is being written on. The SQL is deliberately portable so the PostgreSQL store is a schema file and a JDBC URL rather than a rewrite -- see docs/STORAGE.md."
     }
   },
 

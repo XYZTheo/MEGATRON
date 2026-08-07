@@ -113,6 +113,33 @@ class PolicyGateTest(unittest.TestCase):
         r = fx.run()
         self.assertNotIn("EDGE-CREDENTIALS", r.stdout)
 
+    def test_edge_with_a_flat_file_db_url_is_accepted(self) -> None:
+        """OpenSIPS 3.6's dispatcher hard-requires an sqldb module and refuses
+        to start on an empty db_url, so the edge needs db_text -- a flat file
+        with no server, host, username or password. This rule is about
+        CREDENTIALS, not about the string being non-empty."""
+        fx = self.fixture()
+        fx.write("edge/opensips/opensips.cfg",
+                 'loadmodule "db_text.so"\n'
+                 'modparam("dispatcher", "db_url", "text:///etc/opensips/dbtext")\n'
+                 'route { drop; }\n')
+        r = fx.run()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("flat-file", r.stdout)
+
+    def test_edge_with_a_database_server_url_is_still_rejected(self) -> None:
+        """The escape hatch must not widen into one that matters."""
+        for url in ("postgres://user:pw@10.0.0.5/megatron",
+                    "mysql://root@db/megatron",
+                    "sqlite:///var/lib/megatron.db"):
+            with self.subTest(url=url):
+                fx = self.fixture()
+                fx.write("edge/opensips/opensips.cfg",
+                         f'modparam("dispatcher", "db_url", "{url}")\nroute {{ drop; }}\n')
+                r = fx.run()
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn("EDGE-CREDENTIALS", r.stdout)
+
     def test_edge_loading_a_db_driver_is_rejected(self) -> None:
         fx = self.fixture()
         fx.write("edge/opensips/opensips.cfg", 'loadmodule "db_postgres.so"\n')

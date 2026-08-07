@@ -192,7 +192,8 @@ jobs:
             opensips-json-module \
             opensips-restclient-module \
             opensips-tls-module \
-            opensips-tlsmgm-module
+            opensips-tlsmgm-module \
+            opensips-auth-modules
           opensips -V
 
       - name: Fail if we did not actually get 3.6
@@ -220,9 +221,23 @@ jobs:
           set -euo pipefail
           mpath="$(ls -d /usr/lib/*/opensips/modules 2>/dev/null | head -1)"
           echo "module path: ${mpath}"
+          # proto_udp and proto_tcp are SKIPPED, and that is not laziness.
+          #
+          # No such .so exists in the module directory and no package ships
+          # one -- UDP and TCP are compiled into the OpenSIPS core. But the
+          # `loadmodule "proto_udp.so"` line is still REQUIRED: it enables the
+          # built-in transport, and without it OpenSIPS refuses to start with
+          # "no transport protocol loaded".
+          #
+          # So a file-existence check reports them missing on a CORRECT
+          # config. That false failure cost real time on the lab box: acting
+          # on it deletes the lines, and the resulting error points somewhere
+          # else entirely. Verified against 3.6.7, 2026-08-07.
+          core_transports="proto_udp proto_tcp"
           missing=""
           for m in $(grep -h '^loadmodule' */opensips/*.cfg \
                      | sed 's/loadmodule *"//; s/\.so".*//' | sort -u); do
+            case " ${core_transports} " in *" ${m} "*) continue;; esac
             if [ ! -f "${mpath}/${m}.so" ]; then
               missing="${missing} ${m}"
             fi

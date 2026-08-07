@@ -120,32 +120,42 @@ and why.
 
 ## Status
 
-⚠️ **Nothing here has been executed.** Be precise about this, because it is easy
-to look at a repository with a CI workflow in it and assume otherwise.
+**Executed for the first time on 2026-08-07**, against real OpenSIPS 3.6.7 on an
+Ubuntu 24.04 lab box.
 
 | Check | State |
 |---|---|
-| `ci/policy_check.py` structural rules | ✅ **Runs and passes**, locally and on demand |
-| `opensips -C` against real OpenSIPS 3.6 | ❌ **Never run.** Workflow written, but see #15 |
-| `nft -c` on the ruleset | ❌ **Never run.** Same |
-| All three chains are `policy drop` | ❌ **Never run.** Same |
-| A call actually completing | ❌ Needs the lab VPS — #2 |
+| `ci/policy_check.py` structural rules | ✅ Runs and passes |
+| `opensips -C` against real OpenSIPS 3.6.7 | ✅ **PASSES** — 2026-08-07 |
+| `nft -c` on the ruleset | ✅ **PASSES** — 2026-08-07 |
+| All three chains are `policy drop` | ✅ Asserted by the firewall CI job |
+| A call actually completing | ❌ Still needs a real SIP call — #3 |
 
-[`.github/workflows/validate.yml`](../.github/workflows/validate.yml) exists and
-is believed correct, but **GitHub Actions does not currently execute in this
-repository** ([#15](https://github.com/XYZTheo/MEGATRON/issues/15) — an
-account-level condition, proven not to be the workflow file). So the OpenSIPS
-and nftables checks are written but have never produced a result.
+It did not pass first time. Alongside the defects listed in
+[`edge/README.md`](../edge/README.md), the core config carried four of its own,
+every one a **Kamailio idiom that OpenSIPS does not have** — which is the trap
+this project has now hit repeatedly, and the reason the policy gate has a rule
+group dedicated to it:
 
-The honest summary: the structural rules are genuinely enforced; the claim that
-this config parses under OpenSIPS 3.6 is currently **unverified**, resting on
-documentation review alone.
+| Written | Correct for OpenSIPS 3.6 |
+|---|---|
+| `db_check_to()` / `db_check_from()` | No such module. The property — that the From/To user is the account that authenticated — is asserted directly with `$fU != $au`. |
+| `dlg_set_timeout(x)` | Not a function. The dialog module exposes a **writable pseudo-variable**: `$DLG_timeout = x;` |
+| `$pr` | `$socket_in(proto)`. `$proto` does not exist either — that was the second guess, and it was also wrong. |
+| `if (status =~ …)` | `$rs`. A bare word is refused outright: *"bare word `status` found, command calls need `()`"*. |
 
-When Actions is enabled, note what a green run would and would not prove. It
-would prove the config parses, every `loadmodule` resolves against real module
-binaries, and every function exists with that arity. It would **not** prove that
-the addresses are right, that routing behaves correctly, that the database
-schema matches, or that a call completes. Those need the VPS and SIPp scenarios.
+`auth.so` and `auth_db.so` also needed a package that was not in the install
+list at all — `opensips-auth-modules`. The CI job now installs it.
+
+### What passing `-C` does and does not prove
+
+It proves the config **parses**, every `loadmodule` resolves, and every function
+exists with that arity. That is exactly the class of defect listed above, and it
+is worth having.
+
+It does **not** prove the addresses are right, that routing behaves correctly,
+that the database schema matches, or that a call completes. Those need a real
+call ([#3](https://github.com/XYZTheo/MEGATRON/issues/3)).
 
 Local checks:
 

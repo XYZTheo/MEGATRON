@@ -38,6 +38,7 @@ dependencies {
     // in every conversation with an operator we sell to. See the note in
     // ci/approved-dependencies.json before changing this.
     implementation("org.slf4j:slf4j-simple:2.0.16")
+    implementation("org.xerial:sqlite-jdbc:3.47.1.0")
 
     testImplementation("org.jetbrains.kotlin:kotlin-test:2.0.21")
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit5:2.0.21")

@@ -128,6 +128,20 @@ CREDENTIAL_MARKERS = [
 # whether a value was supplied.
 DB_URL_RE = re.compile(r'modparam\s*\(\s*"[^"]+"\s*,\s*"db_url"\s*,\s*"([^"]*)"')
 
+# db_url schemes that are a FILE, not a database server.
+#
+# This rule is about CREDENTIALS, not about the string being non-empty, and the
+# difference became load-bearing on the lab box: OpenSIPS 3.6's dispatcher
+# hard-requires some sqldb module and refuses to start with an empty db_url
+# ("depends on an sqldb module, but none was loaded"). The edge therefore needs
+# db_text — a flat file with no server, no host, no username and no password.
+#
+# A compromised edge still yields an attacker nothing, which is the entire
+# property this rule protects. `db_postgres` and friends remain rejected by the
+# CREDENTIAL_MARKERS check above, so the escape hatch cannot be widened into
+# one that matters.
+CREDENTIAL_FREE_DB_SCHEMES = ("text://", "flatstore://")
+
 
 def check_edge_holds_no_credentials(f: Findings) -> None:
     edge = REPO / "edge"
@@ -136,6 +150,7 @@ def check_edge_holds_no_credentials(f: Findings) -> None:
         return
     for cfg in sorted(edge.rglob("*.cfg")):
         asserted_empty = 0
+        file_backed = 0
         for n, raw in read_lines(cfg):
             line = strip_comment(raw)
             for pattern, what in CREDENTIAL_MARKERS:
@@ -147,15 +162,23 @@ def check_edge_holds_no_credentials(f: Findings) -> None:
                     )
             m = DB_URL_RE.search(line)
             if m:
-                if m.group(1).strip():
+                value = m.group(1).strip()
+                if not value:
+                    asserted_empty += 1
+                elif value.startswith(CREDENTIAL_FREE_DB_SCHEMES):
+                    file_backed += 1
+                else:
                     f.fail(
                         "EDGE-CREDENTIALS", cfg, n,
-                        f"edge config sets a non-empty db_url ({m.group(1)!r}). The edge "
-                        f"holds no database credential — that is the property that makes "
-                        f"an edge compromise survivable. See CONTRIBUTING.md.",
+                        f"edge config sets db_url to {value!r}, which names a database "
+                        f"server. The edge holds no database credential — that is the "
+                        f"property that makes an edge compromise survivable. A flat-file "
+                        f"driver ({', '.join(CREDENTIAL_FREE_DB_SCHEMES)}) is fine; a "
+                        f"server is not. See CONTRIBUTING.md.",
                     )
-                else:
-                    asserted_empty += 1
+        if file_backed:
+            f.note(f"{cfg.relative_to(REPO).as_posix()}: {file_backed} module(s) on a " +
+                   f"flat-file db_url — no server, no credential")
         if asserted_empty:
             f.note(f"{cfg.relative_to(REPO).as_posix()}: {asserted_empty} module(s) pinned "
                    f"to file/static mode via an empty db_url")
