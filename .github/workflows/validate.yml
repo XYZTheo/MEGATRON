@@ -114,6 +114,35 @@ jobs:
           PY
 
   # --------------------------------------------------------------------
+  # The rating engine. This is the code that decides what a customer is
+  # charged, so its tests are the ones that must never be allowed to rot.
+  #
+  # Pure logic with no I/O and no clock, deliberately, so it can be tested
+  # to the cent without standing up a database — and so it runs here, on a
+  # runner, years before there is a switch to run it on.
+  # --------------------------------------------------------------------
+  rating:
+    name: rating engine
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Run the rating engine tests
+        run: ./gradlew :rating:test --console=plain
+
+      - name: Publish the report when it fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rating-test-report
+          path: rating/build/reports/tests/test
+
+  # --------------------------------------------------------------------
   # The one that matters most: real OpenSIPS 3.6, real module binaries.
   # --------------------------------------------------------------------
   sip-config:

@@ -17,6 +17,7 @@ Run: python ci/test_policy_check.py
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -247,12 +248,136 @@ class PolicyGateTest(unittest.TestCase):
                 r = fx.run()
                 self.assertEqual(r.returncode, 0, r.stdout)
 
+    # -- the Gradle dependency scanner -------------------------------------
+
+    APPROVED = json.dumps({
+        "allowed_licences": ["Apache-2.0", "MIT"],
+        "forbidden_licences": ["GPL-3.0", "AGPL-3.0", "LGPL-2.1"],
+        "dependencies": {
+            "org.jetbrains.kotlin:kotlin-stdlib": {
+                "licence": "Apache-2.0", "why": "language runtime"},
+            "com.example:agpl-thing": {
+                "licence": "AGPL-3.0", "why": "recorded so it can be refused"},
+            "com.example:mystery": {"licence": "WTFPL", "why": "unclassified"},
+            "com.example:unjustified": {"licence": "MIT"},
+        },
+    })
+
+    def gradle(self, body: str, approved: str | None = None):
+        fx = self.fixture()
+        fx.write("ci/approved-dependencies.json",
+                 self.APPROVED if approved is None else approved)
+        fx.write("svc/build.gradle.kts", body)
+        return fx.run()
+
+    def test_approved_dependency_passes(self) -> None:
+        r = self.gradle('dependencies {\n'
+                        '  implementation("org.jetbrains.kotlin:kotlin-stdlib:2.0.21")\n'
+                        '}\n')
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("Gradle manifest", r.stdout)
+
+    def test_unlisted_dependency_is_rejected(self) -> None:
+        """The whole point. A dependency nobody approved is a licence nobody
+        checked, and for a proprietary product distributed to licensees that
+        is not a problem to find later -- it is a product that cannot ship."""
+        r = self.gradle('dependencies {\n'
+                        '  implementation("com.example:not-listed:1.0.0")\n'
+                        '}\n')
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("LICENCE", r.stdout)
+        self.assertIn("not-listed", r.stdout)
+
+    def test_copyleft_dependency_is_rejected(self) -> None:
+        r = self.gradle('dependencies {\n'
+                        '  implementation("com.example:agpl-thing:1.0.0")\n'
+                        '}\n')
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("AGPL-3.0", r.stdout)
+
+    def test_unclassified_licence_is_rejected(self) -> None:
+        """Neither allowed nor forbidden means nobody decided. Silence is not
+        approval."""
+        r = self.gradle('dependencies {\n'
+                        '  implementation("com.example:mystery:1.0.0")\n'
+                        '}\n')
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("neither on the allowed nor the forbidden list", r.stdout)
+
+    def test_dependency_without_a_justification_is_rejected(self) -> None:
+        r = self.gradle('dependencies {\n'
+                        '  implementation("com.example:unjustified:1.0.0")\n'
+                        '}\n')
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("no `why`", r.stdout)
+
+    def test_dependency_the_scanner_cannot_read_is_rejected(self) -> None:
+        """Version catalogs and BOMs are normal, and unreadable to a text
+        scan. A scanner that ignores what it does not understand provides
+        exactly as much protection as no scanner while looking like it
+        provides some."""
+        for label, body in (
+                ("version catalog", 'dependencies {\n  implementation(libs.ktor.core)\n}\n'),
+                ("variable", 'dependencies {\n  implementation(someDep)\n}\n'),
+                ("platform BOM",
+                 'dependencies {\n  implementation(platform("com.example:bom:1.0"))\n}\n')):
+            with self.subTest(form=label):
+                r = self.gradle(body)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn("cannot read", r.stdout)
+
+    def test_commented_out_dependency_does_not_trip_the_scanner(self) -> None:
+        """Prose and dead declarations must not fail the build -- the same
+        trap this file has hit three times now."""
+        r = self.gradle('dependencies {\n'
+                        '  // implementation("com.example:not-listed:1.0.0")\n'
+                        '  /* implementation("com.example:agpl-thing:1.0.0") */\n'
+                        '  implementation("org.jetbrains.kotlin:kotlin-stdlib:2.0.21")\n'
+                        '}\n')
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_missing_approvals_file_fails_closed(self) -> None:
+        fx = self.fixture()
+        fx.write("svc/build.gradle.kts",
+                 'dependencies {\n  implementation("org.jetbrains.kotlin:kotlin-stdlib:2.0.21")\n}\n')
+        r = fx.run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("approved-dependencies.json", r.stdout)
+
+    def test_kdoc_explaining_the_money_rule_does_not_trip_it(self) -> None:
+        """Money.kt's KDoc explains at length why a Double must never appear
+        in a money path, and that explanation was flagged as a Double in a
+        money path on its first run."""
+        fx = self.fixture()
+        fx.write("rating/src/main/kotlin/Money.kt",
+                 "/**\n"
+                 " * Money as integer micros.\n"
+                 " * Floats are excluded: a Double cannot represent 0.1 exactly.\n"
+                 " */\n"
+                 "@JvmInline value class Micros(val value: Long)\n")
+        r = fx.run()
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_an_actual_float_in_a_money_path_is_still_caught(self) -> None:
+        fx = self.fixture()
+        fx.write("rating/src/main/kotlin/Tariff.kt", "val rate: Double = 0.01\n")
+        r = fx.run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("MONEY-NOT-FLOAT", r.stdout)
+
     def test_unscannable_dependency_manifest_is_rejected(self) -> None:
         """The gate must fail closed when the build grows a dependency surface it
         cannot yet inspect, rather than passing and creating the impression that
-        dependencies were checked."""
+        dependencies were checked.
+
+        Uses go.mod because build.gradle.kts now HAS a scanner — which is the
+        rule working as designed: this test previously used Gradle, and adding
+        the Kotlin rating module forced the scanner to be written before the
+        build could go green. That is exactly the pressure it was built to
+        apply. The next ecosystem to arrive (Go, for the node agent) gets the
+        same treatment."""
         fx = self.fixture()
-        fx.write("authorizer/build.gradle.kts", 'dependencies { implementation("io.ktor:ktor-server-core") }\n')
+        fx.write("edge/agent/go.mod", "module megatron/agent\n\ngo 1.23\n")
         r = fx.run()
         self.assertEqual(r.returncode, 1)
         self.assertIn("LICENCE", r.stdout)

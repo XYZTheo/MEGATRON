@@ -34,6 +34,7 @@ Exit code 0 = clean, 1 = at least one violation.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -284,8 +285,15 @@ def check_source_rules(f: Findings) -> None:
     for path in files:
         rel = path.relative_to(REPO).as_posix().lower()
         is_money = any(hint in rel for hint in MONEY_PATH_HINTS)
-        for n, line in read_lines(path):
-            code = line.split("//", 1)[0]
+        # Block comments are blanked before scanning, for the third time in
+        # this file's history and the same reason each time: the KDoc on
+        # Money.kt explains at length why a Double must never appear in a
+        # money path, and that explanation was flagged as a Double in a money
+        # path. Prose about a rule must not trip the rule.
+        source = blank_line_comments(
+            blank_block_comments(path.read_text(encoding="utf-8", errors="replace")))
+        for n, line in enumerate(source.splitlines(), start=1):
+            code = line
             for pattern, what in SHELL_OUT_PATTERNS:
                 if pattern.search(code):
                     f.fail("NO-SHELL-OUT", path, n,
@@ -322,8 +330,8 @@ COPYLEFT_MARKERS = re.compile(
 )
 
 KNOWN_MANIFESTS = {
-    "build.gradle.kts": False,   # scanner not written yet
-    "build.gradle": False,
+    "build.gradle.kts": True,    # scanner: scan_gradle_manifest, below
+    "build.gradle": True,
     "pom.xml": False,
     "go.mod": False,
     "package.json": False,
@@ -367,6 +375,100 @@ LICENCE_DISCUSSION_ALLOWLIST = {
 }
 
 
+APPROVED_DEPENDENCIES = "ci/approved-dependencies.json"
+
+# group:artifact:version inside a dependency declaration. Deliberately narrow:
+# it matches the string-notation form the build files use, and anything it
+# cannot read is reported rather than skipped.
+GRADLE_DEP_RE = re.compile(
+    r"""(?:implementation|api|compileOnly|runtimeOnly|testImplementation"""
+    r"""|testRuntimeOnly|testCompileOnly|annotationProcessor|ksp|kapt)"""
+    r"""\s*\(\s*["']([^"':]+):([^"':]+):([^"']+)["']\s*\)""")
+
+# A dependency declared some other way — a version catalog reference, a
+# variable, a platform BOM. Not necessarily wrong, but not readable by this
+# scanner, and therefore not something it may pass silently.
+GRADLE_OPAQUE_DEP_RE = re.compile(
+    r"""(?:implementation|api|compileOnly|runtimeOnly|testImplementation"""
+    r"""|testRuntimeOnly|testCompileOnly|annotationProcessor|ksp|kapt)"""
+    r"""\s*\(\s*(?!["'])""")
+
+
+def load_approved_dependencies(f: Findings) -> dict | None:
+    path = REPO / APPROVED_DEPENDENCIES
+    if not path.is_file():
+        f.fail("LICENCE", path, None,
+               f"{APPROVED_DEPENDENCIES} is missing, so no dependency can be checked "
+               f"against anything. Restore it rather than dropping the rule.")
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        f.fail("LICENCE", path, None, f"is not valid JSON: {exc}")
+        return None
+
+
+def scan_gradle_manifest(f: Findings, manifest: Path, approved: dict) -> None:
+    """Every dependency must be listed, with a licence we accept.
+
+    Fails closed twice over: an unlisted dependency fails, and a dependency
+    this scanner cannot READ also fails. The second matters more than it
+    looks — a version catalog reference or a BOM is a perfectly normal way to
+    declare a dependency, and a scanner that quietly ignores what it does not
+    understand provides exactly as much protection as no scanner while
+    looking like it provides some.
+    """
+    source = blank_line_comments(
+        blank_block_comments(manifest.read_text(encoding="utf-8", errors="replace")))
+
+    allowed = set(approved.get("allowed_licences", []))
+    forbidden = set(approved.get("forbidden_licences", []))
+    listed = approved.get("dependencies", {})
+
+    found = 0
+    for match in GRADLE_DEP_RE.finditer(source):
+        group, artifact, version = match.groups()
+        coordinate = f"{group}:{artifact}"
+        line_no = _line_of(source, match.start())
+        found += 1
+
+        entry = listed.get(coordinate)
+        if entry is None:
+            f.fail("LICENCE", manifest, line_no,
+                   f"'{coordinate}' is not in {APPROVED_DEPENDENCIES}. Every dependency "
+                   f"MEGATRON links must be approved with its licence first — a "
+                   f"GPL/AGPL/LGPL dependency here is not a problem to discover later, "
+                   f"it is a product that cannot ship.")
+            continue
+
+        licence = entry.get("licence")
+        if licence in forbidden:
+            f.fail("LICENCE", manifest, line_no,
+                   f"'{coordinate}' is {licence}. MEGATRON is proprietary and "
+                   f"distributed to licensees; it cannot link copyleft code. Depend on "
+                   f"it out-of-process, or find another library.")
+        elif licence not in allowed:
+            f.fail("LICENCE", manifest, line_no,
+                   f"'{coordinate}' is recorded as {licence!r}, which is neither on the "
+                   f"allowed nor the forbidden list. Decide deliberately and add it to "
+                   f"one of them.")
+        if not entry.get("why"):
+            f.fail("LICENCE", manifest, line_no,
+                   f"'{coordinate}' has no `why`. A dependency nobody can justify is one "
+                   f"that gets renewed forever without being reconsidered.")
+
+    opaque = list(GRADLE_OPAQUE_DEP_RE.finditer(source))
+    for match in opaque:
+        f.fail("LICENCE", manifest, _line_of(source, match.start()),
+               "a dependency is declared in a form this scanner cannot read (a version "
+               "catalog reference, a variable, or a BOM). That may be perfectly correct, "
+               "but it cannot be licence-checked here — declare it as a literal "
+               "'group:artifact:version', or teach the scanner.")
+
+    if found == 0 and not opaque:
+        f.note(f"{manifest.relative_to(REPO).as_posix()}: no dependencies declared")
+
+
 def check_licence(f: Findings) -> None:
     for path in REPO.rglob("*"):
         if not path.is_file() or ".git" in path.parts:
@@ -387,12 +489,25 @@ def check_licence(f: Findings) -> None:
                    "instead.")
 
     unscannable = []
+    scanned = 0
+    approved = None
     for name, have_scanner in KNOWN_MANIFESTS.items():
         for found in REPO.rglob(name):
             if ".git" in found.parts or "build" in found.parts:
                 continue
             if not have_scanner:
                 unscannable.append(found.relative_to(REPO).as_posix())
+                continue
+            if name in ("build.gradle.kts", "build.gradle"):
+                if approved is None:
+                    approved = load_approved_dependencies(f)
+                    if approved is None:
+                        return
+                scan_gradle_manifest(f, found, approved)
+                scanned += 1
+
+    if scanned:
+        f.note(f"{scanned} Gradle manifest(s) scanned against {APPROVED_DEPENDENCIES}")
 
     if unscannable:
         for rel in unscannable:
@@ -401,7 +516,7 @@ def check_licence(f: Findings) -> None:
                 f"scanner for it. Dependencies are entering the build unscanned. Add a "
                 f"scanner to ci/policy_check.py before merging this."
             )
-    else:
+    elif not scanned:
         f.note("no dependency manifests yet — licence scanning is header-only so far, "
                "and this gate will fail the moment a manifest appears without a scanner")
     f.note(INLINE_DEPENDENCY_NOTE)
