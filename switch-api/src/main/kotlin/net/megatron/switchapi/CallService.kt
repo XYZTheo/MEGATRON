@@ -45,6 +45,8 @@ class CallService(
         val accountHandle: String,
         val destination: String,
         val planId: String,
+        /** When we authorized it — the fallback clock. See endSession. */
+        val authorizedAtMillis: Long,
     )
 
     private val inFlight = ConcurrentHashMap<String, InFlight>()
@@ -91,6 +93,7 @@ class CallService(
                     accountHandle = customer.handle,
                     destination = request.destination,
                     planId = customer.planId,
+                    authorizedAtMillis = System.currentTimeMillis(),
                 )
                 AuthorizeResponse(
                     decision = "allow",
@@ -114,13 +117,34 @@ class CallService(
         val rate = table.lookup(call.destination)
             ?: throw IllegalStateException("rate vanished for '${call.destination}'")
 
-        val charge = RatingEngine.rate(request.durationSeconds, rate)
+        // BILLED DURATION MUST NOT DEPEND ON THE SIP SIDE GETTING IT RIGHT.
+        //
+        // On the lab box the switch reported 0 seconds for a call that plainly
+        // ran for five, because the dialog had not matched and OpenSIPS had no
+        // lifetime to send. A zero-second settlement releases the reservation
+        // and bills nothing — every call free, silently, and the only trace is
+        // a CDR full of zeroes that looks like a quiet week.
+        //
+        // So the switch keeps its own clock from the moment it authorized. The
+        // SIP-reported duration is preferred when it is present and plausible,
+        // because it is measured from ANSWER and therefore excludes ringing;
+        // the fallback measures from authorization and will slightly
+        // over-count. Over-counting a call nobody could otherwise bill is the
+        // right way round, and `duration_source` on the CDR says which was
+        // used so the difference is never invisible.
+        val serverSeconds = ((System.currentTimeMillis() - call.authorizedAtMillis) / 1000)
+            .coerceIn(0, Int.MAX_VALUE.toLong()).toInt()
+        val trustSip = request.durationSeconds > 0
+        val billedDuration = if (trustSip) request.durationSeconds else serverSeconds
+        val durationSource = if (trustSip) "sip" else "server-clock"
+
+        val charge = RatingEngine.rate(billedDuration, rate)
         val settlement = ledger.settle(request.callId, charge.total)
 
         // Answered, billed, and no audio ever flowed. Flagged rather than
         // silently charged: billing for silence is how a switch loses a
         // customer, and being unable to tell is how it loses several.
-        val noMedia = request.durationSeconds > 0 &&
+        val noMedia = billedDuration > 0 &&
             request.mediaBytes != null &&
             request.mediaBytes == 0L
 
@@ -148,7 +172,8 @@ class CallService(
                 account = call.accountHandle,
                 destination = call.destination,
                 prefix = rate.prefix,
-                durationSeconds = request.durationSeconds,
+                durationSeconds = billedDuration,
+                durationSource = durationSource,
                 billedSeconds = charge.billedSeconds,
                 chargedMicros = charge.total.value,
                 ratePerMinute = rate.sellPerMinute.value,

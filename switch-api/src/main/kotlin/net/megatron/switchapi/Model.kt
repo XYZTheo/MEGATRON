@@ -93,6 +93,12 @@ data class Cdr(
     val destination: String,
     val prefix: String?,
     @SerialName("duration_seconds") val durationSeconds: Int,
+    /**
+     * "sip" when the switch reported a duration, "server-clock" when it did
+     * not and we measured it ourselves. Never absent: a bill nobody can trace
+     * to a source is a bill nobody can defend.
+     */
+    @SerialName("duration_source") val durationSource: String,
     @SerialName("billed_seconds") val billedSeconds: Int,
     @SerialName("charged_micros") val chargedMicros: Long,
     @SerialName("rate_micros_per_minute") val ratePerMinute: Long,
