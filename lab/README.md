@@ -17,16 +17,47 @@ by exactly that.
 That is Phase 1 ([#3](https://github.com/XYZTheo/MEGATRON/issues/3)): one call
 in, one call out, CDR emitted.
 
+**And then it carried audio.** With rtpengine anchoring the media:
+
+```
+CDR  bigcorp -> 12125551234  5s  5000u [server-clock]  media=4989852
+rtpstat: RTP: 119448 bytes, 474 packets ...
+```
+
 | File | What it is |
 |---|---|
-| [`opensips-lab.cfg`](opensips-lab.cfg) | Minimal OpenSIPS config that calls the switch API |
+| [`opensips-lab.cfg`](opensips-lab.cfg) | Signalling only — the switch API wired to SIP |
+| [`opensips-lab-media.cfg`](opensips-lab-media.cfg) | The same, plus rtpengine anchoring |
 | [`sipp-customer.xml`](sipp-customer.xml) | A softphone placing one call as `bigcorp` |
-| [`one-call.sh`](one-call.sh) | Builds, starts everything, places the call, checks the balance |
+| [`sipp-customer-audio.xml`](sipp-customer-audio.xml) | The same, sending real G.711 |
+| [`one-call.sh`](one-call.sh) · [`one-call-with-audio.sh`](one-call-with-audio.sh) | Build, start everything, place the call, check the balance |
 
 ```sh
 scp lab/* ubuntu@<box>:/tmp/
-ssh ubuntu@<box> 'bash /tmp/one-call.sh'
+ssh ubuntu@<box> 'bash /tmp/one-call-with-audio.sh'
 ```
+
+## The two media bugs, both silent
+
+**`onreply_route` was declared but never armed.** OpenSIPS only runs a named
+reply route for transactions that asked for it with `t_on_reply()`. Without
+that one line `rtpengine_answer()` never ran, so rtpengine never learned the
+callee's media address and forwarded nothing.
+
+The failure is completely invisible from the outside: the call sets up, both
+parties believe they are connected, and the stats read `RTP: 0 bytes`. On a
+real switch that is *every call carrying silence, billed in full* — the exact
+failure mode the media check exists to catch, caused by the check's own
+plumbing.
+
+**The parser did not match the format.** It understood `bytes=N`; OpenSIPS's
+`$rtpstat` emits `N bytes`, number first. So it returned "unknown" for every
+call — which reads exactly like a switch whose media stats are not wired up
+yet, so nothing looked wrong. It now accepts both, and the tests use strings
+copied verbatim from real calls rather than invented ones.
+
+Unreadable stats stay **unknown**, never zero. Guessing zero turns every
+healthy call into a refund request the day rtpengine changes its wording.
 
 ## This is NOT the production config
 

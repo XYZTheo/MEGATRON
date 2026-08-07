@@ -53,7 +53,8 @@ fun main() {
         // dropped, because a CDR that is silently discarded is revenue that
         // cannot be argued for with a carrier.
         println("CDR ${cdr.callId} ${cdr.account} -> ${cdr.destination} " +
-            "${cdr.billedSeconds}s ${cdr.chargedMicros}u [${cdr.durationSource}]" +
+            "${cdr.billedSeconds}s ${cdr.chargedMicros}u [${cdr.durationSource}] " +
+            "media=${cdr.mediaBytes ?: "unknown"}" +
             (if (cdr.noMedia) " NO-MEDIA" else "") +
             (if (cdr.overran) " OVERRAN" else ""))
     })

@@ -144,9 +144,14 @@ class CallService(
         // Answered, billed, and no audio ever flowed. Flagged rather than
         // silently charged: billing for silence is how a switch loses a
         // customer, and being unable to tell is how it loses several.
-        val noMedia = billedDuration > 0 &&
-            request.mediaBytes != null &&
-            request.mediaBytes == 0L
+        //
+        // mediaBytes may come explicitly, or be parsed out of rtpengine's
+        // totals string. Absent stays absent: "we do not know" and "there was
+        // none" are different facts, and treating the first as the second
+        // would flag every call on a switch whose media stats are not wired
+        // up yet.
+        val mediaBytes = request.mediaBytes ?: parseMediaBytes(request.mediaStats)
+        val noMedia = billedDuration > 0 && mediaBytes != null && mediaBytes == 0L
 
         // Keep the store's balance in step with the ledger, so the bot and the
         // switch agree about what a customer has left. In production the
@@ -177,7 +182,8 @@ class CallService(
                 billedSeconds = charge.billedSeconds,
                 chargedMicros = charge.total.value,
                 ratePerMinute = rate.sellPerMinute.value,
-                mediaBytes = request.mediaBytes,
+                mediaBytes = mediaBytes,
+                mediaStats = request.mediaStats,
                 noMedia = noMedia,
                 overran = settlement.overran,
                 hangupCause = request.hangupCause,
@@ -227,6 +233,35 @@ class CallService(
         )
         tables[planId] = CachedTable(plan.updatedAt, table)
         return table
+    }
+
+    /**
+     * Pull a byte count out of rtpengine's totals string.
+     *
+     * Deliberately forgiving about the shape and deliberately strict about
+     * the outcome: anything it cannot read returns null, which means "we do
+     * not know", NOT "there was no audio". Guessing zero from an unparseable
+     * string would flag healthy calls as silent the first time rtpengine
+     * changed its format -- and a false no-media flag on a busy switch is a
+     * pile of refund requests nobody can adjudicate.
+     */
+    internal fun parseMediaBytes(stats: String?): Long? {
+        if (stats.isNullOrBlank()) return null
+        // Two shapes, because the first guess was wrong and finding out cost
+        // a debugging round: OpenSIPS's $rtpstat reads
+        //   "RTP: 1234 bytes, 56 packets, 0 errors; RTCP: ..."
+        // where the number comes BEFORE the word, while JSON-ish sources use
+        // bytes=N or "bytes": N. Accept both rather than assume.
+        //
+        // RTCP is counted deliberately alongside RTP: a call carrying only
+        // RTCP still carried no audio, and summing both means the "was there
+        // media" question is answered by the same number either way.
+        val before = Regex("""(\d+)\s*bytes""", RegexOption.IGNORE_CASE)
+        val after = Regex("""bytes["'\s]*[=:]\s*(\d+)""", RegexOption.IGNORE_CASE)
+        val found = (before.findAll(stats) + after.findAll(stats))
+            .mapNotNull { it.groupValues[1].toLongOrNull() }
+            .toList()
+        return if (found.isEmpty()) null else found.sum()
     }
 
     private fun reject(reason: Refusal, detail: String, sipCode: Int) =

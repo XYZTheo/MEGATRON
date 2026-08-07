@@ -62,6 +62,17 @@ data class EndSessionRequest(
      * happened; only the media stats say it was worth anything.
      */
     @SerialName("media_bytes") val mediaBytes: Long? = null,
+    /**
+     * rtpengine's raw totals string, exactly as the switch read it.
+     *
+     * Parsed HERE rather than in OpenSIPS config. Picking numbers out of a
+     * string in a language with no types, on the money path, is how a format
+     * change in a dependency becomes a silent billing error — and the config
+     * has no way to report that it failed. The raw string is also kept on the
+     * CDR, so a disputed call can be re-examined against what rtpengine
+     * actually said rather than against our interpretation of it.
+     */
+    @SerialName("media_stats") val mediaStats: String? = null,
     @SerialName("hangup_cause") val hangupCause: String? = null,
 )
 
@@ -103,6 +114,8 @@ data class Cdr(
     @SerialName("charged_micros") val chargedMicros: Long,
     @SerialName("rate_micros_per_minute") val ratePerMinute: Long,
     @SerialName("media_bytes") val mediaBytes: Long?,
+    /** rtpengine's raw totals, kept so a disputed call can be re-examined. */
+    @SerialName("media_stats") val mediaStats: String? = null,
     @SerialName("no_media") val noMedia: Boolean,
     val overran: Boolean,
     @SerialName("hangup_cause") val hangupCause: String?,
