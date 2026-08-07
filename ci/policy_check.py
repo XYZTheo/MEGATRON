@@ -326,7 +326,26 @@ KNOWN_MANIFESTS = {
     "go.mod": False,
     "package.json": False,
     "Cargo.toml": False,
+    # Python was missing from this list while the project's own CI already
+    # depended on pip packages, which made the one ecosystem actually in use
+    # the one ecosystem invisible to the rule.
+    "requirements.txt": False,
+    "pyproject.toml": False,
+    "Pipfile": False,
+    "setup.py": False,
 }
+
+# KNOWN GAP, stated rather than left implicit: .github/workflows/validate.yml
+# installs pinned packages with an inline `pip install`, so those dependencies
+# enter CI without passing through any manifest this rule can see. They are
+# test-time only and never linked into a shipped MEGATRON binary, which is why
+# it is a note and not a violation — but "no manifest exists" is not the same
+# as "nothing is being installed", and the difference belongs in writing.
+INLINE_DEPENDENCY_NOTE = (
+    "CI installs pinned pip packages inline (openapi-spec-validator, jsonschema, "
+    "pyyaml) — test-time only, never linked into a shipped binary, and not covered "
+    "by any manifest scan"
+)
 
 # Files that legitimately discuss copyleft without being copyleft: our own
 # licence, the documents that explain the copyleft posture, this gate, and the
@@ -383,6 +402,7 @@ def check_licence(f: Findings) -> None:
     else:
         f.note("no dependency manifests yet — licence scanning is header-only so far, "
                "and this gate will fail the moment a manifest appears without a scanner")
+    f.note(INLINE_DEPENDENCY_NOTE)
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +429,7 @@ CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
 CSS_BLOCK_RE = re.compile(r"([^{}]+)\{([^{}]*)\}", re.S)
 CSS_DECL_RE = re.compile(r"(--[\w-]+)\s*:\s*([^;]+?)\s*(?:;|$)")
 HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+MG_TOKEN_DECL_RE = re.compile(r"--mg-[\w-]+\s*:")
 
 # The three blocks that must agree, keyed by the normalised selector. The
 # @media wrapper is not part of the selector — the block regex below skips
@@ -461,7 +482,41 @@ def check_theme_blocks_in_sync(f: Findings) -> None:
         f.note(f"no {TOKENS_CSS} yet — THEME-SYNC and PALETTE not exercised")
         return
 
-    blocks = parse_css_tokens(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+
+    # @layer breaks the one assumption parse_css_tokens makes about ordering.
+    # An unlayered normal rule beats a layered one no matter where either sits
+    # in the file (CSS Cascading and Inheritance L5), so "last occurrence in
+    # the text wins" — which is what dict.update() implements — is provably
+    # wrong the moment a layer exists. That is not a parser bug to work
+    # around; it is a signal this gate cannot reason about the file, so it
+    # stops rather than guessing.
+    if "@layer" in blank_block_comments(text):
+        f.fail("THEME-SYNC", path, None,
+               "@layer changes which declaration wins independently of source order, and "
+               "this gate resolves duplicates by source order. It cannot tell you which "
+               "value the browser would actually use. Declare tokens outside any layer.")
+
+    # Colour tokens may live in exactly one file. Anything else under ui/ that
+    # declares --mg-* is invisible to every check below, and a plain second
+    # stylesheet loaded after this one wins in the browser for the same
+    # selector — no exotic syntax required. That was a clean bypass:
+    #   ui/shield/theme-override.css
+    #     :root[data-theme="dark"] { --mg-ink-faint: var(--mg-ground); }
+    # no hex, no colour function, nothing for UI-SELF-CONTAINED to match, and
+    # ink rendered invisible on its own background while every rule said PASS.
+    for other in sorted((REPO / UI_DIR).rglob("*.css")) if (REPO / UI_DIR).is_dir() else []:
+        if other.resolve() == path.resolve():
+            continue
+        if MG_TOKEN_DECL_RE.search(blank_block_comments(
+                other.read_text(encoding="utf-8", errors="replace"))):
+            f.fail("THEME-SYNC", other, None,
+                   f"declares --mg-* tokens. They live in {TOKENS_CSS} and nowhere else: "
+                   f"the contrast and colour-vision checks read only that file, and a "
+                   f"stylesheet loaded after it wins in the browser while being measured "
+                   f"by nothing.")
+
+    blocks = parse_css_tokens(text)
 
     # Fail closed on any selector this gate does not model. See the comment on
     # CANONICAL_SELECTORS — an unrecognised selector is not an oddity, it is a
@@ -771,8 +826,29 @@ PROTOCOL_RELATIVE_RE = re.compile(r"""(?:src|href)\s*=\s*["']\s*//""", re.I)
 # whatever it evaluates to.
 FETCH_CALL_RE = re.compile(r"\bfetch\s*\(\s*([^,)]*)")
 FETCH_LITERAL_RE = re.compile(r"""^["']/[^"']*["']$""")
+
+# Channels that can reach the network without going through fetch(). Worker
+# and serviceWorker are the sharpest: those load and execute remote code, not
+# merely exfiltrate. Image().src is the oldest beacon trick there is.
 DYNAMIC_REQUEST_RE = re.compile(
-    r"\b(?:XMLHttpRequest|importScripts|navigator\s*\.\s*sendBeacon|EventSource|WebSocket)\b")
+    r"\b(?:XMLHttpRequest|importScripts|EventSource|WebSocket|SharedWorker|Worker"
+    r"|serviceWorker|sendBeacon|navigator\s*\.\s*\w+)\s*(?:\(|\.|\[)")
+
+# Indirection that defeats ANY call-site text match — the same argument the
+# fetch rule already makes, carried to its logical end. Matching `fetch(` is
+# useless if the author can write `const f = fetch; f(...)`, or reach the same
+# function as `window["fet" + "ch"]`. So the primitives that make a call site
+# unreadable are themselves the violation, regardless of what follows.
+INDIRECTION_RE = (
+    (re.compile(r"=\s*(?:window\s*\.\s*|globalThis\s*\.\s*)?fetch\s*[;,\n)]"),
+     "aliasing fetch to another name"),
+    (re.compile(r"\b(?:window|globalThis|navigator|self|document)\s*\["),
+     "bracket property access on a global, which hides the name being called"),
+    (re.compile(r"\.\s*src\s*=(?!=)"),
+     "assigning .src in script, which issues a request this gate cannot read"),
+    (re.compile(r"\bnew\s+Function\b|\beval\s*\("),
+     "constructing code at runtime"),
+)
 # Exactly the lengths CSS accepts for a hex colour, so ids like #chart-x and
 # entities like &#39; are not mistaken for one.
 HEX_LITERAL_RE = re.compile(r"#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{4}|[0-9a-fA-F]{3})\b")
@@ -791,11 +867,48 @@ def blank_block_comments(text: str) -> str:
     configs hit the identical trap earlier in this file's history — prose
     about a rule must not trip the rule.
 
-    JS `//` comments are deliberately NOT stripped here. Doing so would eat
-    everything after the "//" in a string like "https://cdn.example/x", which
-    is precisely the string this rule needs to see.
+    JS `//` comments are handled separately, by blank_line_comments below.
     """
     return BLOCK_COMMENT_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+
+
+def blank_line_comments(text: str) -> str:
+    """Blank `//` comments, preserving line count — but only real ones.
+
+    The naive version of this blinds the URL scanner completely: it eats
+    everything after the "//" in "https://cdn.example/x", which is the exact
+    string the rule is looking for. The naive version of NOT doing it fails
+    the build on any comment that merely mentions a URL or a fetch call — so
+    a note explaining why a CDN reference was removed becomes a CI failure.
+    That is the same "prose about the rule trips the rule" trap this file
+    already fixed once for block comments.
+
+    So: walk the text tracking string state, and treat `//` as a comment only
+    when it is outside a quote AND not immediately preceded by a colon (which
+    makes it a scheme separator — the unquoted-HTML-attribute case).
+    """
+    out = list(text)
+    i, n = 0, len(text)
+    quote = None
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            elif ch == "\n" and quote in ("'", '"'):
+                quote = None  # unterminated literal; do not swallow the file
+        elif ch in "'\"`":
+            quote = ch
+        elif ch == "/" and i + 1 < n and text[i + 1] == "/" and (i == 0 or text[i - 1] != ":"):
+            while i < n and text[i] != "\n":
+                out[i] = " "
+                i += 1
+            continue
+        i += 1
+    return "".join(out)
 
 
 # Browser-facing text formats this rule knows how to read.
@@ -827,10 +940,18 @@ def ui_files() -> tuple[list[Path], list[Path]]:
     for path in sorted(ui.rglob("*")):
         if not path.is_file():
             continue
-        # Derived directories are build output, never shipped, and are
-        # gitignored. Without this, fail-closed correctly but uselessly
-        # flags __pycache__ the moment anyone runs the tests.
-        if {"__pycache__", "node_modules", ".git"} & set(path.parts):
+        # __pycache__ is CPython bytecode: unambiguously tooling output, never
+        # served, and regenerated the moment anyone runs the tests. It is the
+        # only name skipped by name.
+        #
+        # node_modules is NOT skipped, and that is a fix rather than an
+        # oversight. Skipping a directory because of what it is called means a
+        # file at ui/shield/node_modules/evil.js — reachable with a perfectly
+        # ordinary <script src="node_modules/evil.js"> — is never opened. A
+        # package tree under ui/ is reported below as something this gate
+        # cannot audit, which is the honest answer: this project has no
+        # JavaScript package manager, so one appearing is news.
+        if "__pycache__" in path.parts or ".git" in path.parts:
             continue
         suffix = path.suffix.lower()
         if suffix in SCANNED_SUFFIXES:
@@ -864,8 +985,10 @@ def check_ui_self_contained(f: Findings) -> None:
         is_tokens = path.name == TOKENS_BASENAME
         # Scanned as ONE string rather than line by line. An HTML attribute
         # value may contain a literal newline, and splitting a URL across one
-        # defeated the per-line scan completely.
-        source = blank_block_comments(path.read_text(encoding="utf-8", errors="replace"))
+        # defeated the per-line scan completely. Comments of both kinds are
+        # blanked first so that prose about a rule cannot trip that rule.
+        source = blank_line_comments(
+            blank_block_comments(path.read_text(encoding="utf-8", errors="replace")))
 
         for match in EXTERNAL_URL_RE.finditer(source):
             url = " ".join(match.group(0).split())
@@ -882,8 +1005,16 @@ def check_ui_self_contained(f: Findings) -> None:
 
         for match in DYNAMIC_REQUEST_RE.finditer(source):
             f.fail("UI-SELF-CONTAINED", path, _line_of(source, match.start()),
-                   f"{match.group(0)} opens a request channel this rule cannot follow. "
-                   f"The console fetches same-origin paths and nothing else.")
+                   f"{match.group(0).strip()} opens a request channel this rule cannot "
+                   f"follow. The console fetches same-origin paths and nothing else — and "
+                   f"Worker/serviceWorker would be loading remote code, not just leaking.")
+
+        for pattern, what in INDIRECTION_RE:
+            for match in pattern.finditer(source):
+                f.fail("UI-SELF-CONTAINED", path, _line_of(source, match.start()),
+                       f"{what}. Every rule here reads source text, so an unreadable call "
+                       f"site defeats all of them at once — `const f = fetch; f(...)` is "
+                       f"the same bypass as a concatenated URL, one level up.")
 
         # Require the good shape rather than trying to recognise the bad one.
         for match in FETCH_CALL_RE.finditer(source):
@@ -903,11 +1034,6 @@ def check_ui_self_contained(f: Findings) -> None:
         for pattern in (HEX_LITERAL_RE, COLOUR_FN_RE):
             for match in pattern.finditer(source):
                 line_no = _line_of(source, match.start())
-                line = source.splitlines()[line_no - 1] if line_no <= source.count("\n") + 1 else ""
-                # A // line comment still suppresses the colour check only.
-                marker = line.find("//")
-                if marker != -1 and match.start() > source.rfind("\n", 0, match.start()) + marker:
-                    continue
                 f.fail("UI-SELF-CONTAINED", path, line_no,
                        f"colour literal {match.group(0)!r} outside {UI_DIR}/"
                        f"{TOKENS_BASENAME}. Use a --mg-* token: literals here are "

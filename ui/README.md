@@ -34,6 +34,17 @@ product.
   because with no browser in the toolchain a typo'd id is a TypeError nothing
   else in the pipeline would find.
 
+**Known limitation, not a defect:** the blocklist panel requests the contract
+maximum of 500 entries and does not walk `next_cursor`. Beyond 500 blocked
+sources the table says so explicitly and the headline count stays correct (it
+comes from `blocked_sources` in the overview, which is the node's true total) —
+but there is no search or filter, so an operator cannot yet reach a specific
+address outside the most recent 500. That matters, because the contract calls
+unblocking "the most important write operation in the product". A search
+endpoint is the right fix and belongs with the node agent
+([#4](https://github.com/XYZTheo/MEGATRON/issues/4)); paging the UI through
+thousands of rows at 3am is not.
+
 **NOT verified:**
 
 - **The JavaScript has never been executed and the page has never been

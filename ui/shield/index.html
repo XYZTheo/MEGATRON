@@ -703,11 +703,38 @@ function buildChart(container, points, key, seriesLabel) {
    comparing them AT THE SAME MOMENT — the linked cursor is what makes two
    separate scales safe to read together, and it is the reason this is a
    correct answer to the problem a dual axis answers wrongly. */
+let crosshairCleanup = null;
+
 function linkCrosshair(charts, tipHost) {
+  /* render() now runs on every poll tick, so this function runs every few
+     seconds for as long as the tab is open — which is precisely the duration
+     of the attack it exists to display.
+
+     Two things therefore have to be undone before they are redone. The
+     tooltip is appended to the PANEL, not to either chart container, so
+     buildChart's `container.querySelectorAll("svg, .tooltip")` cleanup never
+     reaches it: without this, every tick orphaned another tooltip node in the
+     DOM. And the panel is persistent, so its pointerleave listener accumulated
+     one closure per tick, each retaining that tick's points array. Unbounded
+     growth over a sustained incident, in the one page that must not fall over
+     during one.
+
+     An AbortController is the cheap way to be sure: every listener registered
+     below is revoked in one call, including any added later. */
+  if (crosshairCleanup) crosshairCleanup();
+
   const tip = document.createElement("div");
   tip.className = "tooltip";
   tip.hidden = true;
   tipHost.appendChild(tip);
+
+  const listeners = new AbortController();
+  const signal = listeners.signal;
+  crosshairCleanup = () => {
+    listeners.abort();
+    tip.remove();
+    crosshairCleanup = null;
+  };
 
   const hide = () => {
     tip.hidden = true;
@@ -753,10 +780,11 @@ function linkCrosshair(charts, tipHost) {
       }
       return best;
     };
-    c.svg.addEventListener("pointermove", (e) => show(indexAt(e), e.clientX, e.clientY));
-    c.svg.addEventListener("pointerleave", hide);
+    c.svg.addEventListener("pointermove",
+      (e) => show(indexAt(e), e.clientX, e.clientY), { signal });
+    c.svg.addEventListener("pointerleave", hide, { signal });
   });
-  tipHost.addEventListener("pointerleave", hide);
+  tipHost.addEventListener("pointerleave", hide, { signal });
 }
 
 /* ── Rendering ──────────────────────────────────────────────────────────── */
@@ -777,6 +805,10 @@ function render(data, isDemo) {
      switch being down. Say "no data yet" and keep the rest of the page. */
   const series = Array.isArray(data.series) ? data.series : [];
   if (series.length === 0) {
+    /* This path skips linkCrosshair, so nothing else would take down the
+       previous tick's tooltip — leaving one hovering over charts that are no
+       longer there. */
+    if (crosshairCleanup) crosshairCleanup();
     $("stat-accepted").textContent = "—";
     $("stat-absorbed").textContent = "—";
     $("stat-blocked").textContent = compact(data.blocked_sources);
@@ -1020,8 +1052,13 @@ async function loadOverview() {
     }
     if (overviewRes.status === 503 || blocksRes.status === 503) {
       /* Telemetry is shed first, by design. The node is up and busy; keep
-         the last good data on screen and mark it stale. */
-      const retry = Number(overviewRes.headers.get("Retry-After")) || POLL_FALLBACK_S;
+         the last good data on screen and mark it stale.
+
+         Retry-After is read from whichever response actually returned 503 —
+         either endpoint can shed independently, and reading it off the wrong
+         one silently discards the node's own backoff instruction. */
+      const shedding = overviewRes.status === 503 ? overviewRes : blocksRes;
+      const retry = Number(shedding.headers.get("Retry-After")) || POLL_FALLBACK_S;
       showProblem("node shedding telemetry", "▲");
       scheduleNext(retry);
       return;
