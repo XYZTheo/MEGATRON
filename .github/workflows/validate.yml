@@ -295,7 +295,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install the validator
-        run: pip install --quiet openapi-spec-validator==0.7.1
+        run: pip install --quiet openapi-spec-validator==0.7.1 jsonschema==4.26.0 pyyaml==6.0.3
 
       - name: Validate every contract in the tree
         # Discovered rather than listed, for the same reason the OpenSIPS job
@@ -321,3 +321,10 @@ jobs:
             fi
           done
           exit $rc
+
+      - name: Check the dashboard fixture against the contract
+        # The dashboard exists before the Go node agent in order to pin down
+        # what that agent must serve. A fixture that has drifted from the
+        # contract pins down nothing while looking like it does, and the drift
+        # would only surface the day the real agent is finally wired in.
+        run: python3 ci/check_fixtures.py

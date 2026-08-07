@@ -451,15 +451,23 @@ def check_theme_blocks_in_sync(f: Findings) -> None:
                f"no '{BASE_SELECTOR}' block declaring --mg-* tokens was found")
         return
 
-    # Colour tokens are the ones a theme must restate. Type and density are
-    # mode-invariant by design and are declared once.
+    # A token is a colour token if :root gives it a hex value OR any theme
+    # block restates it. Deriving the set from BOTH sides matters: taking it
+    # only from :root means a value :root writes in a form the regex cannot
+    # read (a 3-digit #9AA, rgb(), a named colour, a trailing !important)
+    # quietly drops out of the set and stops being measured at all. Every
+    # token in the union must then be a parseable 6-digit hex EVERYWHERE, so
+    # an unreadable value fails the build instead of disappearing from it.
+    theme_blocks = {sel: blocks.get(sel) for sel in (*DARK_SELECTORS, LIGHT_SELECTOR)}
     colour_tokens = {name for name, value in base.items() if HEX_RE.match(value)}
+    for block in theme_blocks.values():
+        if block:
+            colour_tokens |= set(block)
     if not colour_tokens:
         f.fail("THEME-SYNC", path, None, f"'{BASE_SELECTOR}' declares no colour tokens")
         return
 
-    for selector in (*DARK_SELECTORS, LIGHT_SELECTOR):
-        block = blocks.get(selector)
+    for selector, block in (((BASE_SELECTOR, base),) + tuple(theme_blocks.items())):
         if block is None:
             f.fail("THEME-SYNC", path, None,
                    f"missing theme block '{selector}'. Every theme must restate every "
@@ -470,12 +478,15 @@ def check_theme_blocks_in_sync(f: Findings) -> None:
             f.fail("THEME-SYNC", path, None,
                    f"'{selector}' omits {', '.join(missing)} — those tokens would keep "
                    f"the other theme's value")
-        extra = sorted(set(block) - colour_tokens)
-        if extra:
-            f.fail("THEME-SYNC", path, None,
-                   f"'{selector}' declares {', '.join(extra)}, which {BASE_SELECTOR} does "
-                   f"not declare as a colour. Type and density are mode-invariant; if that "
-                   f"is genuinely changing, change this rule deliberately.")
+        for token in sorted(colour_tokens & set(block)):
+            if not HEX_RE.match(block[token]):
+                f.fail("THEME-SYNC", path, None,
+                       f"'{selector}' sets {token} to {block[token]!r}, which this gate "
+                       f"cannot measure. Colour tokens are written as 6-digit hex so the "
+                       f"contrast and colour-vision checks can read them — a form they "
+                       f"cannot parse is a colour that silently stops being checked. If "
+                       f"this is genuinely not a colour, do not declare it in a theme "
+                       f"block.")
 
     # The two dark blocks are the same palette written twice. Byte-identical
     # values, or the OS-preference path and the explicit-toggle path render
@@ -510,6 +521,18 @@ SERIES_RE = re.compile(r"^--mg-series-(\d+)$")
 
 TEXT_CONTRAST_MIN = 4.5   # WCAG AA, small text. Every ink step carries small text.
 NONTEXT_CONTRAST_MIN = 3.0  # focus rings, link underlines, chart marks
+
+# Tokens this rule MUST be able to measure. Without this list the gate fails
+# OPEN in the most inviting way available: delete or rename --mg-series-*, and
+# the entire categorical/colour-vision battery stops running while the gate
+# still prints PASS. That was a real bypass, found by attacking this file
+# rather than by reading it, and it is the same failure mode the LICENCE rule
+# already refuses (it fails closed on a manifest it has no scanner for).
+#
+# Two series is the minimum a shield dashboard needs: accepted and absorbed.
+REQUIRED_TOKENS = (SURFACE_TOKENS + INK_TOKENS + ("--mg-accent",)
+                   + tuple(t for pair in STATUS_PAIRS for t in pair))
+REQUIRED_SERIES = 2
 
 
 def load_validator():
@@ -555,7 +578,18 @@ def check_palette(f: Findings) -> None:
 
     for mode, tokens in modes.items():
         if not tokens:
+            f.fail("PALETTE", path, None,
+                   f"{mode}: no token block found, so nothing was measured")
             continue
+
+        # Fail closed on anything this rule is supposed to measure but cannot.
+        absent = [t for t in REQUIRED_TOKENS if not HEX_RE.match(tokens.get(t, ""))]
+        if absent:
+            f.fail("PALETTE", path, None,
+                   f"{mode}: {', '.join(absent)} missing or unreadable. These are the "
+                   f"tokens this rule exists to measure; without them it would report "
+                   f"PASS having checked nothing.")
+
         surfaces = [(t, tokens[t]) for t in SURFACE_TOKENS if HEX_RE.match(tokens.get(t, ""))]
         if not surfaces:
             f.fail("PALETTE", path, None, f"{mode}: no surface tokens to measure against")
@@ -604,8 +638,12 @@ def check_palette(f: Findings) -> None:
                   sorted((n for n in tokens if SERIES_RE.match(n)),
                          key=lambda n: int(SERIES_RE.match(n).group(1)))
                   if HEX_RE.match(tokens[name])]
-        if not series:
-            f.note(f"{mode}: no --mg-series-* tokens — categorical checks not exercised")
+        if len(series) < REQUIRED_SERIES:
+            f.fail("PALETTE", path, None,
+                   f"{mode}: found {len(series)} readable --mg-series-* token(s), need at "
+                   f"least {REQUIRED_SERIES}. The dashboard plots accepted against "
+                   f"absorbed; with fewer series the colour-vision battery below would "
+                   f"not run and this rule would pass having proved nothing.")
             continue
         surface = tokens.get("--mg-ground", "")
         report, ok = vp.validate(series, mode, surface)
@@ -632,6 +670,109 @@ def check_palette(f: Findings) -> None:
 
 
 # ---------------------------------------------------------------------------
+# UI-SELF-CONTAINED
+#
+# ui/shield/index.html claims two things about itself: that it makes no
+# external requests, and that it invents no colours. Both are load-bearing and
+# both are cheap to check, so neither is left as a promise in a comment.
+#
+# The egress half is a security property. The shield console ships on the edge
+# node — the most exposed thing we build, and the page an operator opens
+# precisely when something is wrong. A CDN reference there is an availability
+# dependency on a third party during an incident, a privacy leak of who is
+# under attack and when, and a supply-chain hole in a product whose entire
+# pitch is not being MagnusBilling.
+#
+# The colour half keeps the PALETTE rule meaningful. A hex literal in a
+# stylesheet routes straight around the contrast and colour-vision checks,
+# which only ever see tokens.css.
+# ---------------------------------------------------------------------------
+
+UI_DIR = "ui"
+TOKENS_BASENAME = "tokens.css"
+
+# SVG and XHTML namespace URIs are identifiers, not fetches — createElementNS
+# requires the literal string and nothing is ever requested from it.
+URL_ALLOWLIST = (
+    "http://www.w3.org/2000/svg",
+    "http://www.w3.org/1999/xhtml",
+)
+
+EXTERNAL_URL_RE = re.compile(r"https?://[^\s\"'()<>]+")
+PROTOCOL_RELATIVE_RE = re.compile(r"""(?:src|href)\s*=\s*["']//""", re.I)
+# Exactly the lengths CSS accepts for a hex colour, so ids like #chart-x and
+# entities like &#39; are not mistaken for one.
+HEX_LITERAL_RE = re.compile(r"#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{4}|[0-9a-fA-F]{3})\b")
+COLOUR_FN_RE = re.compile(r"\b(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\s*\(")
+
+
+BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/|<!--.*?-->", re.S)
+
+
+def blank_block_comments(text: str) -> str:
+    """Blank out /* */ and <!-- --> comments, preserving line count.
+
+    Line-by-line stripping is not enough and this is not hypothetical: the
+    first run of this rule flagged the word "rgba()" inside a multi-line
+    comment that exists to explain why the file does not use rgba(). The
+    configs hit the identical trap earlier in this file's history — prose
+    about a rule must not trip the rule.
+
+    JS `//` comments are deliberately NOT stripped here. Doing so would eat
+    everything after the "//" in a string like "https://cdn.example/x", which
+    is precisely the string this rule needs to see.
+    """
+    return BLOCK_COMMENT_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+
+
+def ui_files() -> list[Path]:
+    ui = REPO / UI_DIR
+    if not ui.is_dir():
+        return []
+    return sorted(p for p in ui.rglob("*")
+                  if p.is_file() and p.suffix.lower() in {".html", ".htm", ".css", ".js"})
+
+
+def check_ui_self_contained(f: Findings) -> None:
+    files = ui_files()
+    if not files:
+        f.note("no ui/ files yet — UI-SELF-CONTAINED not exercised")
+        return
+
+    checked = 0
+    for path in files:
+        rel = path.relative_to(REPO).as_posix()
+        is_tokens = path.name == TOKENS_BASENAME
+        checked += 1
+        source = blank_block_comments(path.read_text(encoding="utf-8", errors="replace"))
+        for n, line in enumerate(source.splitlines(), start=1):
+            for match in EXTERNAL_URL_RE.finditer(line):
+                url = match.group(0)
+                if any(url.startswith(allowed) for allowed in URL_ALLOWLIST):
+                    continue
+                f.fail("UI-SELF-CONTAINED", path, n,
+                       f"references {url}. The shield console is served from the edge "
+                       f"node and must load nothing from the internet — an operator "
+                       f"opens it when things are already going wrong.")
+            if PROTOCOL_RELATIVE_RE.search(line):
+                f.fail("UI-SELF-CONTAINED", path, n,
+                       "protocol-relative URL. Same rule: no external resources.")
+
+            # tokens.css is where colours are allowed to be literal; that is
+            # the whole point of it, and the PALETTE rule reads it there.
+            if is_tokens:
+                continue
+            code = line.split("//", 1)[0]
+            if HEX_LITERAL_RE.search(code) or COLOUR_FN_RE.search(code):
+                f.fail("UI-SELF-CONTAINED", path, n,
+                       f"colour literal outside {UI_DIR}/{TOKENS_BASENAME}. Use a "
+                       f"--mg-* token: literals here are invisible to the PALETTE "
+                       f"contrast and colour-vision checks.")
+
+    f.note(f"{checked} ui/ file(s) checked for external requests and colour literals")
+
+
+# ---------------------------------------------------------------------------
 
 CHECKS = (
     check_kamailio_names,
@@ -642,6 +783,7 @@ CHECKS = (
     check_licence,
     check_theme_blocks_in_sync,
     check_palette,
+    check_ui_self_contained,
 )
 
 

@@ -1,0 +1,935 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MEGATRON Shield — node telemetry</title>
+
+<!--
+  ===========================================================================
+  MEGATRON — OPERATOR DASHBOARD (shield tier)
+  ===========================================================================
+
+  Answers the four questions from contracts/shield-telemetry.openapi.yaml:
+
+    1. Am I still up, and is legitimate traffic still getting through?
+    2. How much am I absorbing?
+    3. Where is it coming from?
+    4. Why did that address get blocked, and how do I undo it?
+
+  STATUS: this is a real client of a contract that has no implementation.
+  The Go node agent is not written (issue #4). Opened from the filesystem it
+  renders FIXTURE data and says so, loudly and permanently, in the header.
+  It has never been served by a MEGATRON node, because no MEGATRON component
+  has ever run on Linux (issue #2).
+
+  ---------------------------------------------------------------------------
+  WHY TWO CHARTS AND NOT ONE
+  ---------------------------------------------------------------------------
+  Accepted and absorbed differ by orders of magnitude during an attack — a few
+  hundred legitimate requests against tens of thousands of hostile ones. On a
+  shared axis the accepted line flattens onto the baseline and disappears,
+  which destroys the single most important thing the operator came to see:
+  that their real traffic is still flowing.
+
+  The fix is NOT a second y-axis. A dual-axis chart invites the reader to
+  compare two lines whose relative heights are an artefact of two arbitrary
+  scales, and the crossing points mean nothing. The fix is two charts, each
+  with its own scale, sharing one x-axis and one linked crosshair. Comparison
+  is then over TIME, which is real, rather than over height, which is not.
+
+  ---------------------------------------------------------------------------
+  WHY ABSORBED TRAFFIC IS NOT RED
+  ---------------------------------------------------------------------------
+  Absorbed attack volume is the product working. Painting it red would make
+  the shield's success look like an emergency, and would train the operator to
+  ignore red — which is the exact reflex you do not want when something is
+  genuinely wrong. Red is reserved for states that need a human.
+
+  ---------------------------------------------------------------------------
+  NO EXTERNAL REQUESTS
+  ---------------------------------------------------------------------------
+  No CDN, no web font, no analytics, no icon library. Everything here is this
+  file plus ../tokens.css. An edge node is the most exposed thing we ship and
+  it must be able to serve its own console with no egress at all — and an
+  operator behind a firewalled NOC must not get a broken page.
+  ===========================================================================
+-->
+
+<link rel="stylesheet" href="../tokens.css">
+
+<style>
+  /* Nothing here invents a colour. Every value comes from tokens.css, which
+     is contrast-validated in CI (ci/policy_check.py, rule group PALETTE).
+     A hex literal in this file would route around that gate. */
+
+  *, *::before, *::after { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--mg-ground);
+    color: var(--mg-ink);
+    font-family: var(--mg-font-ui);
+    font-size: var(--mg-size-body);
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Every number, address, code and timestamp is set in the data face with
+     tabular figures. In telephony almost everything on screen is a code, and
+     codes are read by scanning a column — proportional digits break that. */
+  .data, .stat-value, td.num, .addr, time {
+    font-family: var(--mg-font-data);
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+
+  .wrap { max-width: 1180px; margin: 0 auto; padding: var(--mg-gap); }
+
+  /* ── Header ──────────────────────────────────────────────────────────── */
+
+  header.bar {
+    display: flex; align-items: center; gap: var(--mg-gap);
+    flex-wrap: wrap;
+    padding-bottom: var(--mg-pad);
+    border-bottom: 1px solid var(--mg-line);
+  }
+  .brand { font-weight: 600; letter-spacing: .02em; margin-right: auto; }
+  .brand span { color: var(--mg-ink-muted); font-weight: 400; }
+
+  .label {
+    font-size: var(--mg-size-label);
+    text-transform: uppercase;
+    letter-spacing: .11em;
+    color: var(--mg-ink-faint);
+  }
+
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 9px;
+    border: 1px solid var(--mg-line-strong);
+    border-radius: var(--mg-radius);
+    font-size: var(--mg-size-meta);
+    color: var(--mg-ink-muted);
+    white-space: nowrap;
+  }
+  /* Status never rides on colour alone: every chip carries a glyph and a
+     word as well. That is what keeps it readable for a colour-blind operator,
+     in forced-colors mode, and on a printout. */
+  .chip.good     { color: var(--mg-good);     background: var(--mg-good-bg);     border-color: transparent; }
+  .chip.warning  { color: var(--mg-warning);  background: var(--mg-warning-bg);  border-color: transparent; }
+  .chip.critical { color: var(--mg-critical); background: var(--mg-critical-bg); border-color: transparent; }
+  .chip .glyph { font-family: var(--mg-font-data); }
+
+  button {
+    font: inherit;
+    font-size: var(--mg-size-meta);
+    color: var(--mg-ink-muted);
+    background: var(--mg-raised);
+    border: 1px solid var(--mg-line-strong);
+    border-radius: var(--mg-radius);
+    padding: 4px 10px;
+    cursor: pointer;
+  }
+  button:hover { background: var(--mg-sunken); color: var(--mg-ink); }
+  /* A visible focus ring is not decoration. An operator driving this by
+     keyboard during an incident must always know where they are. */
+  :focus-visible {
+    outline: 2px solid var(--mg-accent);
+    outline-offset: 2px;
+  }
+
+  /* ── The demo banner ─────────────────────────────────────────────────── */
+  /* Deliberately impossible to miss and impossible to dismiss. A dashboard
+     showing invented numbers that looks exactly like one showing real ones
+     is a way to get an operator to make a decision on fiction. */
+  .demo {
+    margin-top: var(--mg-gap);
+    padding: 10px var(--mg-pad);
+    border: 1px solid var(--mg-warning);
+    border-left-width: 3px;
+    border-radius: var(--mg-radius);
+    background: var(--mg-warning-bg);
+    color: var(--mg-warning);
+    font-size: var(--mg-size-meta);
+  }
+  .demo b { font-weight: 600; }
+
+  /* ── Stat tiles ──────────────────────────────────────────────────────── */
+
+  .tiles {
+    display: grid; gap: var(--mg-gap);
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    margin-top: var(--mg-gap);
+  }
+  .tile {
+    background: var(--mg-raised);
+    border: 1px solid var(--mg-line);
+    border-radius: var(--mg-radius);
+    padding: var(--mg-pad);
+  }
+  .stat-value {
+    font-size: var(--mg-size-stat);
+    line-height: 1.1;
+    margin-top: 6px;
+    display: block;
+  }
+  .tile .sub { font-size: var(--mg-size-meta); color: var(--mg-ink-muted); margin-top: 4px; }
+  /* The swatch is the legend link between a tile and its chart. It is a
+     redundant cue, never the only one — the tile is labelled in words too. */
+  .swatch {
+    display: inline-block; width: 9px; height: 9px;
+    border-radius: 2px; margin-right: 7px; vertical-align: baseline;
+  }
+  .swatch.s1 { background: var(--mg-series-1); }
+  .swatch.s2 { background: var(--mg-series-2); }
+
+  /* ── Panels ──────────────────────────────────────────────────────────── */
+
+  section.panel {
+    background: var(--mg-raised);
+    border: 1px solid var(--mg-line);
+    border-radius: var(--mg-radius);
+    padding: var(--mg-pad);
+    margin-top: var(--mg-gap);
+  }
+  .panel-head {
+    display: flex; align-items: baseline; gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  h2 {
+    font-size: var(--mg-size-h2); font-weight: 600;
+    margin: 0; margin-right: auto;
+  }
+  .panel-note { font-size: var(--mg-size-meta); color: var(--mg-ink-muted); }
+
+  .cols { display: grid; gap: var(--mg-gap); grid-template-columns: repeat(auto-fit, minmax(430px, 1fr)); }
+
+  /* ── Charts ──────────────────────────────────────────────────────────── */
+
+  .chart { position: relative; }
+  .chart + .chart { margin-top: 6px; }
+  .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+
+  .grid-line { stroke: var(--mg-line); stroke-width: 1; }
+  .axis-text { fill: var(--mg-ink-faint); font-size: var(--mg-size-label); font-family: var(--mg-font-data); }
+  .series-line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .s1 .series-line { stroke: var(--mg-series-1); }
+  .s2 .series-line { stroke: var(--mg-series-2); }
+  .s1 .series-fill { fill: var(--mg-series-1); opacity: .13; }
+  .s2 .series-fill { fill: var(--mg-series-2); opacity: .13; }
+  /* The 2px surface ring is what keeps the marker legible where it overlaps
+     its own line and the crosshair. */
+  .cursor-dot { stroke: var(--mg-raised); stroke-width: 2; }
+  .s1 .cursor-dot { fill: var(--mg-series-1); }
+  .s2 .cursor-dot { fill: var(--mg-series-2); }
+  .crosshair { stroke: var(--mg-line-strong); stroke-width: 1; stroke-dasharray: 3 3; }
+  .chart-title { font-size: var(--mg-size-meta); color: var(--mg-ink-muted); margin-bottom: 2px; }
+  .chart-title .val { color: var(--mg-ink); font-family: var(--mg-font-data); font-variant-numeric: tabular-nums; }
+
+  .tooltip {
+    position: absolute; pointer-events: none;
+    background: var(--mg-raised);
+    border: 1px solid var(--mg-line-strong);
+    border-radius: var(--mg-radius);
+    padding: 7px 9px;
+    font-size: var(--mg-size-meta);
+    white-space: nowrap;
+    z-index: 5;
+    /* Separated by a hairline, not a drop shadow. tokens.css says separation
+       is done with rules rather than shadows and floating cards; a tooltip is
+       not the place to make an exception, and a shadow would have needed a
+       raw rgba() that no token supplies. */
+  }
+  .tooltip .t-row { display: flex; gap: 10px; justify-content: space-between; }
+  .tooltip .t-row .v { font-family: var(--mg-font-data); font-variant-numeric: tabular-nums; }
+  .tooltip .t-time { color: var(--mg-ink-faint); margin-bottom: 4px; }
+
+  /* ── Tables ──────────────────────────────────────────────────────────── */
+
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: var(--mg-size-data); }
+  caption { text-align: left; color: var(--mg-ink-muted); font-size: var(--mg-size-meta); padding-bottom: 6px; }
+  th {
+    text-align: left;
+    font-size: var(--mg-size-label);
+    text-transform: uppercase;
+    letter-spacing: .11em;
+    color: var(--mg-ink-faint);
+    font-weight: 600;
+    padding: 0 10px var(--mg-row-y) 0;
+    border-bottom: 1px solid var(--mg-line);
+    white-space: nowrap;
+  }
+  td {
+    padding: var(--mg-row-y) 10px var(--mg-row-y) 0;
+    border-bottom: 1px solid var(--mg-line);
+    color: var(--mg-ink);
+  }
+  tbody tr:hover td { background: var(--mg-sunken); }
+  td.num, th.num { text-align: right; }
+  .addr { color: var(--mg-ink); }
+  .muted { color: var(--mg-ink-muted); }
+  .ua {
+    color: var(--mg-ink-muted); font-family: var(--mg-font-data);
+    font-size: var(--mg-size-meta);
+    max-width: 22ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    display: inline-block; vertical-align: bottom;
+  }
+
+  /* A bar inside a table cell. Length carries magnitude; the number beside
+     it carries the value. Neither one alone. */
+  .bar-cell { min-width: 90px; }
+  .bar { height: 6px; border-radius: 2px; background: var(--mg-series-2); opacity: .55; }
+
+  .visually-hidden {
+    position: absolute; width: 1px; height: 1px;
+    padding: 0; margin: -1px; overflow: hidden;
+    clip-path: inset(50%); white-space: nowrap;
+  }
+  [hidden] { display: none !important; }
+
+  footer.foot {
+    margin: var(--mg-gap) 0 40px;
+    padding-top: var(--mg-pad);
+    border-top: 1px solid var(--mg-line);
+    font-size: var(--mg-size-meta);
+    color: var(--mg-ink-muted);
+  }
+
+  /* Forced-colors: let the OS win, and make sure nothing depended on our
+     fills surviving. The glyph+word pairing on every status carries through. */
+  @media (forced-colors: active) {
+    .tile, .panel, .chip { border: 1px solid CanvasText; }
+    .series-line { stroke: CanvasText; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="bar">
+    <div class="brand">MEGATRON <span>· shield</span></div>
+
+    <span class="chip"><span class="label">node</span>
+      <span class="data" id="node-id">—</span></span>
+
+    <span class="chip"><span class="label">mode</span>
+      <span id="mode">—</span></span>
+
+    <span class="chip" id="status-chip" role="status">
+      <span class="glyph" aria-hidden="true">●</span><span id="status-text">connecting</span></span>
+
+    <span class="chip"><span class="label">updated</span>
+      <time id="updated">—</time></span>
+
+    <button id="theme-toggle" type="button" aria-pressed="false">Dark</button>
+  </header>
+
+  <!-- Never removed by script when the data is real; see loadOverview(). -->
+  <div class="demo" id="demo-banner" hidden>
+    <b>Demo data.</b> No MEGATRON node is serving this page. Every number below
+    is a fixture from <span class="data">fixtures/overview.json</span>, shaped to
+    <span class="data">contracts/shield-telemetry.openapi.yaml</span>. The node
+    agent that would serve it does not exist yet (issue&nbsp;#4).
+  </div>
+
+  <!-- ── Headline ─────────────────────────────────────────────────────── -->
+
+  <div class="tiles">
+    <div class="tile">
+      <div class="label"><span class="swatch s1" aria-hidden="true"></span>Accepted</div>
+      <span class="stat-value" id="stat-accepted">—</span>
+      <div class="sub">requests in window</div>
+    </div>
+    <div class="tile">
+      <div class="label"><span class="swatch s2" aria-hidden="true"></span>Absorbed</div>
+      <span class="stat-value" id="stat-absorbed">—</span>
+      <div class="sub" id="stat-absorbed-sub">requests in window</div>
+    </div>
+    <div class="tile">
+      <div class="label">Sources blocked</div>
+      <span class="stat-value" id="stat-blocked">—</span>
+      <div class="sub">currently in the blocklist</div>
+    </div>
+    <div class="tile">
+      <div class="label">Legitimate traffic</div>
+      <span class="stat-value" id="stat-verdict">—</span>
+      <div class="sub" id="stat-verdict-sub">&nbsp;</div>
+    </div>
+  </div>
+
+  <!-- ── Charts ───────────────────────────────────────────────────────── -->
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Traffic</h2>
+      <span class="panel-note" id="window-note"></span>
+      <button id="table-toggle" type="button" aria-expanded="false" aria-controls="series-table">
+        Show as table
+      </button>
+    </div>
+
+    <p class="panel-note" style="margin-top:0">
+      Two charts, one shared time axis. Accepted and absorbed differ by orders of
+      magnitude under attack, so a single scale would flatten the accepted line
+      onto the baseline — and whether real traffic is still flowing is the whole
+      question. They are never plotted against two y-axes on one chart: relative
+      heights there are an artefact of the scales, not a fact about the traffic.
+    </p>
+
+    <div class="chart s1" id="chart-accepted">
+      <div class="chart-title">
+        <span class="swatch s1" aria-hidden="true"></span>Accepted requests/s
+        · now <span class="val" id="now-accepted">—</span>
+      </div>
+    </div>
+
+    <div class="chart s2" id="chart-absorbed">
+      <div class="chart-title">
+        <span class="swatch s2" aria-hidden="true"></span>Absorbed requests/s
+        · now <span class="val" id="now-absorbed">—</span>
+      </div>
+    </div>
+
+    <!-- The table view is the accessibility floor: every value in the charts
+         is reachable without reading a pixel. Also how an operator copies a
+         number into a ticket. -->
+    <div class="scroll" id="series-table" hidden>
+      <table>
+        <caption>Accepted and absorbed requests per second, by bucket.</caption>
+        <thead>
+          <tr>
+            <th scope="col">Time</th>
+            <th scope="col" class="num">Accepted</th>
+            <th scope="col" class="num">Absorbed</th>
+          </tr>
+        </thead>
+        <tbody id="series-tbody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ── Where from / why ─────────────────────────────────────────────── -->
+
+  <div class="cols">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Top sources</h2>
+        <span class="panel-note">by hostile requests in window</span>
+      </div>
+      <div class="scroll">
+        <table>
+          <caption class="visually-hidden">Heaviest hostile sources in the window.</caption>
+          <thead>
+            <tr>
+              <th scope="col">Source</th>
+              <th scope="col">Country</th>
+              <th scope="col">Classified</th>
+              <th scope="col" class="num">Requests</th>
+              <th scope="col" class="bar-cell"><span class="visually-hidden">Share</span></th>
+            </tr>
+          </thead>
+          <tbody id="sources-tbody"></tbody>
+        </table>
+      </div>
+      <p class="panel-note" style="margin-bottom:0">
+        Country is advisory. It is never an input to a blocking decision —
+        blocking by country loses customers and attackers route around it in
+        minutes.
+      </p>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Blocklist</h2>
+        <span class="panel-note">newest first · all entries expire</span>
+      </div>
+      <div class="scroll">
+        <table>
+          <caption class="visually-hidden">Currently blocked sources and the evidence for each block.</caption>
+          <thead>
+            <tr>
+              <th scope="col">Source</th>
+              <th scope="col">Why</th>
+              <th scope="col" class="num">Hits</th>
+              <th scope="col">Expires</th>
+              <th scope="col"><span class="visually-hidden">Action</span></th>
+            </tr>
+          </thead>
+          <tbody id="blocks-tbody"></tbody>
+        </table>
+      </div>
+      <p class="panel-note" style="margin-bottom:0">
+        Every block shows its evidence and can be undone. An operator whose only
+        remedy for a false positive is to switch automated blocking off will
+        switch automated blocking off.
+      </p>
+    </section>
+  </div>
+
+  <footer class="foot">
+    Client of <span class="data">contracts/shield-telemetry.openapi.yaml</span>.
+    Colours come from <span class="data">ui/tokens.css</span> and are
+    contrast- and colour-vision-validated in CI
+    (<span class="data">ci/policy_check.py</span>, rule group PALETTE).
+    This page makes no external requests.
+  </footer>
+
+</div>
+
+<!--
+  The fixture. Inline rather than fetched because a dashboard opened from the
+  filesystem cannot fetch a sibling file (file:// is an opaque origin), and
+  the point of this page is that it renders with no server and no network.
+  Shape conforms to the Overview and BlockPage schemas in the contract.
+-->
+<script type="application/json" id="fixture">
+{
+  "node_id": "edge-lhr-01",
+  "mode": "transparent",
+  "generated_at": "2026-08-06T21:44:00Z",
+  "window": "1h",
+  "poll_after_seconds": 5,
+  "accepted": { "packets": 1042118, "requests": 41194 },
+  "absorbed": { "packets": 98443127, "requests": 7734512 },
+  "series": [
+    {"t":"2026-08-06T20:44:00Z","accepted":11,"absorbed":38},
+    {"t":"2026-08-06T20:47:00Z","accepted":12,"absorbed":31},
+    {"t":"2026-08-06T20:50:00Z","accepted":10,"absorbed":44},
+    {"t":"2026-08-06T20:53:00Z","accepted":13,"absorbed":52},
+    {"t":"2026-08-06T20:56:00Z","accepted":12,"absorbed":47},
+    {"t":"2026-08-06T20:59:00Z","accepted":11,"absorbed":63},
+    {"t":"2026-08-06T21:02:00Z","accepted":12,"absorbed":1980},
+    {"t":"2026-08-06T21:05:00Z","accepted":11,"absorbed":14200},
+    {"t":"2026-08-06T21:08:00Z","accepted":13,"absorbed":22600},
+    {"t":"2026-08-06T21:11:00Z","accepted":12,"absorbed":29100},
+    {"t":"2026-08-06T21:14:00Z","accepted":11,"absorbed":31400},
+    {"t":"2026-08-06T21:17:00Z","accepted":12,"absorbed":30200},
+    {"t":"2026-08-06T21:20:00Z","accepted":13,"absorbed":33800},
+    {"t":"2026-08-06T21:23:00Z","accepted":12,"absorbed":35100},
+    {"t":"2026-08-06T21:26:00Z","accepted":11,"absorbed":34600},
+    {"t":"2026-08-06T21:29:00Z","accepted":12,"absorbed":36900},
+    {"t":"2026-08-06T21:32:00Z","accepted":14,"absorbed":35500},
+    {"t":"2026-08-06T21:35:00Z","accepted":13,"absorbed":37200},
+    {"t":"2026-08-06T21:38:00Z","accepted":12,"absorbed":36100},
+    {"t":"2026-08-06T21:41:00Z","accepted":13,"absorbed":38400},
+    {"t":"2026-08-06T21:44:00Z","accepted":12,"absorbed":37600}
+  ],
+  "top_sources": [
+    {"address":"203.0.113.44","country":"NL","requests":2841002,"reason":"flood"},
+    {"address":"198.51.100.17","country":"RU","requests":1932885,"reason":"flood"},
+    {"address":"192.0.2.201","country":"US","requests":1204410,"reason":"fingerprint"},
+    {"address":"203.0.113.90","country":"??","requests":812774,"reason":"honeypot"},
+    {"address":"198.51.100.204","country":"DE","requests":499318,"reason":"reputation"},
+    {"address":"192.0.2.66","country":"BR","requests":244123,"reason":"fingerprint"}
+  ],
+  "blocks": {
+    "generated_at": "2026-08-06T21:44:00Z",
+    "items": [
+      {"address":"203.0.113.44","reason":"flood","blocked_at":"2026-08-06T21:02:41Z",
+       "expires_at":"2026-08-06T22:02:41Z","hits":2841002,"country":"NL"},
+      {"address":"198.51.100.17","reason":"flood","blocked_at":"2026-08-06T21:03:02Z",
+       "expires_at":"2026-08-06T22:03:02Z","hits":1932885,"country":"RU"},
+      {"address":"192.0.2.201","reason":"fingerprint","blocked_at":"2026-08-06T21:04:55Z",
+       "expires_at":"2026-08-06T22:04:55Z","hits":1204410,"country":"US",
+       "sample_user_agent":"friendly-scanner"},
+      {"address":"203.0.113.90","reason":"honeypot","blocked_at":"2026-08-06T21:05:18Z",
+       "expires_at":"2026-08-07T21:05:18Z","hits":812774,"country":"??"},
+      {"address":"198.51.100.204","reason":"reputation","blocked_at":"2026-08-06T21:06:30Z",
+       "expires_at":"2026-08-06T22:06:30Z","hits":499318,"country":"DE"},
+      {"address":"192.0.2.66","reason":"fingerprint","blocked_at":"2026-08-06T21:09:12Z",
+       "expires_at":"2026-08-06T22:09:12Z","hits":244123,"country":"BR",
+       "sample_user_agent":"sipcli/v1.8"},
+      {"address":"192.0.2.7","reason":"manual","blocked_at":"2026-08-06T19:22:00Z",
+       "expires_at":"2026-08-07T19:22:00Z","hits":38,"country":"GB",
+       "note":"customer reported spoofed calls"}
+    ]
+  }
+}
+</script>
+
+<script>
+"use strict";
+
+/* ===========================================================================
+   Plain DOM and hand-built SVG. No framework, no chart library.
+
+   Not minimalism for its own sake: this page ships inside the shield, which
+   is the most exposed component we build, and every dependency here would be
+   a dependency an attacker gets to study. It is also the page an operator
+   opens when things are going wrong, so it must render before anything else
+   has to succeed.
+   =========================================================================== */
+
+const $ = (id) => document.getElementById(id);
+
+/* ── Formatting ─────────────────────────────────────────────────────────── */
+
+/* Carrier volumes are large and read at a glance. 7.7M is scannable;
+   7,734,512 is not. The exact value is always available in the table view
+   and in the tooltip, so nothing is lost — only the headline is abbreviated. */
+function compact(n) {
+  if (n < 1000) return String(n);
+  if (n < 1e6) return (n / 1e3).toFixed(n < 1e4 ? 1 : 0) + "k";
+  if (n < 1e9) return (n / 1e6).toFixed(n < 1e7 ? 1 : 0) + "M";
+  return (n / 1e9).toFixed(1) + "B";
+}
+const grouped = (n) => n.toLocaleString("en-GB");
+
+const hhmm = (iso) =>
+  new Date(iso).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+
+function relative(iso, now) {
+  const s = Math.max(0, Math.round((now - new Date(iso)) / 1000));
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.round(s / 60) + "m ago";
+  return Math.round(s / 3600) + "h ago";
+}
+
+function until(iso, now) {
+  const s = Math.round((new Date(iso) - now) / 1000);
+  if (s <= 0) return "expired";
+  if (s < 3600) return "in " + Math.round(s / 60) + "m";
+  if (s < 86400) return "in " + Math.round(s / 3600) + "h";
+  return "in " + Math.round(s / 86400) + "d";
+}
+
+/* The dashboard must be able to render whatever the enum grows into. An
+   unknown reason shows its raw value rather than a blank cell — a blank is
+   how an operator concludes the blocklist is broken. */
+const REASON_TEXT = {
+  flood:       ["Flooded us",        "rate limiter (pike)"],
+  fingerprint: ["Scanner",           "self-identified in User-Agent"],
+  honeypot:    ["Hit a decoy",       "touched an address with no legitimate use"],
+  reputation:  ["Known bad",         "burned itself on another operator's node"],
+  manual:      ["Blocked by you",    "manual override"],
+};
+const reasonLabel = (r) => (REASON_TEXT[r] ? REASON_TEXT[r][0] : r);
+const reasonWhy = (r) => (REASON_TEXT[r] ? REASON_TEXT[r][1] : "unrecognised classifier");
+
+/* ── Charts ─────────────────────────────────────────────────────────────── */
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+const el = (name, attrs) => {
+  const node = document.createElementNS(SVG_NS, name);
+  for (const k in attrs) node.setAttribute(k, attrs[k]);
+  return node;
+};
+
+const VB_W = 720, VB_H = 132;
+const PAD = { top: 8, right: 46, bottom: 20, left: 8 };
+
+/* A nice round top for the y-axis. A max of 38,400 becomes 40,000, not
+   38,400 — an axis whose top is the largest sample makes every chart look
+   equally full, which is exactly the impression a shield dashboard must not
+   give. Zero is always the baseline: these are counts. */
+function niceMax(v) {
+  if (v <= 0) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(v)));
+  const norm = v / mag;
+  const step = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10;
+  return step * mag;
+}
+
+function buildChart(container, points, key, seriesLabel) {
+  container.querySelectorAll("svg, .tooltip").forEach((n) => n.remove());
+
+  const max = niceMax(Math.max(...points.map((p) => p[key])));
+  const innerW = VB_W - PAD.left - PAD.right;
+  const innerH = VB_H - PAD.top - PAD.bottom;
+  const x = (i) => PAD.left + (points.length === 1 ? innerW / 2 : (i / (points.length - 1)) * innerW);
+  const y = (v) => PAD.top + innerH - (v / max) * innerH;
+
+  const svg = el("svg", {
+    viewBox: `0 0 ${VB_W} ${VB_H}`,
+    preserveAspectRatio: "none",
+    role: "img",
+    "aria-label":
+      `${seriesLabel} over ${points.length} buckets, from ${hhmm(points[0].t)} to ` +
+      `${hhmm(points[points.length - 1].t)}. Peak ${grouped(Math.max(...points.map((p) => p[key])))} ` +
+      `per second. Exact values are in the table view.`,
+  });
+
+  /* Grid: baseline and top only. A NOC chart is scanned for shape and for
+     the current value; a full grid competes with the line for attention. */
+  for (const v of [0, max]) {
+    svg.appendChild(el("line", {
+      class: "grid-line", x1: PAD.left, x2: PAD.left + innerW, y1: y(v), y2: y(v),
+    }));
+    const t = el("text", {
+      class: "axis-text", x: PAD.left + innerW + 6, y: y(v) + 3.5,
+    });
+    t.textContent = compact(v);
+    svg.appendChild(t);
+  }
+
+  const line = points.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(2)},${y(p[key]).toFixed(2)}`).join("");
+  svg.appendChild(el("path", {
+    class: "series-fill",
+    d: `${line}L${x(points.length - 1).toFixed(2)},${y(0)}L${x(0).toFixed(2)},${y(0)}Z`,
+  }));
+  svg.appendChild(el("path", { class: "series-line", d: line }));
+
+  /* x labels at the ends only — the shared crosshair carries the rest. */
+  const first = el("text", { class: "axis-text", x: PAD.left, y: VB_H - 6 });
+  first.textContent = hhmm(points[0].t);
+  svg.appendChild(first);
+  const last = el("text", { class: "axis-text", x: PAD.left + innerW, y: VB_H - 6, "text-anchor": "end" });
+  last.textContent = hhmm(points[points.length - 1].t);
+  svg.appendChild(last);
+
+  const cross = el("line", { class: "crosshair", y1: PAD.top, y2: PAD.top + innerH, visibility: "hidden" });
+  const dot = el("circle", { class: "cursor-dot", r: 4, visibility: "hidden" });
+  svg.appendChild(cross);
+  svg.appendChild(dot);
+
+  container.appendChild(svg);
+  return { svg, x, y, cross, dot, points, key };
+}
+
+/* One crosshair drives both charts. Comparing accepted against absorbed is
+   comparing them AT THE SAME MOMENT — the linked cursor is what makes two
+   separate scales safe to read together, and it is the reason this is a
+   correct answer to the problem a dual axis answers wrongly. */
+function linkCrosshair(charts, tipHost) {
+  const tip = document.createElement("div");
+  tip.className = "tooltip";
+  tip.hidden = true;
+  tipHost.appendChild(tip);
+
+  const hide = () => {
+    tip.hidden = true;
+    charts.forEach((c) => {
+      c.cross.setAttribute("visibility", "hidden");
+      c.dot.setAttribute("visibility", "hidden");
+    });
+  };
+
+  const show = (i, clientX, clientY) => {
+    charts.forEach((c) => {
+      const px = c.x(i), py = c.y(c.points[i][c.key]);
+      c.cross.setAttribute("x1", px); c.cross.setAttribute("x2", px);
+      c.cross.setAttribute("visibility", "visible");
+      c.dot.setAttribute("cx", px); c.dot.setAttribute("cy", py);
+      c.dot.setAttribute("visibility", "visible");
+    });
+    const p = charts[0].points[i];
+    tip.innerHTML =
+      `<div class="t-time">${hhmm(p.t)}</div>` +
+      `<div class="t-row"><span><span class="swatch s1"></span>Accepted</span>` +
+      `<span class="v">${grouped(p.accepted)}/s</span></div>` +
+      `<div class="t-row"><span><span class="swatch s2"></span>Absorbed</span>` +
+      `<span class="v">${grouped(p.absorbed)}/s</span></div>`;
+    tip.hidden = false;
+    const host = tipHost.getBoundingClientRect();
+    let left = clientX - host.left + 14;
+    if (left + tip.offsetWidth > host.width) left = clientX - host.left - tip.offsetWidth - 14;
+    tip.style.left = Math.max(0, left) + "px";
+    tip.style.top = Math.max(0, clientY - host.top + 14) + "px";
+  };
+
+  charts.forEach((c) => {
+    /* Hit testing in viewBox space, so it stays correct at any rendered
+       width — the SVG scales, the coordinates do not. */
+    const indexAt = (evt) => {
+      const r = c.svg.getBoundingClientRect();
+      const vx = ((evt.clientX - r.left) / r.width) * VB_W;
+      let best = 0, bestD = Infinity;
+      for (let i = 0; i < c.points.length; i++) {
+        const d = Math.abs(c.x(i) - vx);
+        if (d < bestD) { bestD = d; best = i; }
+      }
+      return best;
+    };
+    c.svg.addEventListener("pointermove", (e) => show(indexAt(e), e.clientX, e.clientY));
+    c.svg.addEventListener("pointerleave", hide);
+  });
+  tipHost.addEventListener("pointerleave", hide);
+}
+
+/* ── Rendering ──────────────────────────────────────────────────────────── */
+
+function render(data, isDemo) {
+  const now = new Date();
+
+  $("demo-banner").hidden = !isDemo;
+  $("node-id").textContent = data.node_id;
+  $("mode").textContent = data.mode;
+  $("updated").textContent = relative(data.generated_at, now);
+  $("updated").setAttribute("datetime", data.generated_at);
+  $("window-note").textContent = `last ${data.window} · ${data.series.length} buckets`;
+
+  const series = data.series;
+  const latest = series[series.length - 1];
+
+  $("stat-accepted").textContent = compact(data.accepted.requests);
+  $("stat-accepted").title = grouped(data.accepted.requests) + " requests";
+  $("stat-absorbed").textContent = compact(data.absorbed.requests);
+  $("stat-absorbed").title = grouped(data.absorbed.requests) + " requests";
+  $("stat-absorbed-sub").textContent =
+    `requests · ${compact(data.absorbed.packets)} packets`;
+  $("stat-blocked").textContent = grouped(data.blocks.items.length);
+  $("now-accepted").textContent = grouped(latest.accepted) + "/s";
+  $("now-absorbed").textContent = grouped(latest.absorbed) + "/s";
+
+  /* The verdict tile answers question 1 directly, in words. Comparing the
+     accepted rate now against the median of the buckets before the attack
+     began is the only honest way to say "still flowing" — an absolute
+     threshold would be wrong for every operator. */
+  const rates = series.map((p) => p.accepted).slice().sort((a, b) => a - b);
+  const median = rates[Math.floor(rates.length / 2)];
+  const ratio = median ? latest.accepted / median : 1;
+  const chip = $("status-chip");
+  chip.classList.remove("good", "warning", "critical");
+  if (ratio >= 0.9) {
+    $("stat-verdict").textContent = "Flowing";
+    $("stat-verdict-sub").textContent = `${grouped(latest.accepted)}/s, at the window median`;
+    chip.classList.add("good");
+    $("status-text").textContent = "shield active";
+    chip.querySelector(".glyph").textContent = "●";
+  } else if (ratio >= 0.5) {
+    $("stat-verdict").textContent = "Degraded";
+    $("stat-verdict-sub").textContent = `${Math.round(ratio * 100)}% of the window median`;
+    chip.classList.add("warning");
+    $("status-text").textContent = "degraded";
+    chip.querySelector(".glyph").textContent = "▲";
+  } else {
+    $("stat-verdict").textContent = "Impaired";
+    $("stat-verdict-sub").textContent = `${Math.round(ratio * 100)}% of the window median`;
+    chip.classList.add("critical");
+    $("status-text").textContent = "impaired";
+    chip.querySelector(".glyph").textContent = "■";
+  }
+
+  const charts = [
+    buildChart($("chart-accepted"), series, "accepted", "Accepted requests per second"),
+    buildChart($("chart-absorbed"), series, "absorbed", "Absorbed requests per second"),
+  ];
+  linkCrosshair(charts, $("chart-absorbed").closest(".panel"));
+
+  const seriesRows = series.map((p) =>
+    `<tr><td class="data">${hhmm(p.t)}</td>` +
+    `<td class="num data">${grouped(p.accepted)}</td>` +
+    `<td class="num data">${grouped(p.absorbed)}</td></tr>`).join("");
+  $("series-tbody").innerHTML = seriesRows;
+
+  const maxReq = Math.max(...data.top_sources.map((s) => s.requests));
+  $("sources-tbody").innerHTML = data.top_sources.map((s) =>
+    `<tr>` +
+    `<td class="addr data">${escapeHtml(s.address)}</td>` +
+    `<td class="muted data">${escapeHtml(s.country)}</td>` +
+    `<td>${escapeHtml(reasonLabel(s.reason))}</td>` +
+    `<td class="num data">${grouped(s.requests)}</td>` +
+    `<td class="bar-cell"><div class="bar" style="width:${(s.requests / maxReq * 100).toFixed(1)}%"></div></td>` +
+    `</tr>`).join("");
+
+  $("blocks-tbody").innerHTML = data.blocks.items.map((b) =>
+    `<tr>` +
+    `<td class="addr data">${escapeHtml(b.address)}` +
+      (b.country ? ` <span class="muted">${escapeHtml(b.country)}</span>` : "") + `</td>` +
+    `<td>${escapeHtml(reasonLabel(b.reason))}` +
+      `<div class="panel-note">${escapeHtml(b.sample_user_agent
+          ? b.sample_user_agent : b.note ? b.note : reasonWhy(b.reason))}</div></td>` +
+    `<td class="num data">${grouped(b.hits)}</td>` +
+    `<td class="muted data">${until(b.expires_at, now)}</td>` +
+    `<td><button type="button" data-unblock="${escapeHtml(b.address)}">Unblock</button></td>` +
+    `</tr>`).join("");
+}
+
+/* Every value below comes from a remote node and several are attacker-
+   controlled — sample_user_agent is literally a string an attacker chose.
+   Interpolating that into innerHTML unescaped would let an attacker put
+   script into the operator's console by sending one SIP packet. Magnus
+   shipped stored XSS twice (CVE-2025-2609, CVE-2025-2610); this is the
+   same bug class, and the escape below is not optional. */
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+/* ── Wiring ─────────────────────────────────────────────────────────────── */
+
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-unblock]");
+  if (!btn) return;
+  /* DELETE /v1/blocks/{address} once the agent exists. Until then, say so
+     rather than faking a success the operator might believe. */
+  btn.disabled = true;
+  btn.textContent = "no agent";
+  btn.title = "DELETE /v1/blocks/" + btn.dataset.unblock +
+              " — the node agent is not implemented yet (issue #4)";
+});
+
+$("table-toggle").addEventListener("click", () => {
+  const table = $("series-table");
+  const showing = table.hidden;
+  table.hidden = !showing;
+  $("table-toggle").setAttribute("aria-expanded", String(showing));
+  $("table-toggle").textContent = showing ? "Hide table" : "Show as table";
+});
+
+/* An explicit theme choice must beat the OS preference in both directions,
+   which is why this writes light as well as dark rather than only setting a
+   dark flag. Matches the contract tokens.css declares. */
+const themeBtn = $("theme-toggle");
+function applyTheme(mode) {
+  document.documentElement.setAttribute("data-theme", mode);
+  themeBtn.textContent = mode === "dark" ? "Light" : "Dark";
+  themeBtn.setAttribute("aria-pressed", String(mode === "dark"));
+}
+themeBtn.addEventListener("click", () => {
+  const current = document.documentElement.getAttribute("data-theme");
+  const osDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+  const effective = current || (osDark ? "dark" : "light");
+  applyTheme(effective === "dark" ? "light" : "dark");
+});
+themeBtn.textContent =
+  window.matchMedia("(prefers-color-scheme: dark)").matches ? "Light" : "Dark";
+
+/* Fetch from the node when served by one; fall back to the fixture ONLY on
+   file://. The guard matters: a fallback that fired on a network error would
+   show an operator invented numbers at the exact moment their node stopped
+   answering, which is the worst possible time to be lied to. */
+async function loadOverview() {
+  const fixture = JSON.parse($("fixture").textContent);
+
+  if (location.protocol === "file:") {
+    render(fixture, true);
+    return;
+  }
+  try {
+    const [overview, blocks] = await Promise.all([
+      fetch("/v1/overview?window=1h", { headers: { Accept: "application/json" } }),
+      fetch("/v1/blocks?limit=100", { headers: { Accept: "application/json" } }),
+    ]);
+    if (!overview.ok || !blocks.ok) throw new Error("HTTP " + overview.status + "/" + blocks.status);
+    const data = await overview.json();
+    data.blocks = await blocks.json();
+    render(data, false);
+  } catch (err) {
+    /* Last good data with a visible staleness marker, never an error page
+       that makes "the dashboard broke" look like "the switch is down". */
+    const chip = $("status-chip");
+    chip.classList.remove("good", "warning");
+    chip.classList.add("critical");
+    chip.querySelector(".glyph").textContent = "■";
+    $("status-text").textContent = "no telemetry from node";
+    $("updated").textContent = "unreachable";
+    console.error("shield telemetry unavailable:", err);
+  }
+}
+
+loadOverview();
+</script>
+</body>
+</html>

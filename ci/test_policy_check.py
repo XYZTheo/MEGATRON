@@ -345,6 +345,59 @@ class PolicyGateTest(unittest.TestCase):
         self.assertIn("PALETTE", r.stdout)
         self.assertIn("impersonates an alarm", r.stdout)
 
+    # -- fail-closed: bypasses found by attacking the gate ------------------
+    #
+    # These came from running deliberately-bad stylesheets through the gate,
+    # not from reading it. The first version caught all of them by accident or
+    # not at all, and one was a clean fail-open.
+
+    def test_deleting_the_series_tokens_does_not_silence_the_rule(self) -> None:
+        """The real bypass. Remove --mg-series-*, and the whole categorical
+        and colour-vision battery stops running while the gate still prints
+        PASS. A gate that can be switched off by deletion is not a gate."""
+        light = self.LIGHT_BODY.replace(
+            "  --mg-series-1: #2C7CBF; --mg-series-2: #9A6614;\n", "")
+        dark = self.DARK_BODY.replace(
+            "  --mg-series-1: #4A98D8; --mg-series-2: #B87C2A;\n", "")
+        r = self.with_tokens(self.tokens(light_all=light, dark_all=dark))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("PALETTE", r.stdout)
+        self.assertIn("--mg-series-", r.stdout)
+
+    def test_unreadable_colour_forms_are_rejected_everywhere(self) -> None:
+        """An illegible colour written in a form the hex regex cannot parse,
+        applied CONSISTENTLY to every block so the sync check has nothing to
+        object to. Each of these is valid CSS and renders the same 2.2:1 grey;
+        each previously vanished from the measurement instead of failing it."""
+        for value in ("#9AA",                       # 3-digit hex
+                      "rgb(155, 170, 176)",         # function syntax
+                      "silver",                     # named colour
+                      "#8B9AA0 !important",         # trailing declaration flag
+                      "var(--mg-line-strong)"):     # indirection
+            with self.subTest(value=value):
+                light = self.LIGHT_BODY.replace("--mg-ink-faint: #5F6D74",
+                                                f"--mg-ink-faint: {value}")
+                dark = self.DARK_BODY.replace("--mg-ink-faint: #7C8C94",
+                                              f"--mg-ink-faint: {value}")
+                r = self.with_tokens(self.tokens(light_all=light, dark_all=dark))
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn("--mg-ink-faint", r.stdout)
+                # Must be caught by the rule that owns the property, not only
+                # as a side effect of the sync check noticing an odd token.
+                self.assertIn("PALETTE", r.stdout)
+
+    def test_required_tokens_cannot_simply_be_removed(self) -> None:
+        for token, light_decl, dark_decl in (
+                ("--mg-accent", "--mg-accent: #26699F;", "--mg-accent: #4A98D8;"),
+                ("--mg-sunken", "--mg-sunken: #ECEFEF;", "--mg-sunken: #0A0F12;"),
+                ("--mg-critical", "--mg-critical: #BE302C;", "--mg-critical: #E4665F;")):
+            with self.subTest(token=token):
+                light = self.LIGHT_BODY.replace(light_decl, "")
+                dark = self.DARK_BODY.replace(dark_decl, "")
+                r = self.with_tokens(self.tokens(light_all=light, dark_all=dark))
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn(token, r.stdout)
+
     def test_absent_tokens_file_is_a_note_not_a_failure(self) -> None:
         """Most of the repository has no UI. The rule must stay quiet there
         rather than failing every tree that has not grown a design system."""
@@ -353,6 +406,80 @@ class PolicyGateTest(unittest.TestCase):
         r = fx.run()
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertIn("not exercised", r.stdout)
+
+    # -- UI-SELF-CONTAINED -------------------------------------------------
+
+    def page(self, body: str) -> subprocess.CompletedProcess[str]:
+        fx = self.fixture()
+        fx.write("ui/tokens.css", self.tokens())
+        fx.write("ui/shield/index.html", body)
+        return fx.run()
+
+    def test_cdn_reference_is_rejected(self) -> None:
+        """The console ships on the edge node and is opened when things are
+        already going wrong. A CDN there is an availability dependency on a
+        third party mid-incident and a leak of who is under attack, when."""
+        r = self.page('<script src="https://cdn.example.com/chart.js"></script>')
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("UI-SELF-CONTAINED", r.stdout)
+
+    def test_protocol_relative_url_is_rejected(self) -> None:
+        r = self.page('<link rel="stylesheet" href="//fonts.example.com/x.css">')
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("UI-SELF-CONTAINED", r.stdout)
+
+    def test_relative_asset_is_allowed(self) -> None:
+        r = self.page('<link rel="stylesheet" href="../tokens.css">')
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_svg_namespace_is_not_an_external_request(self) -> None:
+        """createElementNS requires the literal namespace URI and never
+        fetches it. Flagging it would make the rule wrong in the one place
+        every SVG-building page has to touch."""
+        r = self.page('<script>const NS = "http://www.w3.org/2000/svg";</script>')
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_hex_literal_outside_tokens_is_rejected(self) -> None:
+        """A hex in a stylesheet is invisible to the PALETTE checks, which
+        only ever read tokens.css. That is how an illegible colour gets in."""
+        r = self.page("<style>.x { color: #8B9AA0; }</style>")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("UI-SELF-CONTAINED", r.stdout)
+
+    def test_colour_function_outside_tokens_is_rejected(self) -> None:
+        r = self.page("<style>.x { box-shadow: 0 2px 8px rgba(0,0,0,.2); }</style>")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("UI-SELF-CONTAINED", r.stdout)
+
+    def test_token_reference_is_allowed(self) -> None:
+        r = self.page("<style>.x { color: var(--mg-ink); }</style>")
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_prose_about_colours_does_not_trip_the_rule(self) -> None:
+        """The rule flagged this exact shape on its first ever run: the word
+        rgba() inside the multi-line comment written to explain why the file
+        avoids rgba(). Line-by-line comment stripping is not enough."""
+        r = self.page("<style>\n"
+                      "/* We do not use rgba() or #8B9AA0 here;\n"
+                      "   this comment explains why, across lines. */\n"
+                      ".x { color: var(--mg-ink); }\n"
+                      "</style>\n"
+                      "<!-- and an HTML comment mentioning #123456 too -->")
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_element_ids_are_not_mistaken_for_hex_colours(self) -> None:
+        """#chart-accepted and &#39; are not colours. A rule with false
+        positives gets disabled, which costs more than it ever caught."""
+        r = self.page("<style>#chart-accepted { color: var(--mg-ink); }</style>"
+                      "<script>const s = '&#39;';</script>")
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_url_hidden_after_a_js_line_comment_marker_is_still_seen(self) -> None:
+        """Stripping // comments would eat the second half of a "https://..."
+        string literal and blind the rule to the exact thing it looks for."""
+        r = self.page('<script>fetch("https://cdn.example.com/x.json");</script>')
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("UI-SELF-CONTAINED", r.stdout)
 
     # -- the CSS parser itself ---------------------------------------------
 
