@@ -26,6 +26,8 @@ incumbent platforms failed, or to a mistake this project has already made once:
                    and an edit has already updated only two of them.
   PALETTE          The colours an operator reads during an attack must clear
                    the contrast and colour-vision floors. Measured, not judged.
+  INSTALLER-ASSETS The wizard's masthead is the first thing an operator sees,
+                   on the least forgiving terminal a program ever renders on.
 
 Exit code 0 = clean, 1 = at least one violation.
 """
@@ -1148,6 +1150,101 @@ def check_ui_self_contained(f: Findings) -> None:
 
 
 # ---------------------------------------------------------------------------
+# INSTALLER-ASSETS
+#
+# The wizard's masthead is the first thing an operator ever sees of this
+# product, and it is rendered in the least forgiving place a program ever
+# renders: a fresh Debian box over SSH, often with LANG=C, sometimes on a
+# provider's serial console, sometimes in a rescue shell.
+#
+# A banner that arrives as "â??â??â??" says "built by people who never ran
+# this on a real server" before the operator has read a word. So: 7-bit ASCII
+# only, no box-drawing, no smart quotes, no em dashes — and 78 columns, so it
+# cannot wrap in an 80-column terminal, because a wrapped banner looks worse
+# than no banner at all.
+#
+# All of which is easy to promise in a README and easy to break with one
+# copy-paste out of a document that helpfully replaced the hyphens.
+# ---------------------------------------------------------------------------
+
+INSTALL_DIR = "install"
+BANNER_MAX_COLUMNS = 78
+BANNER_MIN_COLUMNS = 20  # narrow variant still has to look like something
+
+
+def check_installer_assets(f: Findings) -> None:
+    install = REPO / INSTALL_DIR
+    if not install.is_dir():
+        f.note("no install/ directory yet — INSTALLER-ASSETS not exercised")
+        return
+
+    banners = sorted(install.glob("banner-*.txt"))
+    if not banners:
+        f.fail("INSTALLER-ASSETS", install, None,
+               "install/ exists but carries no banner-*.txt. The wizard renders one; "
+               "if it has moved, this rule must move with it rather than passing "
+               "vacuously.")
+        return
+
+    for banner in banners:
+        raw = banner.read_bytes()
+        try:
+            text = raw.decode("ascii")
+        except UnicodeDecodeError as exc:
+            offending = raw[exc.start:exc.end]
+            f.fail("INSTALLER-ASSETS", banner, None,
+                   f"contains non-ASCII byte(s) {offending!r} at offset {exc.start}. The "
+                   f"masthead renders on consoles with LANG=C and on serial terminals — "
+                   f"anything outside 7-bit ASCII arrives as mojibake. Box-drawing "
+                   f"characters, smart quotes and em dashes are the usual way this gets "
+                   f"broken.")
+            continue
+
+        if "\t" in text:
+            f.fail("INSTALLER-ASSETS", banner, None,
+                   "contains a tab. Tab stops differ between terminals, so the art will "
+                   "shear. Use spaces.")
+
+        for n, line in enumerate(text.splitlines(), start=1):
+            if len(line) > BANNER_MAX_COLUMNS:
+                f.fail("INSTALLER-ASSETS", banner, n,
+                       f"line is {len(line)} columns, over the {BANNER_MAX_COLUMNS} "
+                       f"limit. It will wrap in an 80-column terminal, and a wrapped "
+                       f"banner looks worse than no banner.")
+
+        widths = [len(line) for line in text.splitlines() if line.strip()]
+        if widths and max(widths) < BANNER_MIN_COLUMNS:
+            f.fail("INSTALLER-ASSETS", banner, None,
+                   f"widest line is only {max(widths)} columns — that is not a masthead")
+
+    names = {b.name for b in banners}
+    for required in ("banner-wide.txt", "banner-narrow.txt"):
+        if required not in names:
+            f.fail("INSTALLER-ASSETS", install, None,
+                   f"missing {required}. The wizard picks by terminal width; without "
+                   f"both, a narrow terminal gets a wrapped banner.")
+
+    wide = install / "banner-wide.txt"
+    narrow = install / "banner-narrow.txt"
+    if wide.is_file() and narrow.is_file():
+        def widest(p: Path) -> int:
+            try:
+                return max((len(l) for l in p.read_text(encoding="ascii",
+                                                        errors="replace").splitlines()),
+                           default=0)
+            except OSError:
+                return 0
+        if widest(narrow) >= widest(wide):
+            f.fail("INSTALLER-ASSETS", narrow, None,
+                   f"the narrow banner ({widest(narrow)} cols) is not narrower than the "
+                   f"wide one ({widest(wide)} cols), so choosing between them does "
+                   f"nothing")
+
+    f.note(f"{len(banners)} installer banner(s) checked: ASCII-only, "
+           f"<= {BANNER_MAX_COLUMNS} columns")
+
+
+# ---------------------------------------------------------------------------
 
 CHECKS = (
     check_kamailio_names,
@@ -1159,6 +1256,7 @@ CHECKS = (
     check_theme_blocks_in_sync,
     check_palette,
     check_ui_self_contained,
+    check_installer_assets,
 )
 
 

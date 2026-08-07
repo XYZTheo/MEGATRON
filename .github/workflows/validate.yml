@@ -334,6 +334,14 @@ jobs:
           done
           exit $rc
 
+      - name: Prove an insecure install is not expressible
+        # ARCHITECTURE.md 6.2b promises there is no path through the wizard
+        # that produces an insecure install. This attempts eighteen of them --
+        # a password field, a pasted private key, an admin console on
+        # 0.0.0.0, open 5060, prepaid failing open -- and fails if the schema
+        # accepts any. The promise is worth exactly as much as this step.
+        run: python3 ci/check_wizard_answers.py
+
       - name: Check the dashboard fixture against the contract
         # The dashboard exists before the Go node agent in order to pin down
         # what that agent must serve. A fixture that has drifted from the

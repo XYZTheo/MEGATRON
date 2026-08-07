@@ -1020,6 +1020,81 @@ class PolicyGateTest(unittest.TestCase):
                          f"of the shipped page — every check after that point is silently "
                          f"disabled")
 
+    # -- INSTALLER-ASSETS --------------------------------------------------
+
+    WIDE = ("=" * 40 + "\n"
+            "  #     # ####### #######\n"
+            "  ##   ## #       #\n"
+            "  #     # ####### #######\n"
+            + "=" * 40 + "\n"
+            "  SWITCH . BILLING . SHIELDS UP\n")
+    NARROW = ("=" * 20 + "\n"
+              " __  __ ___\n"
+              "|  \\/  | __|\n"
+              + "=" * 20 + "\n")
+
+    def banners(self, wide=None, narrow=None):
+        fx = self.fixture()
+        fx.write("install/banner-wide.txt", self.WIDE if wide is None else wide)
+        fx.write("install/banner-narrow.txt", self.NARROW if narrow is None else narrow)
+        return fx.run()
+
+    def test_valid_banners_pass(self) -> None:
+        r = self.banners()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("installer banner", r.stdout)
+
+    def test_non_ascii_banner_is_rejected(self) -> None:
+        """The reason this rule exists. The masthead renders on a fresh Debian
+        box over SSH with LANG=C, on a provider's serial console, and in a
+        rescue shell. Box-drawing characters and smart quotes arrive as
+        mojibake, which says 'never run on a real server' before the operator
+        has read a word. One paste out of a word processor does it."""
+        for label, text in (
+                ("box drawing", "╔" + "═" * 20 + "╗\n MEGATRON\n"),
+                ("em dash", "=" * 20 + "\n MEGATRON — the switch\n"),
+                ("smart quote", "=" * 20 + "\n MEGATRON’s console\n")):
+            with self.subTest(case=label):
+                r = self.banners(wide=text)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn("INSTALLER-ASSETS", r.stdout)
+
+    def test_overwide_banner_is_rejected(self) -> None:
+        """A wrapped banner looks worse than no banner."""
+        r = self.banners(wide="#" * 90 + "\n MEGATRON\n")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("INSTALLER-ASSETS", r.stdout)
+        self.assertIn("80-column", r.stdout)
+
+    def test_tabs_in_a_banner_are_rejected(self) -> None:
+        """Tab stops differ between terminals, so the art shears."""
+        r = self.banners(wide="=" * 20 + "\n#\tMEGATRON\n")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("INSTALLER-ASSETS", r.stdout)
+
+    def test_missing_width_variant_is_rejected(self) -> None:
+        fx = self.fixture()
+        fx.write("install/banner-wide.txt", self.WIDE)
+        r = fx.run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("banner-narrow.txt", r.stdout)
+
+    def test_narrow_banner_must_actually_be_narrower(self) -> None:
+        """Otherwise choosing between them does nothing, and the narrow
+        terminal this exists for still gets a wrapped masthead."""
+        r = self.banners(narrow=self.WIDE)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("INSTALLER-ASSETS", r.stdout)
+
+    def test_install_dir_without_a_banner_is_rejected(self) -> None:
+        """A renamed or moved banner must not turn this rule into a no-op that
+        keeps reporting success."""
+        fx = self.fixture()
+        fx.write("install/answers.example.yml", "version: '0.1.0'\n")
+        r = fx.run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("INSTALLER-ASSETS", r.stdout)
+
     # -- the CSS parser itself ---------------------------------------------
 
     def test_parser_ignores_declarations_inside_comments(self) -> None:
