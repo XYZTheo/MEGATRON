@@ -385,6 +385,15 @@ GRADLE_DEP_RE = re.compile(
     r"""|testRuntimeOnly|testCompileOnly|annotationProcessor|ksp|kapt)"""
     r"""\s*\(\s*["']([^"':]+):([^"':]+):([^"']+)["']\s*\)""")
 
+# An internal module: implementation(project(":rating")). Our own code, so
+# there is no third-party licence to check — but it is still matched
+# explicitly rather than ignored, so that it does not fall through to the
+# opaque-dependency rule below and so that a typo'd form still fails.
+GRADLE_PROJECT_DEP_RE = re.compile(
+    r"""(?:implementation|api|compileOnly|runtimeOnly|testImplementation"""
+    r"""|testRuntimeOnly|testCompileOnly|annotationProcessor|ksp|kapt)"""
+    r"""\s*\(\s*project\s*\(\s*["'][^"']+["']\s*\)\s*\)""")
+
 # A dependency declared some other way — a version catalog reference, a
 # variable, a platform BOM. Not necessarily wrong, but not readable by this
 # scanner, and therefore not something it may pass silently.
@@ -457,6 +466,17 @@ def scan_gradle_manifest(f: Findings, manifest: Path, approved: dict) -> None:
                    f"'{coordinate}' has no `why`. A dependency nobody can justify is one "
                    f"that gets renewed forever without being reconsidered.")
 
+    # Internal module dependencies carry no third-party licence. Blanked so
+    # they do not read as unparseable to the opaque check below.
+    internal = 0
+
+    def _blank_internal(m: re.Match) -> str:
+        nonlocal internal
+        internal += 1
+        return " " * len(m.group(0))
+
+    source = GRADLE_PROJECT_DEP_RE.sub(_blank_internal, source)
+
     opaque = list(GRADLE_OPAQUE_DEP_RE.finditer(source))
     for match in opaque:
         f.fail("LICENCE", manifest, _line_of(source, match.start()),
@@ -465,7 +485,7 @@ def scan_gradle_manifest(f: Findings, manifest: Path, approved: dict) -> None:
                "but it cannot be licence-checked here — declare it as a literal "
                "'group:artifact:version', or teach the scanner.")
 
-    if found == 0 and not opaque:
+    if found == 0 and not opaque and internal == 0:
         f.note(f"{manifest.relative_to(REPO).as_posix()}: no dependencies declared")
 
 

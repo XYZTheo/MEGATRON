@@ -326,6 +326,15 @@ class PolicyGateTest(unittest.TestCase):
                 self.assertEqual(r.returncode, 1, r.stdout)
                 self.assertIn("cannot read", r.stdout)
 
+    def test_internal_module_dependency_needs_no_licence(self) -> None:
+        """implementation(project(":rating")) is our own code. It must not be
+        demanded in the approvals file, and must not read as unparseable."""
+        r = self.gradle('dependencies {\n'
+                        '  implementation(project(":rating"))\n'
+                        '  implementation("org.jetbrains.kotlin:kotlin-stdlib:2.0.21")\n'
+                        '}\n')
+        self.assertEqual(r.returncode, 0, r.stdout)
+
     def test_commented_out_dependency_does_not_trip_the_scanner(self) -> None:
         """Prose and dead declarations must not fail the build -- the same
         trap this file has hit three times now."""
