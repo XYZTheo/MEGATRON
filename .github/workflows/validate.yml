@@ -334,6 +334,14 @@ jobs:
           done
           exit $rc
 
+      - name: Keep the softphone interop profiles honest
+        # The profiles are the concrete meaning of "optimised for MicroSIP,
+        # Zoiper and PortSIP", and the interop test matrix for the first day
+        # with a real host. Their value rests entirely on a reader being able
+        # to tell which claims were verified and which were reasoned -- so a
+        # profile claiming lab-verified while #2 is still open fails the build.
+        run: python3 ci/check_softphone_profiles.py
+
       - name: Hold the MagnusBilling parity inventory to its claims
         # "Every single feature Magnus has, so we aren't missing anything" is a
         # requirement, and a requirement that lives only in a markdown table is
