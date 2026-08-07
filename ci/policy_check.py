@@ -829,7 +829,9 @@ URL_ALLOWLIST = (
 # split the scheme from the host across two lines and passed a per-line scan
 # clean. \s* inside the pattern lets the match span that break.
 EXTERNAL_URL_RE = re.compile(r"https?:\s*//\s*[^\s\"'()<>]+")
-PROTOCOL_RELATIVE_RE = re.compile(r"""(?:src|href)\s*=\s*["']\s*//""", re.I)
+# The quotes are optional: HTML attribute values may be unquoted, and
+# <img src=//evil.example.com/x.png> is a perfectly ordinary way to write one.
+PROTOCOL_RELATIVE_RE = re.compile(r"""(?:src|href|action)\s*=\s*["']?\s*//""", re.I)
 
 # Every fetch() in shipped UI must name a same-origin absolute path as a
 # plain string literal. This is the structural answer to the one thing a text
@@ -969,6 +971,15 @@ def blank_line_comments(text: str) -> str:
             if ch == "\\":
                 i += 2
                 continue
+            # Character-class tracking is defence in depth, and honestly
+            # labelled as such: mutation testing could not find an input where
+            # deleting it changes the output. A slash inside [...] that
+            # prematurely ends the "regex" is immediately followed by another
+            # `/` that re-opens one (last_sig is not updated inside a
+            # literal), so the blanking nets out identical. It is kept because
+            # it makes the scanner model the language correctly rather than
+            # correctly by luck — but no test discriminates it, and pretending
+            # otherwise would be the kind of claim this file exists to stop.
             if ch == "[":
                 in_class = True
             elif ch == "]":
@@ -982,7 +993,14 @@ def blank_line_comments(text: str) -> str:
 
         if ch in "'\"`":
             quote = ch
-        elif ch == "/" and i + 1 < n and text[i + 1] == "/" and (i == 0 or text[i - 1] != ":"):
+        elif (ch == "/" and i + 1 < n and text[i + 1] == "/"
+              # ':' makes it a scheme separator (https://...). '=' makes it an
+              # unquoted HTML attribute value (<img src=//host/x>), which was
+              # being blanked wholesale and then missed by the protocol-
+              # relative pattern too — a silent miss, the bad direction.
+              # A JS `x = // comment` is the cost, and it is only ever a loud
+              # false positive.
+              and (i == 0 or text[i - 1] not in ":=")):
             while i < n and text[i] != "\n":
                 out[i] = " "
                 i += 1

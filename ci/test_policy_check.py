@@ -802,6 +802,65 @@ class PolicyGateTest(unittest.TestCase):
                 r = self.page(body)
                 self.assertEqual(r.returncode, 0, r.stdout)
 
+    def test_unquoted_attribute_urls_are_caught(self) -> None:
+        """HTML attribute values may be unquoted, so no string state protects
+        them from the comment scanner. Both of these were silently blanked and
+        then missed — the protocol-relative one twice over, because that
+        pattern also required quotes.
+
+        Found by mutation testing: removing the ':' guard from the scanner
+        left the whole suite green, which meant nothing pinned the behaviour
+        the guard exists for."""
+        for label, body in (
+                ("unquoted https", '<img src=https://evil.example.com/x.png>'),
+                ("unquoted href", '<a href=https://evil.example.com/>x</a>'),
+                ("unquoted protocol-relative", '<img src=//evil.example.com/x.png>'),
+                ("unquoted form action", '<form action=//evil.example.com/x></form>')):
+            with self.subTest(case=label):
+                r = self.page(body)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn("UI-SELF-CONTAINED", r.stdout)
+
+    def test_comment_scanner_unit_behaviour(self) -> None:
+        """Direct unit tests of blank_line_comments.
+
+        Honest note on coverage, because the alternative is a false
+        impression: mutation testing showed the regex character-class branch
+        can be deleted with this whole suite staying green, and no input was
+        found that discriminates it (a slash inside [...] that prematurely
+        ends the literal is immediately followed by another `/` that re-opens
+        one, so the blanking nets out the same). The assertions below are
+        correct statements of intended behaviour, but the character-class ones
+        would pass without that branch. It is kept for correctness of the
+        model, not because a test forces it — and that is written down in the
+        function itself too."""
+        sys.path.insert(0, str(GATE.parent))
+        try:
+            import policy_check as pc
+        finally:
+            sys.path.pop(0)
+
+        blank = lambda s: pc.blank_line_comments(s)
+
+        # A real comment goes away.
+        self.assertNotIn("secret", blank("const a = 1; // secret\n"))
+        # A URL inside a string does not.
+        self.assertIn("evil.example", blank('fetch("https://evil.example/x");\n'))
+        # A scheme separator outside a string does not.
+        self.assertIn("evil.example", blank("<img src=https://evil.example/x>\n"))
+        # An unquoted protocol-relative attribute does not.
+        self.assertIn("evil.example", blank("<img src=//evil.example/x>\n"))
+        # A regex containing a slash does not swallow what follows it.
+        self.assertIn("#8B9AA0", blank('const r = /a\\//; const b = "#8B9AA0";\n'))
+        # ...including when the slash is inside a character class.
+        self.assertIn("#8B9AA0", blank('const r = /[a/]/; const b = "#8B9AA0";\n'))
+        self.assertIn("#8B9AA0", blank('const r = /[//]/; const b = "#8B9AA0";\n'))
+        # A regex does not run past the end of its line.
+        self.assertIn("#8B9AA0", blank('const r = /unterminated\nconst b = "#8B9AA0";\n'))
+        # Line count is preserved, so reported line numbers stay correct.
+        source = 'a\n// b\nc\n'
+        self.assertEqual(blank(source).count("\n"), source.count("\n"))
+
     def test_runtime_token_assignment_is_rejected(self) -> None:
         """The "colour tokens live in exactly one file" guarantee is static.
         Writing a --mg-* property at runtime steps around it with no literal
@@ -916,6 +975,50 @@ class PolicyGateTest(unittest.TestCase):
         r = self.page('<script>fetch("https://cdn.example.com/x.json");</script>')
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn("UI-SELF-CONTAINED", r.stdout)
+
+    def test_scanning_survives_the_whole_real_page(self) -> None:
+        """The scenario that keeps this rule honest, checked against the file
+        that actually ships.
+
+        blank_line_comments is hand-written state-machine code. If it wrongly
+        enters string or regex state anywhere inside ui/shield/index.html,
+        every check after that point silently stops and the gate still reports
+        PASS — the exact failure this whole rule exists to prevent, hiding
+        inside the tool meant to prevent it.
+
+        So: inject a known violation after every line of the real page and
+        assert it survives the comment blanking. Lines that are genuinely
+        inside a /* */ or <!-- --> comment are skipped, because ignoring those
+        is correct. Run in-process rather than through the gate, so probing a
+        thousand lines costs milliseconds instead of a thousand subprocesses.
+        """
+        page = GATE.parent.parent / "ui" / "shield" / "index.html"
+        if not page.is_file():
+            self.skipTest("no shipped page to probe")
+
+        sys.path.insert(0, str(GATE.parent))
+        try:
+            import policy_check
+        finally:
+            sys.path.pop(0)
+
+        lines = page.read_text(encoding="utf-8").split("\n")
+        violation = "<style>.zz{color:#8B9AA0}</style>"
+        blind: list[int] = []
+
+        for idx in range(len(lines)):
+            mutated = "\n".join(lines[:idx + 1] + [violation] + lines[idx + 1:])
+            after_block = policy_check.blank_block_comments(mutated)
+            if after_block.split("\n")[idx + 1].strip() == "":
+                continue   # landed inside a real comment; correct to ignore
+            after_line = policy_check.blank_line_comments(after_block)
+            if "#8B9AA0" not in after_line.split("\n")[idx + 1]:
+                blind.append(idx + 1)
+
+        self.assertEqual(blind, [],
+                         f"comment blanking swallows real code after line(s) {blind[:10]} "
+                         f"of the shipped page — every check after that point is silently "
+                         f"disabled")
 
     # -- the CSS parser itself ---------------------------------------------
 
