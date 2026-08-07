@@ -35,13 +35,18 @@ class SqlStore(
 ) : Store, AutoCloseable {
 
     private val connection: Connection = DriverManager.getConnection(jdbcUrl).apply {
-        autoCommit = false
-        // Foreign keys and sane durability. SQLite defaults to both off, which
-        // is a reasonable default for a file format and a poor one for money.
+        // PRAGMAS FIRST, THEN autoCommit = false. Order matters and getting it
+        // wrong is not subtle: SQLite refuses to change journal mode inside a
+        // transaction ("cannot change into wal mode from within a
+        // transaction"), so setting autoCommit false first makes every
+        // constructor throw. Found by running the tests on Linux.
+        //
+        // Foreign keys and durable writes are both OFF by default in SQLite —
+        // a reasonable default for a file format, and a poor one for money.
         createStatement().use { it.execute("PRAGMA foreign_keys = ON") }
         createStatement().use { it.execute("PRAGMA journal_mode = WAL") }
         createStatement().use { it.execute("PRAGMA synchronous = FULL") }
-        commit()
+        autoCommit = false
     }
 
     private val ids = AtomicLong(System.currentTimeMillis())
