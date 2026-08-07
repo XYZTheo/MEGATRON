@@ -6,6 +6,15 @@ import net.megatron.rating.RatingEngine
 
 /** Why a call was refused. Every reason is one an operator can act on. */
 enum class Refusal {
+    /**
+     * The account does not exist.
+     *
+     * Distinct from ACCOUNT_SUSPENDED on purpose. Reporting an unknown
+     * account as "suspended" sends an operator looking at a customer record
+     * that is not there -- it masqueraded as a business decision while
+     * actually being a data problem, and it hid a real bug for a while.
+     */
+    NO_SUCH_ACCOUNT,
     ACCOUNT_SUSPENDED,
     NO_RATE_FOR_DESTINATION,
     INSUFFICIENT_BALANCE,

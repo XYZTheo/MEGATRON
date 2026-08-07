@@ -39,7 +39,17 @@ fun main() {
         )
     }
 
-    val store = InMemoryStore()
+    val dbUrl = System.getenv("MEGATRON_DB_URL")
+    val store: Store = if (dbUrl.isNullOrBlank()) {
+        System.err.println(
+            "WARNING: MEGATRON_DB_URL is not set. Running on an in-memory store -- " +
+                "every customer and balance is lost on exit. Set it to something like " +
+                "jdbc:sqlite:/var/lib/megatron/megatron.db before this carries real money."
+        )
+        InMemoryStore()
+    } else {
+        SqlStore(dbUrl)
+    }
     val authenticator = Authenticator { token ->
         if (token == operatorToken) Caller.Operator("operator") else null
     }

@@ -46,7 +46,43 @@ class SqlStore(
         createStatement().use { it.execute("PRAGMA foreign_keys = ON") }
         createStatement().use { it.execute("PRAGMA journal_mode = WAL") }
         createStatement().use { it.execute("PRAGMA synchronous = FULL") }
-        autoCommit = false
+
+        // autoCommit STAYS ON. Turning it off globally was a real bug and a
+        // nasty one: with autoCommit off, every SELECT silently opens a
+        // transaction that is never ended, so the connection pins a snapshot
+        // and NEVER SEES ANOTHER PROCESS'S COMMITS AGAIN.
+        //
+        // The symptom was not a database error. The switch API simply could
+        // not find a customer the provisioning API had just created, and
+        // reported it as "no such account" — a data bug wearing the costume
+        // of a business decision. Found by running the two services against
+        // one database, which no unit test would have done.
+        //
+        // Multi-statement work uses transaction {} below, which turns
+        // autoCommit off for exactly its own duration.
+        autoCommit = true
+    }
+
+    /**
+     * Runs [block] as one atomic unit.
+     *
+     * Scoped rather than global, for the reason above. `finally` restores
+     * autoCommit even on the exception paths, because a store that leaves the
+     * connection in manual-commit mode after a failure goes permanently blind
+     * to other writers.
+     */
+    private fun <T> transaction(block: () -> T): T = synchronized(connection) {
+        connection.autoCommit = false
+        try {
+            val result = block()
+            connection.commit()
+            result
+        } catch (e: Throwable) {
+            runCatching { connection.rollback() }
+            throw e
+        } finally {
+            connection.autoCommit = true
+        }
     }
 
     private val ids = AtomicLong(System.currentTimeMillis())
@@ -56,13 +92,14 @@ class SqlStore(
         val schema = SqlStore::class.java.getResourceAsStream("/schema.sql")
             ?.bufferedReader()?.readText()
             ?: error("schema.sql is missing from the jar")
-        connection.createStatement().use { statement ->
-            for (ddl in schema.split(";")) {
-                if (ddl.isBlank()) continue
-                statement.execute(ddl)
+        transaction {
+            connection.createStatement().use { statement ->
+                for (ddl in schema.split(";")) {
+                    if (ddl.isBlank()) continue
+                    statement.execute(ddl)
+                }
             }
         }
-        connection.commit()
         // Continue ids past anything already stored, so a restart cannot
         // reissue an id that is already in the audit trail.
         query("SELECT id FROM customers UNION ALL SELECT id FROM plans " +
@@ -98,9 +135,7 @@ class SqlStore(
         synchronized(connection) {
             connection.prepareStatement(sql).use { statement ->
                 args.forEachIndexed { i, arg -> statement.setObject(i + 1, arg) }
-                val rows = statement.executeUpdate()
-                connection.commit()
-                rows
+                statement.executeUpdate()
             }
         }
 
@@ -250,7 +285,7 @@ class SqlStore(
         id: String,
         request: BalanceAdjustment,
         actor: String,
-    ): Transaction = synchronized(connection) {
+    ): Transaction = transaction {
         if (request.reason.length < 3) {
             throw Invalid("a reason is required, including on credits")
         }
@@ -298,7 +333,6 @@ class SqlStore(
         // The balance change and its audit row commit together or not at all.
         // A balance that moved with no record of who moved it is exactly the
         // state that cannot be argued about later.
-        connection.commit()
         txn
     }
 
@@ -374,7 +408,7 @@ class SqlStore(
         }
 
     override fun replaceRates(planId: String, request: ReplaceRates): RatesReplaced =
-        synchronized(connection) {
+        transaction {
             listPlans().firstOrNull { it.id == planId } ?: throw NotFound("plan '$planId'")
             if (request.rates.isEmpty()) throw Invalid("a rate table must not be empty")
 
@@ -425,11 +459,10 @@ class SqlStore(
                 it.setInt(1, request.rates.size); it.setString(2, now())
                 it.setString(3, planId); it.executeUpdate()
             }
-            connection.commit()
             RatesReplaced(planId, request.rates.size, effective)
         }
 
-    fun ratesFor(planId: String): List<RateRow> =
+    override fun ratesFor(planId: String): List<RateRow> =
         query("SELECT * FROM rates WHERE plan_id = ? ORDER BY prefix", planId) { rs ->
             buildList {
                 while (rs.next()) add(

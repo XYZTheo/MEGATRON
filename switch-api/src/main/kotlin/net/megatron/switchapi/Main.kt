@@ -3,6 +3,7 @@ package net.megatron.switchapi
 import io.ktor.server.engine.*
 import io.ktor.server.netty.*
 import net.megatron.provisioning.InMemoryStore
+import net.megatron.provisioning.SqlStore
 
 /**
  * Runs the switch API.
@@ -31,7 +32,23 @@ fun main() {
         )
     }
 
-    val service = CallService(InMemoryStore(), cdrSink = { cdr ->
+    // Same store as the provisioning API, so a customer created through the
+    // bot can place a call immediately. MEGATRON_DB_URL points both services
+    // at one database; without it, an in-memory store that is useful only for
+    // a smoke test and says so.
+    val dbUrl = System.getenv("MEGATRON_DB_URL")
+    val store = if (dbUrl.isNullOrBlank()) {
+        System.err.println(
+            "WARNING: MEGATRON_DB_URL is not set, so this is running on an in-memory " +
+                "store. Customers, balances and rates are shared with nothing and are " +
+                "lost on exit."
+        )
+        InMemoryStore()
+    } else {
+        SqlStore(dbUrl)
+    }
+
+    val service = CallService(store, cdrSink = { cdr ->
         // Stand-in for the ClickHouse pipeline (#8). Printed rather than
         // dropped, because a CDR that is silently discarded is revenue that
         // cannot be argued for with a carrier.

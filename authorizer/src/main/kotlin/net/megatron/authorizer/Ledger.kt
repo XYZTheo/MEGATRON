@@ -75,6 +75,33 @@ class Ledger {
         )
     }
 
+    /**
+     * Adopt an externally-changed balance while keeping live reservations.
+     *
+     * THE BUG THIS FIXES was invisible to every unit test and obvious the
+     * moment two services ran against one database: the ledger learned an
+     * account's balance once, at first call, and never again. So a customer
+     * who topped up through the bot could not call until the switch was
+     * restarted — and, far worse, a customer whose balance had been drained
+     * or corrected downward kept right on calling against money that was no
+     * longer there.
+     *
+     * Reservations are deliberately preserved. They represent calls that are
+     * up RIGHT NOW; discarding them on a resync would let the next call spend
+     * money already committed to a call in progress, which is the double-spend
+     * this whole class exists to prevent.
+     */
+    fun syncBalance(accountId: String, balance: Micros) {
+        val state = accounts[accountId]
+        if (state == null) {
+            open(accountId, balance)
+            return
+        }
+        state.balance.set(balance.value)
+    }
+
+    fun isOpen(accountId: String): Boolean = accounts.containsKey(accountId)
+
     fun balanceOf(accountId: String): Micros =
         Micros(accounts.getValue(accountId).balance.get())
 

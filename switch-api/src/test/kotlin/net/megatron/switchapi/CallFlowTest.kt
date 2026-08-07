@@ -224,6 +224,65 @@ class CallFlowTest {
         }
     }
 
+    // -- the balance the switch acts on must be the CURRENT one -------------
+
+    @Test
+    fun `a balance drained between calls stops the next call`() {
+        // The switch used to learn a balance once, at the customer's first
+        // call, and never again. A balance corrected downward -- or spent
+        // through another node -- kept right on authorizing calls against
+        // money that was gone. Invisible to every unit test until two
+        // services shared one database.
+        val (store, service, _) = setup()
+        assertEquals("allow",
+            service.authorize(AuthorizeRequest("bigcorp", "12125551234", "call-1")).decision)
+        service.endSession(EndSessionRequest("call-1", durationSeconds = 1))
+
+        val customer = store.findByHandle("bigcorp")!!
+        store.adjustBalance(
+            customer.id,
+            net.megatron.provisioning.BalanceAdjustment(
+                -customer.balanceMicros, "drained by another node"
+            ),
+            "test",
+        )
+
+        val second = service.authorize(AuthorizeRequest("bigcorp", "12125551234", "call-2"))
+        assertEquals("insufficient_balance", second.reason,
+                     "authorized against money that is gone")
+        assertEquals(402, second.sipCode)
+    }
+
+    @Test
+    fun `a top-up between calls is visible immediately`() {
+        // The other direction, and the one a customer notices: topping up
+        // through the bot must work without restarting the switch.
+        val (store, service, _) = setup(balanceMicros = 0)
+        assertEquals("reject",
+            service.authorize(AuthorizeRequest("bigcorp", "12125551234", "call-1")).decision)
+
+        val customer = store.findByHandle("bigcorp")!!
+        store.adjustBalance(
+            customer.id,
+            net.megatron.provisioning.BalanceAdjustment(10_000_000, "top up via bot"),
+            "telegram:1",
+        )
+
+        assertEquals("allow",
+            service.authorize(AuthorizeRequest("bigcorp", "12125551234", "call-2")).decision)
+    }
+
+    @Test
+    fun `an unknown account is not reported as suspended`() {
+        // Reporting a missing account as "suspended" sends an operator looking
+        // at a customer record that is not there. It masqueraded as a business
+        // decision while actually being a data bug, and it hid one.
+        val (_, service, _) = setup()
+        val decision = service.authorize(AuthorizeRequest("ghost", "12125551234", "c1"))
+        assertEquals("no_such_account", decision.reason)
+        assertEquals(404, decision.sipCode)
+    }
+
     // -- rate table cache ---------------------------------------------------
 
     @Test

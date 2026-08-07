@@ -7,7 +7,7 @@ import net.megatron.authorizer.Decision
 import net.megatron.authorizer.Ledger
 import net.megatron.authorizer.Refusal
 import net.megatron.provisioning.CustomerStatus
-import net.megatron.provisioning.InMemoryStore
+import net.megatron.provisioning.Store
 import net.megatron.rating.Micros
 import net.megatron.rating.Rate
 import net.megatron.rating.RateTable
@@ -27,7 +27,7 @@ import java.util.concurrent.ConcurrentHashMap
  * the authorizer's process" that ARCHITECTURE.md §4.4 requires.
  */
 class CallService(
-    private val store: InMemoryStore,
+    private val store: Store,
     private val ledger: Ledger = Ledger(),
     private val ceilingSeconds: Int = 4 * 60 * 60,
     private val cdrSink: (Cdr) -> Unit = {},
@@ -38,7 +38,6 @@ class CallService(
     private data class CachedTable(val version: String?, val table: RateTable)
 
     private val tables = ConcurrentHashMap<String, CachedTable>()
-    private val opened = ConcurrentHashMap<String, Unit>()
 
     /** What a call in progress needs remembered between INVITE and BYE. */
     private data class InFlight(
@@ -52,14 +51,22 @@ class CallService(
 
     fun authorize(request: AuthorizeRequest): AuthorizeResponse {
         val customer = store.findByHandle(request.account)
-            ?: return reject(Refusal.ACCOUNT_SUSPENDED, "no such account", 403)
+            ?: return reject(Refusal.NO_SUCH_ACCOUNT, "no such account", 404)
 
-        // Opened lazily so a customer created through the bot can place a call
-        // without the switch being restarted. The real store does this at
-        // load; here it keeps the in-memory ledger honest.
-        opened.computeIfAbsent(customer.id) {
-            ledger.open(customer.id, Micros(customer.balanceMicros))
-        }
+        // Re-read the balance from the store on EVERY authorize, not once at
+        // first call.
+        //
+        // The earlier version opened the ledger lazily and never refreshed it,
+        // which meant the switch was working from whatever the balance had
+        // been the first time that customer ever called. A top-up through the
+        // bot did not take effect until a restart, and — the expensive
+        // direction — a balance drained or corrected downward kept authorizing
+        // calls against money that was gone. No unit test could see it; it
+        // showed up the moment two services shared one database.
+        //
+        // Live reservations survive the sync, because they are calls that are
+        // up right now and their money is already committed.
+        ledger.syncBalance(customer.id, Micros(customer.balanceMicros))
 
         val account = Account(
             id = customer.id,
@@ -214,6 +221,7 @@ class CallService(
      */
     private fun sipCodeFor(reason: Refusal): Int = when (reason) {
         Refusal.INSUFFICIENT_BALANCE -> 402   // Payment Required
+        Refusal.NO_SUCH_ACCOUNT -> 404        // Not Found -- no such account
         Refusal.ACCOUNT_SUSPENDED -> 403      // Forbidden
         Refusal.NO_RATE_FOR_DESTINATION -> 404 // Not Found
         Refusal.CONCURRENT_CALL_LIMIT -> 486  // Busy Here

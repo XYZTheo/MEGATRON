@@ -40,6 +40,15 @@ interface Store {
     fun createPlan(request: CreatePlan): Plan
     fun listPlans(): List<Plan>
     fun replaceRates(planId: String, request: ReplaceRates): RatesReplaced
+
+    /**
+     * The rate table for a plan.
+     *
+     * On the interface rather than only on the implementations because the
+     * switch API reads it on the call path — it is not an administrative
+     * query, it is how a call gets priced.
+     */
+    fun ratesFor(planId: String): List<RateRow>
     fun createTrunk(request: CreateTrunk): Trunk
     fun listTrunks(): List<Trunk>
 }
@@ -325,7 +334,7 @@ class InMemoryStore(
         return RatesReplaced(planId, request.rates.size, effective)
     }
 
-    fun ratesFor(planId: String): List<RateRow> = rates[planId].orEmpty()
+    override fun ratesFor(planId: String): List<RateRow> = rates[planId].orEmpty()
 
     override fun createTrunk(request: CreateTrunk): Trunk {
         if (request.name.isBlank()) throw Invalid("trunk name must not be blank")
