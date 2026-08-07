@@ -376,7 +376,7 @@ components:
       type: object
       required:
         [node_id, mode, generated_at, window, poll_after_seconds,
-         accepted, absorbed, series, top_sources]
+         accepted, absorbed, blocked_sources, series, top_sources]
       properties:
         node_id:
           type: string
@@ -403,6 +403,21 @@ components:
           $ref: "#/components/schemas/Counter"
         absorbed:
           $ref: "#/components/schemas/Counter"
+        blocked_sources:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            How many sources are in the blocklist right now — the whole
+            blocklist, not a page of it.
+
+            This exists because the alternative is a lie. A dashboard that
+            counts the rows it happened to receive from `/v1/blocks` reports
+            "100 blocked" during an attack that blocked forty thousand, and
+            it does so on the one panel whose entire job is to be trustworthy
+            at 3am. The node already knows the true figure; it says so here,
+            and the table below is free to be an honest, explicitly truncated
+            sample of it.
         series:
           type: array
           description: |

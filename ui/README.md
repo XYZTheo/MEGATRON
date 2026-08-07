@@ -23,8 +23,16 @@ product.
   surface it can land on (`python ci/policy_check.py`, rule group PALETTE).
 - The dashboard's fixture conforms to the contract it cites, schema by schema
   (`python ci/check_fixtures.py`).
-- The page is structurally well-formed, every `getElementById` target exists in
-  the markup, and it references no external URL.
+- The page is structurally well-formed, every id looked up in script exists in
+  the markup exactly once, no id is dead, every `aria-controls` target
+  resolves, and no external URL is referenced (`python ci/check_ui_markup.py`,
+  with `python ci/test_check_ui_markup.py` proving that check can fail).
+
+  That last one was itself an overclaim until a reviewer caught it: the bullet
+  was listed under "verified by execution" when the verification was a thing
+  done once by hand. The check now exists rather than the claim being deleted,
+  because with no browser in the toolchain a typo'd id is a TypeError nothing
+  else in the pipeline would find.
 
 **NOT verified:**
 
@@ -82,6 +90,8 @@ colour-vision deficiency.
 python ci/policy_check.py            # the gate
 python ci/test_policy_check.py       # proof the gate can fail
 python ui/test_validate_palette.py   # proof the colour checks can fail
+python ci/check_ui_markup.py         # page structure and id integrity
+python ci/test_check_ui_markup.py    # proof that check can fail
 python ci/check_fixtures.py          # fixture vs contract (needs pyyaml, jsonschema)
 ```
 

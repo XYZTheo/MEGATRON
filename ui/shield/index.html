@@ -453,7 +453,7 @@
     <section class="panel">
       <div class="panel-head">
         <h2>Blocklist</h2>
-        <span class="panel-note">newest first · all entries expire</span>
+        <span class="panel-note" id="blocks-note">newest first</span>
       </div>
       <div class="scroll">
         <table>
@@ -503,6 +503,7 @@
   "poll_after_seconds": 5,
   "accepted": { "packets": 1042118, "requests": 41194 },
   "absorbed": { "packets": 98443127, "requests": 7734512 },
+  "blocked_sources": 7,
   "series": [
     {"t":"2026-08-06T20:44:00Z","accepted":11,"absorbed":38},
     {"t":"2026-08-06T20:47:00Z","accepted":12,"absorbed":31},
@@ -778,7 +779,7 @@ function render(data, isDemo) {
   if (series.length === 0) {
     $("stat-accepted").textContent = "—";
     $("stat-absorbed").textContent = "—";
-    $("stat-blocked").textContent = grouped(data.blocks.items.length);
+    $("stat-blocked").textContent = compact(data.blocked_sources);
     $("stat-verdict").textContent = "No data";
     $("stat-verdict-sub").textContent = "no traffic buckets in this window yet";
     $("window-note").textContent = `last ${data.window} · no buckets`;
@@ -792,7 +793,13 @@ function render(data, isDemo) {
   $("stat-absorbed").title = grouped(data.absorbed.requests) + " requests";
   $("stat-absorbed-sub").textContent =
     `requests · ${compact(data.absorbed.packets)} packets`;
-  $("stat-blocked").textContent = grouped(data.blocks.items.length);
+
+  /* The count comes from the overview, which is the node's true figure for
+     the whole blocklist. Counting the rows that came back from /v1/blocks
+     would report "500 blocked" during an attack that blocked forty thousand,
+     on the one tile whose entire job is to be trustworthy at 3am. */
+  $("stat-blocked").textContent = compact(data.blocked_sources);
+  $("stat-blocked").title = grouped(data.blocked_sources) + " sources";
   $("now-accepted").textContent = grouped(latest.accepted) + "/s";
   $("now-absorbed").textContent = grouped(latest.absorbed) + "/s";
 
@@ -858,6 +865,14 @@ function render(data, isDemo) {
     `<td class="muted data">${until(b.expires_at, now)}</td>` +
     `<td><button type="button" data-unblock="${escapeHtml(b.address)}">Unblock</button></td>` +
     `</tr>`).join("");
+
+  /* Say so when the table is a sample. next_cursor present means the node
+     had more to give than we asked for, and a table that just stops without
+     saying it stopped is a table an operator will read as complete. */
+  const shown = data.blocks.items.length;
+  $("blocks-note").textContent = data.blocks.next_cursor
+    ? `showing the ${grouped(shown)} most recent of ${grouped(data.blocked_sources)}`
+    : `${grouped(shown)} entr${shown === 1 ? "y" : "ies"} · all entries expire`;
 }
 
 /* Every value below comes from a remote node and several are attacker-
@@ -914,38 +929,133 @@ themeBtn.addEventListener("click", () => {
 themeBtn.textContent =
   window.matchMedia("(prefers-color-scheme: dark)").matches ? "Light" : "Dark";
 
+/* The operator token. The contract puts `operatorToken` (HTTP bearer) on
+   every endpoint except /v1/health, so a client that sends no Authorization
+   header gets 401 on every load and can never show anything.
+
+   The node agent injects it into this page as a meta tag when it serves it,
+   which keeps it out of the URL (URLs land in logs and Referer headers) and
+   out of localStorage (which survives the session and is readable by anything
+   else that ends up running on this origin). sessionStorage is accepted as a
+   second source so a tunnelled/static deployment can hand it over once.
+
+   Note what does NOT happen if the token is missing: the page does not fetch
+   anyway and report the resulting 401 as "the node is down". Those are
+   different problems with different fixes, and telling an operator their
+   switch is unreachable when actually their token expired is how a support
+   call becomes an outage. */
+function operatorToken() {
+  const meta = document.querySelector('meta[name="megatron-token"]');
+  const injected = meta && meta.content && meta.content.trim();
+  if (injected) return injected;
+  try {
+    return (window.sessionStorage.getItem("megatron.token") || "").trim();
+  } catch (err) {
+    return "";   /* storage can throw in a hardened browser profile */
+  }
+}
+
+function authHeaders(token) {
+  return { Accept: "application/json", Authorization: "Bearer " + token };
+}
+
+function showProblem(text, glyph) {
+  const chip = $("status-chip");
+  chip.classList.remove("good", "warning");
+  chip.classList.add("critical");
+  chip.querySelector(".glyph").textContent = glyph;
+  $("status-text").textContent = text;
+}
+
+/* Server-driven polling. The contract's whole argument for polling over a
+   push channel is that the node is the thing under load during an attack, and
+   that it can therefore tell every open dashboard to back off by moving one
+   number. That only works if the client actually honours it — a page that
+   fetches once on load leaves the operator hitting F5 during the incident,
+   and gives poll_after_seconds nothing to drive.
+
+   On failure the interval backs off geometrically to a ceiling, so a node
+   that has fallen over is not additionally hammered by every dashboard that
+   was left open pointing at it. */
+const POLL_FALLBACK_S = 5, POLL_MAX_S = 60;
+let pollTimer = null, failures = 0;
+
+function scheduleNext(seconds) {
+  if (pollTimer !== null) clearTimeout(pollTimer);
+  pollTimer = setTimeout(loadOverview, Math.max(1, seconds) * 1000);
+}
+
 /* Fetch from the node when served by one; fall back to the fixture ONLY on
    file://. The guard matters: a fallback that fired on a network error would
    show an operator invented numbers at the exact moment their node stopped
    answering, which is the worst possible time to be lied to. */
 async function loadOverview() {
-  const fixture = JSON.parse($("fixture").textContent);
-
   if (location.protocol === "file:") {
-    render(fixture, true);
+    render(JSON.parse($("fixture").textContent), true);
+    return;   /* a fixture does not change; polling it would be theatre */
+  }
+
+  const token = operatorToken();
+  if (!token) {
+    showProblem("no operator token", "▲");
+    $("updated").textContent = "not authenticated";
     return;
   }
+
   try {
-    const [overview, blocks] = await Promise.all([
-      fetch("/v1/overview?window=1h", { headers: { Accept: "application/json" } }),
-      fetch("/v1/blocks?limit=100", { headers: { Accept: "application/json" } }),
+    /* Both URLs are same-origin literals on purpose: ci/policy_check.py
+       (UI-SELF-CONTAINED) requires it, because a URL assembled at runtime is
+       one no static check can read. limit is the contract maximum rather
+       than a cursor walk — see renderBlocks() for why the table is an
+       explicitly truncated sample and the count comes from the overview. */
+    const [overviewRes, blocksRes] = await Promise.all([
+      fetch("/v1/overview?window=1h", { headers: authHeaders(token) }),
+      fetch("/v1/blocks?limit=500", { headers: authHeaders(token) }),
     ]);
-    if (!overview.ok || !blocks.ok) throw new Error("HTTP " + overview.status + "/" + blocks.status);
-    const data = await overview.json();
-    data.blocks = await blocks.json();
+
+    if (overviewRes.status === 401 || blocksRes.status === 401) {
+      showProblem("operator token rejected", "▲");
+      $("updated").textContent = "not authenticated";
+      return;   /* retrying a rejected token just burns requests */
+    }
+    if (overviewRes.status === 503 || blocksRes.status === 503) {
+      /* Telemetry is shed first, by design. The node is up and busy; keep
+         the last good data on screen and mark it stale. */
+      const retry = Number(overviewRes.headers.get("Retry-After")) || POLL_FALLBACK_S;
+      showProblem("node shedding telemetry", "▲");
+      scheduleNext(retry);
+      return;
+    }
+    if (!overviewRes.ok || !blocksRes.ok) {
+      throw new Error("HTTP " + overviewRes.status + "/" + blocksRes.status);
+    }
+
+    const data = await overviewRes.json();
+    data.blocks = await blocksRes.json();
+    failures = 0;
     render(data, false);
+    scheduleNext(data.poll_after_seconds || POLL_FALLBACK_S);
   } catch (err) {
     /* Last good data with a visible staleness marker, never an error page
        that makes "the dashboard broke" look like "the switch is down". */
-    const chip = $("status-chip");
-    chip.classList.remove("good", "warning");
-    chip.classList.add("critical");
-    chip.querySelector(".glyph").textContent = "■";
-    $("status-text").textContent = "no telemetry from node";
+    failures += 1;
+    showProblem("no telemetry from node", "■");
     $("updated").textContent = "unreachable";
     console.error("shield telemetry unavailable:", err);
+    scheduleNext(Math.min(POLL_FALLBACK_S * 2 ** (failures - 1), POLL_MAX_S));
   }
 }
+
+/* Polling a hidden tab is work the node does not need to do. Resume on
+   return, and refresh immediately so the operator is never looking at a
+   number that stopped updating while the tab was in the background. */
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    if (pollTimer !== null) { clearTimeout(pollTimer); pollTimer = null; }
+  } else if (location.protocol !== "file:") {
+    loadOverview();
+  }
+});
 
 loadOverview();
 </script>

@@ -56,6 +56,18 @@ jobs:
       - name: Check the repository
         run: python3 ci/policy_check.py
 
+      - name: Prove the markup check can fail
+        run: python3 ci/test_check_ui_markup.py
+
+      - name: Check the shipped UI markup
+        # There is no browser and no Node runtime anywhere in this project's
+        # toolchain, so the dashboard's JavaScript has never been executed. A
+        # typo'd element id is a TypeError on the first line that touches it
+        # and a blank page for the operator, and nothing else in the pipeline
+        # would notice. This is the cheapest available substitute for running
+        # it — and it is what makes ui/README.md's "verified" list honest.
+        run: python3 ci/check_ui_markup.py
+
   # --------------------------------------------------------------------
   # Colour is a correctness property here, not a preference. The operator
   # dashboard's job is to be readable by a tired human at 3am during an

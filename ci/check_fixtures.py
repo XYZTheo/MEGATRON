@@ -89,17 +89,28 @@ def main() -> int:
         return 1
 
     failures = 0
+    schema_clean = True
     for name, instance in (("Overview", fixture), ("BlockPage", blocks)):
         errors = sorted(validator_for(name, schemas).iter_errors(instance),
                         key=lambda e: list(e.absolute_path))
         if errors:
             failures += len(errors)
+            schema_clean = False
             print(f"FAIL: fixture does not conform to {name}:")
             for err in errors:
                 where = "/".join(str(p) for p in err.absolute_path) or "(root)"
                 print(f"  {where}: {err.message}")
         else:
             print(f"OK: fixture conforms to {name}")
+
+    # The checks below index fields the schema has just guaranteed. Running
+    # them on a fixture that FAILED validation buries the useful message
+    # under a KeyError traceback, which in a CI log is how a clear diagnosis
+    # becomes ten minutes of scrolling. Stop here and report what we know.
+    if not schema_clean:
+        print(f"\n{failures} problem(s). Later checks skipped — they assume a "
+              f"schema-valid fixture.")
+        return 1
 
     # The dashboard renders reason labels from a closed set. A value the page
     # does not know shows as a raw string, which is survivable, but a value in
