@@ -112,6 +112,10 @@ def render(data: dict) -> str:
     out: list[str] = []
     add = out.append
 
+    v1_total = sum(1 for _, m in rows(data) if m.get("v1"))
+    v1_done = sum(1 for _, m in rows(data)
+                  if m.get("v1") and m["status"] in ("shipped", "specified"))
+
     add("# MagnusBilling feature parity")
     add("")
     add("> **Generated from [`magnus-parity.yaml`](magnus-parity.yaml).**")
@@ -121,6 +125,19 @@ def render(data: dict) -> str:
     add("An operator asking \"does it do everything Magnus does?\" deserves a real")
     add("answer, and a project claiming it deserves something that checks. Every")
     add("module MagnusBilling documents has a row here, a status, and an owner.")
+    add("")
+    add("## ⚠️ This is not the v1 to-do list")
+    add("")
+    add("**Read [`PRODUCT.md`](PRODUCT.md) first.** The owner's business is")
+    add("`trunk in → rate → authenticate → trunk out → bill`, operated through a")
+    add("Telegram bot. Most of MagnusBilling's surface is not in that workflow, and")
+    add("building it first would delay the switch that exists to stop his platform")
+    add("being knocked offline.")
+    add("")
+    add(f"**{v1_total} of {total} modules are on the v1 critical path** — the `v1`")
+    add("column below. The other rows are roadmap: real features, tracked so that")
+    add("\"we don't have that yet\" is always a deliberate answer rather than a")
+    add("discovery, and worked when a paying operator actually needs them.")
     add("")
     add("**The inventory cannot shrink.** `ci/check_parity.py` fails the build if it")
     add("drops below the count taken from Magnus's own documentation tree, which is")
@@ -157,15 +174,16 @@ def render(data: dict) -> str:
     for group in data["groups"]:
         add(f"## {group['name']}")
         add("")
-        add("| Magnus module | What it does there | Status | MEGATRON |")
-        add("|---|---|---|---|")
+        add("| Magnus module | What it does there | v1 | Status | MEGATRON |")
+        add("|---|---|---|---|---|")
         for module in group["modules"]:
             status = BADGE[module["status"]]
+            v1 = "**yes**" if module.get("v1") else "—"
             detail = module.get("note") or module.get("instead") or ""
             if module["status"] == "planned" and module.get("issue"):
                 detail = (f"[#{module['issue']}](https://github.com/XYZTheo/MEGATRON/"
                           f"issues/{module['issue']})" + (f" — {detail}" if detail else ""))
-            add(f"| `{module['id']}` | {module['magnus']} | {status} | {detail} |")
+            add(f"| `{module['id']}` | {module['magnus']} | {v1} | {status} | {detail} |")
         add("")
 
     return "\n".join(out) + "\n"
@@ -187,6 +205,14 @@ def main() -> int:
         if mid in seen:
             problems.append(f"duplicate module id '{mid}'")
         seen.add(mid)
+
+        if "v1" not in module:
+            problems.append(
+                f"'{mid}': no v1 flag. Every module has to be explicitly on or off the "
+                f"critical path for the owner's own workflow (docs/PRODUCT.md). "
+                f"Unclassified is how Magnus's whole feature surface quietly becomes "
+                f"the v1 scope and delays the switch that is meant to stop his platform "
+                f"being knocked offline.")
 
         status = module.get("status")
         if status not in STATUSES:
@@ -245,6 +271,15 @@ def main() -> int:
     print(f"OK: every status in the closed vocabulary; every 'planned' has an issue; "
           f"every 'superseded' argues its case")
     print(f"OK: {RENDERED.name} is in sync")
+
+    v1 = [m for _, m in rows(data) if m.get("v1")]
+    v1_pending = [m["id"] for m in v1 if m["status"] == "planned"]
+    print(f"\nv1 critical path (docs/PRODUCT.md): {len(v1)} of {total} modules")
+    print(f"  shipped or specified: {len(v1) - len(v1_pending)}")
+    print(f"  still to build:       {len(v1_pending)}")
+    print("\nThe other "
+          f"{total - len(v1)} are roadmap, not v1. Working them first would delay the "
+          "switch that exists to stop the owner's platform being attacked.")
     if gaps:
         print(f"\n{len(gaps)} GAP(s) with no owner yet:")
         for mid in gaps:

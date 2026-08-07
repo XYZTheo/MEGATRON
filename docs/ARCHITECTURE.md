@@ -4,6 +4,31 @@
 
 ---
 
+> ## ⚠️ READ [`PRODUCT.md`](PRODUCT.md) FIRST
+>
+> This document describes what the platform can grow into. **[`PRODUCT.md`](PRODUCT.md)
+> describes the business it has to serve on day one.** Where the two disagree,
+> PRODUCT.md wins.
+>
+> The short version, so it cannot be missed:
+>
+> - The owner resells SIP trunks. **Trunk in → rate → authenticate → trunk out → bill.**
+>   That is the entire v1 business.
+> - **A Telegram bot is the operating interface**, not the web console — it
+>   generates logins, manages balances, and lets customers top up and set their
+>   own caller ID. The provisioning API is the product; the bot and the console
+>   are two clients of it.
+> - **The motive is security, not features.** Magnus keeps getting attacked.
+>   That is why this project exists.
+> - **The owner is the first customer.** v1 must carry *his* traffic
+>   excellently, not everyone's traffic adequately.
+>
+> Much of what follows — class-5 services, IVR, queues, campaigns, the full
+> MagnusBilling parity surface — is roadmap, not v1. Building it first would
+> delay the switch that is meant to stop his platform being knocked offline.
+
+---
+
 ## Context
 
 Seth is building a new Class-4 + Class-5 VoIP softswitch with integrated realtime
