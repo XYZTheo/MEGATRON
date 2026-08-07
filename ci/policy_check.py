@@ -491,11 +491,21 @@ def check_theme_blocks_in_sync(f: Findings) -> None:
     # wrong the moment a layer exists. That is not a parser bug to work
     # around; it is a signal this gate cannot reason about the file, so it
     # stops rather than guessing.
-    if "@layer" in blank_block_comments(text):
-        f.fail("THEME-SYNC", path, None,
-               "@layer changes which declaration wins independently of source order, and "
-               "this gate resolves duplicates by source order. It cannot tell you which "
-               "value the browser would actually use. Declare tokens outside any layer.")
+    # @scope is here for the same reason: it introduces scoping proximity as a
+    # tie-breaker that runs BEFORE source order, so it too can change which
+    # declaration wins without changing which one comes last.
+    #
+    # @media and @container are deliberately NOT in this list. They change
+    # which rules MATCH, not which of two matching declarations wins, so
+    # source order still decides and the parser's assumption holds.
+    stripped = blank_block_comments(text)
+    for at_rule in ("@layer", "@scope"):
+        if at_rule in stripped:
+            f.fail("THEME-SYNC", path, None,
+                   f"{at_rule} changes which declaration wins independently of source "
+                   f"order, and this gate resolves duplicates by source order. It cannot "
+                   f"tell you which value the browser would actually use, so it refuses to "
+                   f"guess. Declare tokens outside it.")
 
     # Colour tokens may live in exactly one file. Anything else under ui/ that
     # declares --mg-* is invisible to every check below, and a plain second
@@ -505,7 +515,14 @@ def check_theme_blocks_in_sync(f: Findings) -> None:
     #     :root[data-theme="dark"] { --mg-ink-faint: var(--mg-ground); }
     # no hex, no colour function, nothing for UI-SELF-CONTAINED to match, and
     # ink rendered invisible on its own background while every rule said PASS.
-    for other in sorted((REPO / UI_DIR).rglob("*.css")) if (REPO / UI_DIR).is_dir() else []:
+    # Matched on the lowercased suffix rather than with rglob("*.css"): glob is
+    # case-insensitive on Windows and case-sensitive on Linux, so a file named
+    # theme.CSS would be scanned on the machine this was written on and
+    # invisible on the CI runner that actually gates the merge.
+    other_css = ([p for p in sorted((REPO / UI_DIR).rglob("*"))
+                  if p.is_file() and p.suffix.lower() == ".css"]
+                 if (REPO / UI_DIR).is_dir() else [])
+    for other in other_css:
         if other.resolve() == path.resolve():
             continue
         if MG_TOKEN_DECL_RE.search(blank_block_comments(
@@ -842,6 +859,11 @@ DYNAMIC_REQUEST_RE = re.compile(
 INDIRECTION_RE = (
     (re.compile(r"=\s*(?:window\s*\.\s*|globalThis\s*\.\s*)?fetch\s*[;,\n)]"),
      "aliasing fetch to another name"),
+    (re.compile(r"\{[^{}\n]*\b(?:fetch|sendBeacon|Worker|Image|XMLHttpRequest)\b"
+                r"[^{}\n]*\}\s*=\s*(?:window|globalThis|self|navigator|top|parent)\b"),
+     "destructuring a request primitive out of a global, which renames the call site"),
+    (re.compile(r"\b(?:top|parent|frames)\s*\.\s*(?:location|postMessage)\b"),
+     "reaching another browsing context"),
     (re.compile(r"\b(?:window|globalThis|navigator|self|document)\s*\["),
      "bracket property access on a global, which hides the name being called"),
     (re.compile(r"\.\s*src\s*=(?!=)"),

@@ -626,6 +626,44 @@ class PolicyGateTest(unittest.TestCase):
         r = fx.run()
         self.assertEqual(r.returncode, 0, r.stdout)
 
+    def test_second_stylesheet_scan_is_not_case_sensitive(self) -> None:
+        """rglob("*.css") is case-insensitive on Windows and case-sensitive on
+        Linux, so theme.CSS would be checked on the machine this was written
+        on and invisible on the runner that actually gates the merge."""
+        fx = self.fixture()
+        fx.write("ui/tokens.css", self.tokens())
+        fx.write("ui/shield/override.CSS", ":root { --mg-ink: #FFFFFF; }\n")
+        r = fx.run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("THEME-SYNC", r.stdout)
+
+    def test_token_smuggled_into_an_at_rule_in_a_second_file_is_rejected(self) -> None:
+        fx = self.fixture()
+        fx.write("ui/tokens.css", self.tokens())
+        fx.write("ui/shield/override.css",
+                 "@media (min-width: 1px) { :root { --mg-ink: #FFFFFF; } }\n")
+        r = fx.run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("THEME-SYNC", r.stdout)
+
+    def test_at_scope_in_tokens_is_rejected(self) -> None:
+        """@scope is @layer's twin for this purpose: it adds scoping proximity
+        as a tie-breaker that runs BEFORE source order, so it too can change
+        the winner without changing which declaration comes last.
+
+        @media and @container are deliberately NOT rejected — they change
+        which rules match, not which of two matching declarations wins."""
+        css = self.tokens() + "\n@scope (:root) { :root { --mg-ink: #FFFFFF; } }\n"
+        r = self.with_tokens(css)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("THEME-SYNC", r.stdout)
+
+    def test_prose_about_at_layer_does_not_trip_the_rule(self) -> None:
+        css = self.tokens().replace(
+            ":root {", "/* Tokens are declared outside any @layer or @scope. */\n:root {", 1)
+        r = self.with_tokens(css)
+        self.assertEqual(r.returncode, 0, r.stdout)
+
     def test_at_layer_in_tokens_is_rejected(self) -> None:
         """@layer decides winners independently of source order — an unlayered
         rule beats a layered one wherever each sits. parse_css_tokens resolves
@@ -661,6 +699,62 @@ class PolicyGateTest(unittest.TestCase):
                 r = self.page(body)
                 self.assertEqual(r.returncode, 1, r.stdout)
                 self.assertIn("UI-SELF-CONTAINED", r.stdout)
+
+    def test_markup_level_egress_channels_are_rejected(self) -> None:
+        """None of these involve fetch at all. They are the ways a page
+        reaches the network without any script the fetch rule would see."""
+        for label, body in (
+                ("iframe", '<iframe src="https://evil.example.com/x"></iframe>'),
+                ("meta refresh",
+                 '<meta http-equiv="refresh" content="0;url=https://evil.example.com/">'),
+                ("css url() in an inline style",
+                 '<div style="background:url(https://evil.example.com/x.png)"></div>'),
+                ("@import a remote stylesheet",
+                 '<style>@import url("https://evil.example.com/x.css");</style>'),
+                ("form action off-host",
+                 '<form action="https://evil.example.com/x" method="post"></form>')):
+            with self.subTest(channel=label):
+                r = self.page(body)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn("UI-SELF-CONTAINED", r.stdout)
+
+    def test_destructuring_a_request_primitive_is_rejected(self) -> None:
+        r = self.page('<script>const {fetch: f} = window; f("/v1/x");</script>')
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("UI-SELF-CONTAINED", r.stdout)
+
+    def test_comment_scanner_survives_awkward_javascript(self) -> None:
+        """blank_line_comments tracks quote state by hand, so the constructs
+        that break naive scanners get pinned: an apostrophe inside a template
+        literal or a regex would otherwise flip it into 'inside a string' for
+        the rest of the file and silently stop checking anything after."""
+        for label, body in (
+                ("template literal with an apostrophe",
+                 "<script>const s = `it's fine`; fetch(\"/v1/x\");</script>"),
+                ("regex literal with an apostrophe",
+                 "<script>const r = /can't/; fetch(\"/v1/x\");</script>"),
+                ("apostrophe in HTML text",
+                 "<p>the operator's console</p><script>fetch(\"/v1/x\");</script>"),
+                ("CRLF line endings",
+                 '<script>\r\n  // a comment\r\n  fetch("/v1/x");\r\n</script>\r\n')):
+            with self.subTest(construct=label):
+                r = self.page(body)
+                self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_violations_after_awkward_javascript_are_still_caught(self) -> None:
+        """The other half of the previous test, and the one that would fail
+        silently: if the scanner got stuck 'inside a string', everything after
+        the awkward construct would stop being checked and the suite would
+        still be green."""
+        r = self.page("<script>const s = `it's fine`;</script>"
+                      "<style>.x { color: #8B9AA0; }</style>")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("colour literal", r.stdout)
+
+        r = self.page('<script>\r\n  // note\r\n'
+                      '  fetch("https://evil.example.com/x");\r\n</script>')
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("evil.example.com", r.stdout)
 
     def test_colour_literal_is_caught_despite_an_unrelated_line_comment(self) -> None:
         """Pins the // exclusion as line-scoped. Replacing the whole exclusion
