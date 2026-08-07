@@ -334,6 +334,16 @@ jobs:
           done
           exit $rc
 
+      - name: Hold the MagnusBilling parity inventory to its claims
+        # "Every single feature Magnus has, so we aren't missing anything" is a
+        # requirement, and a requirement that lives only in a markdown table is
+        # one that quietly erodes. Every migration project's feature matrix has
+        # been edited down to what was convenient by month four, and nobody
+        # noticed because nothing was watching the list. This watches it: the
+        # inventory is pinned to Magnus's own documented module set, so a row
+        # cannot be dropped, invented, or left owner-less.
+        run: python3 ci/check_parity.py
+
       - name: Prove an insecure install is not expressible
         # ARCHITECTURE.md 6.2b promises there is no path through the wizard
         # that produces an insecure install. This attempts eighteen of them --
