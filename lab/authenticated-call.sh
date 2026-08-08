@@ -108,10 +108,17 @@ step "1. a carrier, a plan, a rate, and a customer"
 #
 # The lab's "carrier" is the SIPp UAS on 5070 that answers later in this
 # script.
-curl -s -m 5 "${OP[@]}" -H "Idempotency-Key: auth-trunk-$$" \
-    -d '{"name":"lab-carrier","direction":"OUTBOUND","host":"127.0.0.1",
-         "port":5070,"remote_ips":["127.0.0.1"],"transport":"UDP"}' \
-    "$PROV/v1/trunks" > /dev/null
+# The enum is lower-case on the wire ("outbound", not "OUTBOUND"), and the
+# response is CHECKED rather than discarded: sending > /dev/null here hid a
+# rejected request, and the only symptom was every call later refused with
+# "503 Refused" from the no-route guard -- which reads like a routing bug
+# rather than a trunk that was never created.
+TRUNK=$(curl -s -m 5 "${OP[@]}" -H "Idempotency-Key: auth-trunk-$$" \
+    -d '{"name":"lab-carrier","direction":"outbound","host":"127.0.0.1",
+         "port":5070,"remote_ips":["127.0.0.1"],"transport":"udp"}' \
+    "$PROV/v1/trunks")
+echo "$TRUNK" | grep -q '"id"' || fatal "the carrier was not created: $TRUNK"
+echo "carrier: 127.0.0.1:5070"
 
 PLAN=$(curl -s -m 5 "${OP[@]}" -H "Idempotency-Key: auth-plan-$$" \
     -d '{"name":"Lab Retail","currency":"USD"}' "$PROV/v1/plans" | jget 'd["id"]')

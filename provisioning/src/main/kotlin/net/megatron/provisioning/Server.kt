@@ -104,6 +104,30 @@ fun Application.provisioningModule(
                 HttpStatusCode.Conflict, "Idempotency-Key reused", cause.message
             )
         }
+        exception<io.ktor.server.plugins.BadRequestException> { call, cause ->
+            // A BODY WE CANNOT PARSE IS THE CALLER'S MISTAKE, NOT OURS.
+            //
+            // Without this it fell to the generic handler and came back as
+            // "500 Internal error — the request could not be completed",
+            // which says the server broke. It had not: the request named an
+            // enum value that does not exist.
+            //
+            // That cost real time in the lab. A trunk was created with
+            // "direction":"OUTBOUND" (the wire name is lower case), the 500
+            // was ignored by a script that discarded the response, and the
+            // only visible symptom was every later call refused with 503 by
+            // the no-route guard — which reads like a routing bug rather than
+            // a trunk that never existed.
+            //
+            // The cause is unwrapped because Ktor's own message is just
+            // "Failed to convert request body"; the useful sentence is
+            // underneath it, and it is about the caller's JSON, not about us.
+            val detail = generateSequence(cause as Throwable) { it.cause }
+                .mapNotNull { it.message }
+                .lastOrNull()
+                ?: "the request body could not be read"
+            call.problem(HttpStatusCode.BadRequest, "Invalid request", detail)
+        }
         exception<Throwable> { call, cause ->
             // Never leak a stack trace or an internal message to a caller.
             // The detail goes to the log; the caller gets a reference.

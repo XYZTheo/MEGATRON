@@ -50,6 +50,43 @@ class ProvisioningApiTest {
         if (key != null) header("Idempotency-Key", key)
     }
 
+    @Test
+    fun `an unparseable body is the caller's fault, and says what was wrong`() = testApp {
+        // FOUND THE EXPENSIVE WAY. A trunk was created with
+        // "direction":"OUTBOUND" — the wire name is lower case — and the API
+        // answered "500 Internal error: the request could not be completed",
+        // which says the SERVER broke. It had not. A script discarded that
+        // response, and the only visible symptom was every later call refused
+        // 503 by the no-route guard, which reads like a routing bug rather
+        // than a trunk that was never created.
+        val response = client.post("/v1/trunks") {
+            operator("trunk-bad-enum")
+            setBody(
+                """{"name":"c","direction":"OUTBOUND","host":"203.0.113.1",
+                    "remote_ips":["203.0.113.1"]}"""
+            )
+        }
+
+        assertEquals(HttpStatusCode.BadRequest, response.status)
+        val body = response.bodyAsText()
+        assertTrue(
+            body.contains("direction") || body.contains("OUTBOUND"),
+            "the reply does not say which field was wrong: $body",
+        )
+    }
+
+    @Test
+    fun `a well-formed trunk is accepted, so the check above is about the body`() = testApp {
+        val response = client.post("/v1/trunks") {
+            operator("trunk-good")
+            setBody(
+                """{"name":"c","direction":"outbound","host":"203.0.113.1",
+                    "port":5060,"remote_ips":["203.0.113.1"],"transport":"udp"}"""
+            )
+        }
+        assertEquals(HttpStatusCode.Created, response.status)
+    }
+
     private suspend fun ApplicationTestBuilder.makePlan(): String {
         val response = client.post("/v1/plans") {
             operator("plan-key-00001")

@@ -52,8 +52,8 @@ auth=(-H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json')
 # remote_ips is what the carrier sends to you from, and it is required — an
 # inbound trunk that accepts from anywhere is an open relay.
 curl -s "${auth[@]}" -H "Idempotency-Key: trunk-1" \
-  -d '{"name":"carrier-a","direction":"OUTBOUND","host":"203.0.113.10",
-       "port":5060,"remote_ips":["203.0.113.10"],"transport":"UDP"}' \
+  -d '{"name":"carrier-a","direction":"outbound","host":"203.0.113.10",
+       "port":5060,"remote_ips":["203.0.113.10"],"transport":"udp"}' \
   $API/v1/trunks
 
 # A plan
