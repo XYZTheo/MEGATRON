@@ -1,4 +1,4 @@
-[Unit]
+﻿[Unit]
 Description=MEGATRON provisioning API
 After=network-online.target 
 Wants=network-online.target
@@ -9,7 +9,7 @@ User=megatron
 Group=megatron
 EnvironmentFile=/etc/megatron/megatron.env
 EnvironmentFile=/etc/megatron/secrets.env
-ExecStart=@REPO@/provisioning/build/install/provisioning/bin/provisioning
+ExecStart=/opt/megatron/provisioning/bin/provisioning
 Restart=always
 RestartSec=5
 

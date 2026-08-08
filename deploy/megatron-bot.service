@@ -1,4 +1,4 @@
-[Unit]
+﻿[Unit]
 Description=MEGATRON Telegram bot (the operating interface)
 After=network-online.target megatron-provisioning.service
 Wants=network-online.target
@@ -9,7 +9,7 @@ User=megatron
 Group=megatron
 EnvironmentFile=/etc/megatron/megatron.env
 EnvironmentFile=/etc/megatron/secrets.env
-ExecStart=@REPO@/bot/build/install/bot/bin/bot
+ExecStart=/opt/megatron/bot/bin/bot
 Restart=always
 RestartSec=5
 

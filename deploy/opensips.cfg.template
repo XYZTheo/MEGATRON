@@ -34,6 +34,20 @@ udp_workers=2
 
 socket=udp:0.0.0.0:5060
 
+# WHAT THIS SWITCH TELLS THE WORLD ITS ADDRESS IS.
+#
+# Bound on every interface, but on a NAT'd host -- every EC2, GCE and most VPS
+# instances -- the address OpenSIPS would otherwise put in Via, Record-Route
+# and Contact is the private one. A softphone then sends its ACK and BYE to an
+# address the internet cannot route: the call sets up and never tears down,
+# which is a dialog that lives until the session timer kills it and a customer
+# billed for the difference.
+#
+# The installer substitutes the address customers actually reach. On a machine
+# with a real public IP on its interface this is the same value, and setting
+# it explicitly costs nothing.
+advertised_address="@PUBLIC_IP@"
+
 mpath="/usr/lib/x86_64-linux-gnu/opensips/modules/"
 
 loadmodule "proto_udp.so"

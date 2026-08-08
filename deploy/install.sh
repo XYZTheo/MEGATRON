@@ -76,12 +76,52 @@ step "1/9  preflight"
 [ "${ID:-}" = "ubuntu" ] || [ "${ID:-}" = "debian" ] \
     || fatal "this installer supports Ubuntu and Debian; found '${ID:-unknown}'"
 
+# TWO ADDRESSES, NOT ONE, AND CONFLATING THEM COSTS YOU AUDIO.
+#
+# BIND_IP is the address on this machine. ADVERTISE_IP is what we put in SDP
+# so the far end knows where to send RTP. On any NAT'd host -- which is every
+# EC2, GCE and most VPS instances -- they are DIFFERENT, and the local one is
+# a 172.16/12 or 10/8 address the internet cannot route.
+#
+# The first version of this script called `ip route get` "the public IP". On
+# this very box that returned 172.31.6.145. Deployed as-is, every call would
+# have connected and carried silence, which is the single hardest VoIP fault
+# to diagnose and the one this whole project treats as a money-losing failure.
+BIND_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
+[ -n "$BIND_IP" ] || fatal "could not determine this machine's IP address"
+
 if [ -z "$PUBLIC_IP" ]; then
-    PUBLIC_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
+    # Cloud metadata, best-effort and quickly. IMDSv2 first because AWS
+    # increasingly refuses v1; a short timeout because on a box that is NOT in
+    # a cloud this endpoint is a black hole.
+    TOKEN=$(curl -fsS -m 2 -X PUT "http://169.254.169.254/latest/api/token" \
+        -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+    if [ -n "$TOKEN" ]; then
+        PUBLIC_IP=$(curl -fsS -m 2 -H "X-aws-ec2-metadata-token: $TOKEN" \
+            "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null || true)
+    fi
 fi
-[ -n "$PUBLIC_IP" ] || fatal "could not detect a public IP; pass --public-ip"
-echo "domain    $DOMAIN"
-echo "public ip $PUBLIC_IP"
+
+if [ -z "$PUBLIC_IP" ]; then
+    PUBLIC_IP=$BIND_IP
+fi
+
+echo "domain       $DOMAIN"
+echo "bind         $BIND_IP"
+echo "advertise    $PUBLIC_IP"
+
+case "$PUBLIC_IP" in
+    10.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|192.168.*|127.*)
+        # Correct on a box with a real public IP on its interface, and a
+        # silent disaster on a NAT'd one, so it is said out loud rather than
+        # assumed either way.
+        echo
+        echo "  NOTE: $PUBLIC_IP is a private address, so that is what this switch will"
+        echo "  advertise in SDP. If this machine is behind NAT, audio will not reach it"
+        echo "  and every call will connect with silence. Re-run with:"
+        echo "      --public-ip <the address customers reach you on>"
+        ;;
+esac
 
 # THE PACKAGED opensips.service MUST NOT RUN.
 #
@@ -95,6 +135,34 @@ if systemctl list-unit-files opensips.service >/dev/null 2>&1; then
     systemctl stop opensips 2>/dev/null || true
     systemctl mask opensips 2>/dev/null || true
     echo "masked the packaged opensips.service"
+fi
+
+# AND ANYTHING ELSE HOLDING 5060, WHICH MASKING A UNIT DOES NOT COVER.
+#
+# A hand-started `opensips -f something.cfg` keeps the port, our switch cannot
+# bind, and systemd reports only "Job for megatron-opensips.service failed
+# because a timeout was exceeded" -- because with Type=forking the parent
+# exits 0 and the child dies before writing a pidfile. Nothing in that message
+# mentions the port. Meanwhile `ss` still shows an opensips on 5060, so even
+# a careful check afterwards says the switch is up.
+SQUATTER=$(ss -lunp 2>/dev/null | awk '/:5060 /{print $NF}' \
+    | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+if [ -n "${SQUATTER:-}" ]; then
+    OWNER=$(ps -p "$SQUATTER" -o args= 2>/dev/null | head -1)
+    case "$OWNER" in
+        *"/etc/opensips/megatron.cfg"*)
+            systemctl stop megatron-opensips 2>/dev/null || true
+            ;;
+        *)
+            fatal "something else is already listening on UDP 5060 and it is not
+  ours, so this switch cannot start:
+
+      pid $SQUATTER  $OWNER
+
+  Stop it and run this again. (Masking the packaged unit does not cover a
+  process started by hand.)"
+            ;;
+    esac
 fi
 
 step "2/9  packages"
@@ -158,7 +226,26 @@ for service in provisioning switch-api bot; do
     [ -x "$REPO/$service/build/install/$service/bin/$service" ] \
         || fatal "$service was not built; run without --skip-build"
 done
-echo "built provisioning, switch-api, bot"
+
+# INSTALLED TO /opt, NOT RUN FROM THE BUILD TREE.
+#
+# The units set ProtectHome=yes, which makes /home invisible to the service —
+# so pointing ExecStart at a checkout under /home/<someone> produced
+# "status=203/EXEC", a systemd error that says only that it could not execute
+# the binary and nothing about why. Hardening that makes your own program
+# unreachable is worse than no hardening, because it fails in a way that reads
+# like a broken build.
+#
+# It is also simply where a service belongs: running one out of a developer's
+# home directory means a `git checkout` restarts the business.
+install -d -m 0755 /opt/megatron
+for service in provisioning switch-api bot; do
+    rm -rf "/opt/megatron/$service"
+    cp -r "$REPO/$service/build/install/$service" "/opt/megatron/$service"
+done
+chown -R root:megatron /opt/megatron
+chmod -R a+rX /opt/megatron
+echo "installed provisioning, switch-api, bot to /opt/megatron"
 
 step "6/9  configuration"
 
@@ -167,11 +254,13 @@ step "6/9  configuration"
 # relays every call to a SIPp listener on 127.0.0.1:5070. The deploy template
 # is derived from it -- same hard-won details -- with the fake carrier replaced
 # by the route the authorizer returns per call.
-sed -e "s|@DOMAIN@|$DOMAIN|g" \
+sed -e "s|@DOMAIN@|$DOMAIN|g" -e "s|@PUBLIC_IP@|$PUBLIC_IP|g" \
     "$REPO/deploy/opensips.cfg.template" > /etc/opensips/megatron.cfg
 chmod 0644 /etc/opensips/megatron.cfg
-grep -q '@DOMAIN@' /etc/opensips/megatron.cfg \
-    && fatal "the config template still has unsubstituted placeholders"
+if grep -q '@[A-Z_]*@' /etc/opensips/megatron.cfg; then
+    fatal "the switch config still has unsubstituted placeholders: " \
+        "$(grep -o '@[A-Z_]*@' /etc/opensips/megatron.cfg | sort -u | tr '\n' ' ')"
+fi
 
 # db_text needs a table version file, and the number is not guessable: the
 # module refuses to start against a mismatch, at FIXUP -- so `opensips -C`
@@ -198,7 +287,14 @@ chmod 0644 "$ETC/megatron.env"
 step "7/9  services"
 
 for unit in megatron-provisioning megatron-switch-api megatron-bot megatron-rtpengine megatron-opensips; do
-    sed -e "s|@REPO@|$REPO|g" "$REPO/deploy/$unit.service" > "/etc/systemd/system/$unit.service"
+    sed -e "s|@REPO@|$REPO|g" -e "s|@BIND_IP@|$BIND_IP|g" -e "s|@PUBLIC_IP@|$PUBLIC_IP|g" \
+        "$REPO/deploy/$unit.service" > "/etc/systemd/system/$unit.service"
+    # An unsubstituted placeholder in a unit file is a service that fails to
+    # start with an error about a value nobody typed.
+    if grep -q '@[A-Z_]*@' "/etc/systemd/system/$unit.service"; then
+        fatal "$unit.service still has unsubstituted placeholders: " \
+            "$(grep -o '@[A-Z_]*@' "/etc/systemd/system/$unit.service" | sort -u | tr '\n' ' ')"
+    fi
 done
 systemctl daemon-reload
 

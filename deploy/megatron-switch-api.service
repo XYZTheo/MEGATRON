@@ -1,4 +1,4 @@
-[Unit]
+﻿[Unit]
 Description=MEGATRON switch API (the money path)
 After=network-online.target megatron-provisioning.service
 Wants=network-online.target
@@ -9,7 +9,7 @@ User=megatron
 Group=megatron
 EnvironmentFile=/etc/megatron/megatron.env
 EnvironmentFile=/etc/megatron/secrets.env
-ExecStart=@REPO@/switch-api/build/install/switch-api/bin/switch-api
+ExecStart=/opt/megatron/switch-api/bin/switch-api
 Restart=always
 RestartSec=5
 
