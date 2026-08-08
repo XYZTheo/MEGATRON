@@ -137,6 +137,29 @@ class SqlStore(
     private val ids = AtomicLong(System.currentTimeMillis())
     private val random = SecureRandom()
 
+    /**
+     * Four hex digits that identify THIS process, appended to every id.
+     *
+     * TWO SERVICES SHARE THIS DATABASE. provisioning and switch-api each open
+     * their own SqlStore, and both seeded their counter from
+     * System.currentTimeMillis(). Start them together — which the installer,
+     * systemd and every lab script all do — and their counters begin at the
+     * same number, so they issue the same ids.
+     *
+     * It surfaced as `UNIQUE constraint failed: transactions.id` on a
+     * SETTLEMENT: the call completed, the customer was not billed, and the
+     * switch logged a 500 from the money endpoint. Earlier runs passed purely
+     * because the two processes happened to start in different milliseconds.
+     * A bug that depends on process start timing for whether the business gets
+     * paid is not one to leave for later.
+     *
+     * The counter still orders ids within a process, and the suffix is
+     * fixed-width so cursor pagination — which compares ids as strings — keeps
+     * a total order.
+     */
+    private val processTag: String =
+        "%04x".format(SecureRandom().nextInt(0x10000))
+
     init {
         val schema = SqlStore::class.java.getResourceAsStream("/schema.sql")
             ?.bufferedReader()?.readText()
@@ -155,7 +178,14 @@ class SqlStore(
         query("SELECT id FROM customers UNION ALL SELECT id FROM plans " +
             "UNION ALL SELECT id FROM trunks") { rs ->
             while (rs.next()) {
-                rs.getString(1).substringAfterLast('-').toLongOrNull()?.let { existing ->
+                // Ids are `prefix-counter` (older rows) or `prefix-counter-tag`
+                // (this process's format), so the counter is the SECOND
+                // segment — not the last, which is now the process tag and
+                // parses as a hex string that is usually not a number at all.
+                // Reading the wrong segment would silently stop the counter
+                // advancing past what is stored, which is how a restart
+                // reissues an id that is already in the audit trail.
+                rs.getString(1).split('-').getOrNull(1)?.toLongOrNull()?.let { existing ->
                     while (true) {
                         val current = ids.get()
                         if (current > existing) break
@@ -170,7 +200,7 @@ class SqlStore(
 
     // -- helpers ------------------------------------------------------------
 
-    private fun nextId(prefix: String) = "$prefix-${ids.getAndIncrement()}"
+    private fun nextId(prefix: String) = "$prefix-${ids.getAndIncrement()}-$processTag"
     private fun now() = Instant.now().toString()
 
     private fun <T> query(sql: String, vararg args: Any?, read: (ResultSet) -> T): T =

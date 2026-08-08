@@ -31,6 +31,10 @@ export MEGATRON_OPERATOR_TOKEN="lab-operator-token-at-least-32-chars-long"
 export MEGATRON_SUBSCRIBER_FILE="$SUBSCRIBER"
 export MEGATRON_SIP_REALM="$REALM"
 export MEGATRON_SUBSCRIBER_INTERVAL_SECONDS=5
+# Provisioning tells the switch to re-read the file. Without this the file
+# changes and OpenSIPS keeps serving the table it loaded at startup, so a new
+# customer can never register — see SwitchReloader.
+export MEGATRON_SWITCH_MI_URL=http://127.0.0.1:8888/mi
 
 PROV=http://127.0.0.1:8081
 OP=(-H "Authorization: Bearer $MEGATRON_OPERATOR_TOKEN" -H "Content-Type: application/json")
@@ -57,11 +61,17 @@ pkill -f 'net.megatron.provisioning.MainKt' 2>/dev/null
 pkill -f 'net.megatron.switchapi.MainKt' 2>/dev/null
 pkill -f 'install/provisioning' 2>/dev/null
 pkill -f 'install/switch-api' 2>/dev/null
+# Match the JVM specifically -- `java ... net.megatron.<x>.MainKt` -- not the
+# bare string. A plain `pgrep -f net.megatron` also matches any shell command
+# that happens to mention it, including a grep over the service's own log, and
+# then this guard reports a stale service that does not exist and refuses to
+# run at all.
+running() { pgrep -f 'java.*net\.megatron\.' >/dev/null; }
 for _ in $(seq 1 10); do
-    pgrep -f 'net.megatron' >/dev/null || break
+    running || break
     sleep 1
 done
-pgrep -f 'net.megatron' >/dev/null && fatal "a previous service would not stop"
+running && fatal "a previous service would not stop: $(pgrep -af 'java.*net\.megatron\.')"
 
 # -wal and -shm too: SQLite recovers from them, so removing only the .db
 # leaves the previous run's customers in place.
@@ -125,11 +135,16 @@ grep -q '^labdialer:' "$SUBSCRIBER" 2>/dev/null \
     || { tail -10 /tmp/prov.log; fatal "provisioning never exported labdialer"; }
 echo "labdialer is in $SUBSCRIBER"
 
-# db_text is cached in memory at load. Without a reload the switch is still
-# serving the table as it was at startup, and the new customer cannot log in.
-curl -s --max-time 5 http://127.0.0.1:8888/mi -H 'Content-Type: application/json' \
-     -d '{"jsonrpc":"2.0","id":1,"method":"dbt_reload"}' > /dev/null
-echo "asked the switch to reload it"
+# NO MANUAL RELOAD HERE, DELIBERATELY.
+#
+# db_text caches its tables at load, so somebody has to tell the switch. This
+# script used to do it with a curl — which meant the test passed whether or
+# not the SERVICE did, and it did not. Provisioning owns that call now
+# (SwitchReloader), and leaving it out here is what lets registration below
+# fail if the service ever stops making it.
+#
+# Give the export thread a moment to write and reload.
+sleep 3
 
 step "3. the softphone registers"
 

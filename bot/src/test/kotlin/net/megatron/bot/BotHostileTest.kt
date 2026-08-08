@@ -113,6 +113,45 @@ class BotHostileTest {
         )
     }
 
+    @Test
+    fun `a remembered offset means a restart does not replay at all`() {
+        // claimOnce makes a replay harmless; this makes it not happen. The
+        // common case then produces no duplicate work and no puzzling
+        // "Already done" reply to a command the operator sent once.
+        val directory = java.nio.file.Files.createTempDirectory("megatron-offset-")
+        val path = directory.resolve("offset")
+        val (store, _) = seed()
+        val engine = CommandEngine(store, Roles(setOf(operator)))
+
+        val first = Fake(listOf(message(41, "/help")))
+        BotLoop(first, engine, log = { }, offsetFile = path).pollOnce()
+
+        // A new process, as after a deploy or a crash.
+        val second = Fake(listOf(message(41, "/help"), message(42, "/help")))
+        BotLoop(second, engine, log = { }, offsetFile = path).pollOnce()
+
+        assertTrue(
+            second.sent.size == 1,
+            "update 41 was handled again after the restart: ${second.sent}",
+        )
+        java.nio.file.Files.deleteIfExists(path)
+        java.nio.file.Files.deleteIfExists(directory)
+    }
+
+    @Test
+    fun `an unreadable offset file does not stop the bot starting`() {
+        // Losing the offset costs one replayed batch, which claimOnce already
+        // makes harmless. Refusing to start would cost the whole business.
+        val (store, _) = seed()
+        val telegram = Fake(listOf(message(1, "/help")))
+        val missing = java.nio.file.Path.of("/nonexistent-dir-megatron/offset")
+
+        BotLoop(telegram, CommandEngine(store, Roles(setOf(operator))),
+                log = { }, offsetFile = missing).pollOnce()
+
+        assertEquals(1, telegram.sent.size, "the bot refused to work without its offset file")
+    }
+
     // -- the group check fails OPEN -------------------------------------------
 
     /**

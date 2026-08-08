@@ -545,6 +545,78 @@ class SqlStoreTest : StoreContractTest() {
     }
 
     @Test
+    fun `two services sharing one database do not issue the same ids`() {
+        // THE PRODUCTION TOPOLOGY. provisioning and switch-api each open their
+        // own SqlStore against the same file, and both seeded their id counter
+        // from System.currentTimeMillis(). Started together — which systemd,
+        // the installer and every lab script do — they began at the same
+        // number and issued the same ids.
+        //
+        // It surfaced on a SETTLEMENT: `UNIQUE constraint failed:
+        // transactions.id`, so the call completed, the customer was not
+        // billed, and the switch got a 500 from the money endpoint. Earlier
+        // runs passed only because the two processes happened to start in
+        // different milliseconds.
+        val file = Files.createTempFile("megatron-shared-", ".db")
+        files.add(file)
+        val url = "jdbc:sqlite:${file.absolutePathString()}"
+
+        SqlStore(url).use { provisioning ->
+            SqlStore(url).use { switch ->
+                val plan = provisioning.createPlan(CreatePlan("Retail", "USD"))
+                val (customer, _) = provisioning.createCustomer(
+                    CreateCustomer("shared", plan.id, openingBalanceMicros = 1_000_000),
+                    "provisioning",
+                )
+
+                // The second service settles a call against the same customer.
+                // Before the fix this threw on the transaction id.
+                switch.adjustBalance(
+                    customer.id,
+                    BalanceAdjustment(-250_000, "a call"),
+                    "switch-api",
+                )
+
+                assertEquals(
+                    750_000L,
+                    provisioning.getCustomer(customer.id).balanceMicros,
+                    "the settlement did not reach the balance the operator sees",
+                )
+                assertEquals(
+                    2,
+                    provisioning.transactionsFor(customer.id).size,
+                    "an audit row was lost to an id collision",
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `ids still order correctly for cursor pagination`() {
+        // The cursor compares ids AS STRINGS, so the process tag appended to
+        // every id must not disturb their order. Two customers created in
+        // sequence must still sort in that sequence, or paging skips or
+        // repeats rows.
+        val store = store()
+        val plan = store.createPlan(CreatePlan("Retail", "USD"))
+        val handles = (1..12).map { "seq%02d".format(it) }
+        handles.forEach { store.createCustomer(CreateCustomer(it, plan.id), "t") }
+
+        val seen = mutableListOf<String>()
+        var cursor: String? = null
+        var empty: Boolean
+        do {
+            val page = store.listCustomers(null, 5, cursor)
+            seen += page.items.map { it.handle }
+            cursor = page.nextCursor
+            empty = page.items.isEmpty()
+        } while (cursor != null && !empty)
+
+        assertEquals(handles.size, seen.size, "paging lost or repeated customers")
+        assertEquals(handles.toSet(), seen.toSet())
+    }
+
+    @Test
     fun `the sip password is not recoverable from the database`() {
         // A provisioning database that can hand back SIP passwords is one whose
         // compromise hands over every customer's ability to place calls at the

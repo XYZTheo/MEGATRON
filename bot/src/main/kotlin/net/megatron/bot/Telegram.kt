@@ -213,10 +213,48 @@ class BotLoop(
     private val pollSeconds: Int = 30,
     private val rateLimit: RateLimit = RateLimit(),
     private val log: (String) -> Unit = { System.err.println(it) },
+    /**
+     * Where the offset is remembered across restarts, if anywhere.
+     *
+     * NOT the protection against double-processing — [CommandEngine] holds a
+     * durable claim per message for that, and it has to, because a crash can
+     * land between handling an update and writing this file no matter how
+     * carefully it is written.
+     *
+     * What it buys is that a restart does not replay the last batch at all,
+     * so the common case produces no duplicate work and no confusing "Already
+     * done" replies to commands the operator only sent once.
+     */
+    private val offsetFile: java.nio.file.Path? = null,
 ) {
 
-    /** Survives restarts only as far as Telegram's own 24h queue does. */
     private var offset = 0L
+
+    init {
+        offsetFile?.let { path ->
+            runCatching { java.nio.file.Files.readString(path).trim().toLong() }
+                .onSuccess {
+                    offset = it
+                    log("bot: resuming from offset $it")
+                }
+        }
+    }
+
+    private fun rememberOffset() {
+        val path = offsetFile ?: return
+        // Best-effort. A failure here costs a replayed batch on the next
+        // restart, which claimOnce already makes harmless — it must never stop
+        // the bot processing messages.
+        runCatching {
+            val temporary = path.resolveSibling("${path.fileName}.tmp")
+            java.nio.file.Files.writeString(temporary, offset.toString())
+            java.nio.file.Files.move(
+                temporary, path,
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+            )
+        }
+    }
 
     /** One poll. Returns how many updates were handled. Exposed for tests. */
     fun pollOnce(): Int {
@@ -234,6 +272,7 @@ class BotLoop(
                 log("bot: dropped update ${update.updateId}: $failure")
             }
         }
+        if (updates.isNotEmpty()) rememberOffset()
         return handled
     }
 

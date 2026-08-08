@@ -69,5 +69,8 @@ fun main() {
         api = HttpTelegramApi(token),
         engine = engine,
         pollSeconds = poll,
+        offsetFile = System.getenv("MEGATRON_BOT_OFFSET_FILE")
+            ?.takeIf { it.isNotBlank() }
+            ?.let { java.nio.file.Path.of(it) },
     ).run()
 }

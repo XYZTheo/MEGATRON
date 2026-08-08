@@ -86,6 +86,37 @@ branching on those reintroduces the oracle inverted. `is_nonce_stale()` would
 have settled it, but in 3.6 it exists only as a C symbol and is not callable
 from config — **the symbol table lists more than the config language exposes.**
 
+## The account takeover the tests could not see
+
+`register-test.sh` passed 8/8 while the config contained a working
+account-takeover, and the reason is worth more than the bug.
+
+The REGISTER identity check compared `$au` (who authenticated) against `$fU`
+(the From user), with a comment above it describing exactly the attack it was
+supposed to stop. But **OpenSIPS's registrar takes the address-of-record from
+the `To` header** (RFC 3261 §10.2), not From. So this, with a completely valid
+credential:
+
+```
+From: <sip:bigcorp@sip.megatron.local>   ← matches $au, passes the check
+To:   <sip:victim@sip.megatron.local>    ← this is what save() registers
+Contact: <sip:bigcorp@attacker.ip:5060>
+```
+
+registered a binding for **victim** pointing at the attacker, and every
+inbound call for victim went to them. Every credential valid, no protocol
+violation anywhere.
+
+**The suite could not catch it because both scenario files used one injection
+field for From and To.** The "from-spoof" case set both to `victim`, so it only
+ever exercised the From branch — the To path had no test at all. A negative
+test that cannot distinguish two code paths is a test of one of them.
+
+To is its own field now, and the two cases are deliberately separated so each
+reaches its own branch: with To *also* spoofed, the AOR check fires first and
+the From branch is never reached. That is checked too — the suite asserts both
+log lines appear, not just that the requests were refused.
+
 ## Four failures worth keeping
 
 **`opensips -C` is not validation.** The auth config passed it and then refused
