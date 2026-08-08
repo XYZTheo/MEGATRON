@@ -81,6 +81,23 @@ class CallService(
         val table = rateTableFor(customer.planId)
             ?: return reject(Refusal.NO_RATE_FOR_DESTINATION, "plan has no rates", 503)
 
+        // WHERE THE CALL GOES IS DECIDED BEFORE IT IS RESERVED AGAINST.
+        //
+        // A call authorized with nowhere to send it would hold a reservation,
+        // connect to nothing, and then settle — the customer pays for a call
+        // that could never have happened, and the operator's first sign of it
+        // is a complaint. Refusing costs one call; the alternative is a
+        // billing dispute per attempt for as long as the trunk is missing.
+        //
+        // 503, not 404: "we have no carrier configured" is our fault, and a
+        // 404 would tell the caller their number was invalid.
+        val route = outboundRoute()
+            ?: return reject(
+                Refusal.NO_RATE_FOR_DESTINATION,
+                "no enabled outbound trunk is configured",
+                503,
+            )
+
         // The Call-ID is the reservation id. A retransmitted INVITE therefore
         // cannot reserve twice — SIP retransmits by design, and without this
         // a lossy network silently multiplies every customer's reservations.
@@ -101,6 +118,7 @@ class CallService(
                     ratePerMinute = decision.ratePerMinute.value,
                     prefix = decision.prefix,
                     reservedMicros = decision.reserved.value,
+                    route = route,
                 )
             }
 
@@ -209,6 +227,34 @@ class CallService(
     }
 
     fun activeCalls(): Int = inFlight.size
+
+    /**
+     * The carrier to send an outbound call to, or null if there is none.
+     *
+     * V1 IS ONE TRUNK, AND SAYING SO IS BETTER THAN PRETENDING OTHERWISE.
+     * Real least-cost routing picks a carrier per destination prefix, from
+     * buy prices, with failover to the next on a 503. That belongs here — it
+     * is the same decision as rating, which is why routing lives in this
+     * service and not in switch config — but it is not built, and a
+     * half-implementation that silently always picks the first trunk anyway
+     * would be harder to replace than an honest one.
+     *
+     * Deterministic by id, so the choice does not move between calls for no
+     * reason. Read fresh rather than cached: a trunk disabled because the
+     * carrier is having an outage must stop receiving calls now, not at the
+     * next restart.
+     */
+    private fun outboundRoute(): String? {
+        val trunk = store.listTrunks()
+            .filter { it.enabled && it.direction == net.megatron.provisioning.TrunkDirection.OUTBOUND }
+            .minByOrNull { it.id }
+            ?: return null
+        // The transport is named explicitly. Left off, OpenSIPS applies its
+        // own default, which is UDP — so a TLS trunk would silently be dialled
+        // in clear, which is both a security failure and one the carrier
+        // reports as "we never received your call".
+        return "sip:${trunk.host}:${trunk.port};transport=${trunk.transport.name.lowercase()}"
+    }
 
     private fun rateTableFor(planId: String): RateTable? {
         val plan = store.listPlans().firstOrNull { it.id == planId } ?: return null

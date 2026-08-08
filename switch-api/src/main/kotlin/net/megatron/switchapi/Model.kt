@@ -38,6 +38,22 @@ data class AuthorizeResponse(
     @SerialName("rate_micros_per_minute") val ratePerMinute: Long? = null,
     val prefix: String? = null,
     @SerialName("reserved_micros") val reservedMicros: Long? = null,
+    /**
+     * Where to send the call — a SIP URI like `sip:1.2.3.4:5060`.
+     *
+     * ROUTING IS DECIDED HERE, NOT IN THE SWITCH CONFIG, and that is
+     * deliberate on two counts. Choosing a carrier and pricing a call are the
+     * same decision: the cheapest route and the rate charged for it come from
+     * one table, and splitting them across a GPL module's database and our
+     * rating engine would make "which gateway, at what cost" have two answers.
+     * It is also what keeps our business logic on the far side of a network
+     * boundary from GPL code — see docs/ARCHITECTURE.md §3.
+     *
+     * Absent on a refusal. Present on every allow: a call authorized with
+     * nowhere to go would be reserved against, connected to nothing, and
+     * settled — so the authorizer refuses instead.
+     */
+    val route: String? = null,
     /** Machine-readable refusal, for the switch to map onto a SIP response. */
     val reason: String? = null,
     /**

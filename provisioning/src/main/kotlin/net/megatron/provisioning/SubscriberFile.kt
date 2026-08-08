@@ -24,7 +24,22 @@ import java.util.concurrent.atomic.AtomicReference
  * unchanged, so the caller can run it on a short timer without making OpenSIPS
  * reload — and flush its registrar cache — every time.
  */
-class SubscriberFile(private val path: Path) {
+class SubscriberFile(
+    private val path: Path,
+    private val log: (String) -> Unit = { System.err.println(it) },
+) {
+
+    /**
+     * How many credential rows the file on disk currently has.
+     *
+     * The question the guard actually needs to answer is "would this write
+     * DESTROY credentials", and only the file can answer that — the render is
+     * empty in both the dangerous case and the harmless one.
+     */
+    private fun existingRowCount(): Int =
+        runCatching {
+            Files.readAllLines(path).count { it.isNotBlank() } - 1
+        }.getOrDefault(0).coerceAtLeast(0)
 
     /** The last content written, so an unchanged render costs no disk I/O. */
     private val lastWritten = AtomicReference<String?>(null)
@@ -110,28 +125,48 @@ class SubscriberFile(private val path: Path) {
         val content = SubscriberExport.render(active, { store.sipDigestHa1(it, realm) }, realm)
         val rows = content.lines().count { it.isNotBlank() } - 1
 
-        // AN EMPTY FILE NEVER OVERWRITES A POPULATED ONE.
+        // AN EMPTY RENDER NEVER OVERWRITES A POPULATED FILE — AND THAT IS NOT
+        // THE SAME AS "NEVER WRITES AN EMPTY FILE".
         //
         // The realm is baked into every stored HA1. Point this at a realm the
         // store holds no credentials for — a typo in MEGATRON_SIP_REALM is
-        // enough — and sipDigestHa1 returns null for every customer, render
-        // skips them all, and a header-only file lands on top of a working
-        // one. Every customer's login disappears within one interval, the
-        // write reports success, and nothing is logged as a problem.
+        // enough — and every lookup misses, every customer is skipped, and a
+        // header-only file lands on top of a working one. Every login
+        // disappears within one interval and the write reports success.
         //
-        // The doc on this class used to claim a realm mismatch "produces HA1
-        // values no phone can satisfy". It does not; it produces no rows at
-        // all, which is a different failure with a different diagnosis and a
-        // much wider blast radius.
+        // The first guard refused whenever the render was empty and customers
+        // existed, which was WORSE than the bug for two ordinary states:
         //
-        // Refusing is safe: a stale credential file keeps existing customers
-        // working while somebody reads the error. Writing is not.
-        if (rows == 0 && active.isNotEmpty()) {
+        //   - a database just migrated to store HA1, where every existing
+        //     customer legitimately has none yet;
+        //   - a MagnusBilling import, same thing.
+        //
+        // There the file was never created at all, and a MISSING table makes
+        // auth_db report "table 'subscriber' does not exist" — a 500 on every
+        // REGISTER, which is the exact failure the header-only file avoids.
+        // The error also blamed MEGATRON_SIP_REALM, sending the operator to
+        // hunt a mismatch that did not exist.
+        //
+        // So the question is not "is the render empty" but "are we DESTROYING
+        // credentials that were there a moment ago". Going from populated to
+        // empty is a realm mismatch; starting empty is a new or migrated
+        // deployment, and it gets a header so the switch can load a table.
+        if (rows == 0 && active.isNotEmpty() && existingRowCount() > 0) {
             throw IllegalStateException(
-                "refusing to write an empty subscriber file: ${active.size} active " +
-                    "customer(s) exist but none has a credential for realm '$realm'. " +
-                    "Check MEGATRON_SIP_REALM matches the realm the credentials were " +
-                    "created under."
+                "refusing to blank a populated subscriber file: ${active.size} active " +
+                    "customer(s) exist and none has a credential for realm '$realm', " +
+                    "but the file currently on disk has ${existingRowCount()}. Check " +
+                    "MEGATRON_SIP_REALM matches the realm the credentials were created " +
+                    "under."
+            )
+        }
+        if (rows == 0 && active.isNotEmpty()) {
+            log(
+                "NOTE: writing a subscriber file with no credentials. ${active.size} active " +
+                    "customer(s) exist but none has a SIP digest credential yet — usual " +
+                    "after an upgrade or an import. They cannot register until their " +
+                    "credentials are rotated (/rotate <handle>, or " +
+                    "POST /v1/customers/{id}/credentials)."
             )
         }
         return write(content)

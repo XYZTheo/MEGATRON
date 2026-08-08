@@ -99,7 +99,19 @@ done
 [ "${s:-}" = "200" ] || { tail -20 /tmp/switch.log; fatal "switch-api did not come up"; }
 echo "provisioning and switch-api are up"
 
-step "1. a plan, a rate, and a customer"
+step "1. a carrier, a plan, a rate, and a customer"
+
+# WHERE CALLS GO. The switch asks the authorizer per call and refuses when
+# there is no enabled outbound trunk -- allowing it would reserve balance
+# against a call that connects to nothing and then settle, so the customer
+# pays for a call that could never have happened.
+#
+# The lab's "carrier" is the SIPp UAS on 5070 that answers later in this
+# script.
+curl -s -m 5 "${OP[@]}" -H "Idempotency-Key: auth-trunk-$$" \
+    -d '{"name":"lab-carrier","direction":"OUTBOUND","host":"127.0.0.1",
+         "port":5070,"remote_ips":["127.0.0.1"],"transport":"UDP"}' \
+    "$PROV/v1/trunks" > /dev/null
 
 PLAN=$(curl -s -m 5 "${OP[@]}" -H "Idempotency-Key: auth-plan-$$" \
     -d '{"name":"Lab Retail","currency":"USD"}' "$PROV/v1/plans" | jget 'd["id"]')

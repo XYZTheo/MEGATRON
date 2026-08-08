@@ -347,7 +347,16 @@ class BotLoop(
                 val elapsedMs = (System.nanoTime() - started) / 1_000_000
                 // A long poll that came back in a fraction of its timeout did
                 // not long-poll. Something answered instead of waiting.
-                handled == 0 && elapsedMs < pollSeconds * 250L
+                //
+                // THE FLOOR IS NOT DECORATION. The threshold was
+                // `pollSeconds * 250`, which is ZERO when pollSeconds is 0 —
+                // so no poll was ever judged suspicious, the backoff never
+                // armed, and the hot loop came straight back. And
+                // MEGATRON_TELEGRAM_POLL_SECONDS=0 is exactly what somebody
+                // types to "turn off long polling". A negative value did the
+                // same. One second is below any real long poll and above any
+                // instant answer.
+                handled == 0 && elapsedMs < maxOf(1_000L, pollSeconds * 250L)
             } catch (failure: Exception) {
                 // Telegram being down must not end the process: the bot is the
                 // only way the business is operated, so it has to still be

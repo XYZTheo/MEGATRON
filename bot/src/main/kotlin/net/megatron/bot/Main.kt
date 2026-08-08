@@ -61,7 +61,12 @@ fun main() {
     }
 
     val engine = CommandEngine(store, Roles(operators))
-    val poll = System.getenv("MEGATRON_TELEGRAM_POLL_SECONDS")?.toIntOrNull() ?: 30
+    // Floored at 1. Zero is what somebody types to "turn off long polling",
+    // and a zero-second long poll is not a long poll — it is a busy wait
+    // against Telegram, which answers by rate-limiting us. Capped too: past a
+    // minute Telegram closes the connection itself.
+    val poll = (System.getenv("MEGATRON_TELEGRAM_POLL_SECONDS")?.toIntOrNull() ?: 30)
+        .coerceIn(1, 60)
 
     System.err.println("MEGATRON bot: ${operators.size} operator(s), polling every ${poll}s")
 

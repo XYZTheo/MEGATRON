@@ -60,25 +60,51 @@ class SubscriberExportHostileTest {
      * ha1, which arrives from a lambda this file does not own — SqlStore hands
      * back whatever is in the sip_ha1 column, unexamined.
      */
+    /**
+     * REWRITTEN. These originally required render() to THROW, which is how the
+     * check was first built — and a later pass showed that was the wrong
+     * blast radius: throwing meant one bad row denied a file to EVERY
+     * customer, and on a fresh deployment a missing subscriber table is a 500
+     * on every REGISTER. A blank credential already skipped just its own
+     * customer; a malformed one now does the same.
+     *
+     * The property that actually matters is unchanged and is what is asserted
+     * here: the forged row does not appear, and the accounts around it are
+     * unaffected.
+     */
     @Test
     fun `an unsafe stored credential forges an entire extra subscriber row`() {
         val forged = "5f4dcc3b5aa765d61d8327deb882cf99\n" +
             "admin:$realm:5f4dcc3b5aa765d61d8327deb882cf99"
+        val good = "0123456789abcdef0123456789abcdef"
+        var warned = false
 
-        assertFailsWith<IllegalArgumentException>(
-            "an ha1 carrying a newline was rendered instead of refused"
-        ) {
-            SubscriberExport.render(listOf(customer("victim")), { forged }, realm)
-        }
+        val out = SubscriberExport.render(
+            listOf(customer("victim"), customer("bystander")),
+            { if (it == "victim") forged else good },
+            realm,
+            { warned = true },
+        )
+
+        assertTrue(!out.contains("admin:"), "a forged subscriber row was written:\n$out")
+        assertTrue(!out.contains("victim:"), "the customer with a corrupt credential got a row")
+        assertTrue(out.contains("bystander:"), "one bad row denied a login to everyone else")
+        assertTrue(warned, "a corrupt stored credential was skipped silently")
     }
 
     @Test
     fun `an ha1 carrying a field separator shifts every column after it`() {
-        assertFailsWith<IllegalArgumentException>(
-            "an ha1 carrying ':' was rendered instead of refused"
-        ) {
-            SubscriberExport.render(listOf(customer("victim")), { "deadbeef:extra" }, realm)
-        }
+        val out = SubscriberExport.render(
+            listOf(customer("victim")),
+            { "deadbeef:extra" },
+            realm,
+            { },
+        )
+        assertTrue(
+            !out.contains("victim:"),
+            "an ha1 carrying ':' was written, shifting every column after it:\n$out",
+        )
+        assertEquals("username(str) domain(str) ha1(str)\n", out)
     }
 
     // -- the realm the file is rendered for -----------------------------------

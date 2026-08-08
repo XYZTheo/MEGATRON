@@ -105,23 +105,18 @@ private fun startSubscriberExport(store: Store, realm: String) {
     // register; a rotated password left the OLD one working indefinitely; a
     // suspended account kept registering forever. All silent, because from
     // provisioning's side the write succeeded.
-    val reloader = SwitchReloader(System.getenv("MEGATRON_SWITCH_MI_URL"))
+    val publisher = CredentialPublisher(
+        file = writer,
+        reloader = SwitchReloader(System.getenv("MEGATRON_SWITCH_MI_URL")),
+        realm = realm,
+    )
 
     val thread = Thread {
         while (!Thread.currentThread().isInterrupted) {
-            try {
-                if (writer.writeFrom(store, realm)) {
-                    System.err.println("subscriber file updated: $path")
-                    reloader.reloadSubscribers()
-                }
-            } catch (failure: Throwable) {
-                // Never fatal. A provisioning API that dies because a switch's
-                // credential file could not be written takes the business
-                // offline over a file the business can run without for a few
-                // seconds. Loud, though: silence here is customers who cannot
-                // log in and no reason given.
-                System.err.println("WARNING: could not write $path: $failure")
-            }
+            // Every failure inside is handled and logged; publish() never
+            // throws, so one bad tick cannot end the thread and silently stop
+            // every future credential from reaching the switch.
+            publisher.publish(store)
             try {
                 Thread.sleep(seconds * 1000)
             } catch (stop: InterruptedException) {

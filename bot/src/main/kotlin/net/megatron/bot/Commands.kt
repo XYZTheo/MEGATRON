@@ -95,11 +95,25 @@ fun parseMoney(raw: String): Long {
  */
 fun formatMoney(micros: Long, currency: String = ""): String {
     val negative = micros < 0
-    val abs = if (negative) -micros else micros
     val sign = if (negative) "-" else ""
     val suffix = if (currency.isEmpty()) "" else " $currency"
-    val whole = abs / 1_000_000L
-    val fraction = abs % 1_000_000L
+
+    // SPLIT FIRST, THEN TAKE ABSOLUTE VALUES OF THE PARTS.
+    //
+    // `-micros` is a no-op on Long.MIN_VALUE — it stays negative — so negating
+    // up front made every division and modulo below produce a negative digit
+    // group and rendered "--9223372036854.-775808": two minus signs, a minus
+    // inside the fraction, and nothing parseMoney will read back.
+    //
+    // Reachable without any overflow: a balance of -Long.MAX_VALUE plus one
+    // more micro-unit of debit is an exact addition, so Math.addExact permits
+    // it and /balance then shows the customer garbage.
+    //
+    // Both parts are safely negatable: |micros / 1_000_000| and
+    // |micros % 1_000_000| are each far below Long.MAX_VALUE even at the
+    // extreme.
+    val whole = kotlin.math.abs(micros / 1_000_000L)
+    val fraction = kotlin.math.abs(micros % 1_000_000L)
 
     // Exact at 2dp when the remainder is a whole number of cents.
     if (fraction % 10_000L == 0L) {
@@ -237,6 +251,29 @@ class CommandEngine(
         }
     }
 
+    /**
+     * Runs the guarded mutation, giving the key back if it fails.
+     *
+     * A CLAIM AND ITS MUTATION ARE NOT ONE TRANSACTION. The claim commits by
+     * itself, so without this a failed mutation left the key taken — and on
+     * the redelivery that claimOnce exists to handle, the operator was told
+     * "Already done" for a credit that never happened. Losing the operation
+     * permanently while reporting success is worse than the double-credit the
+     * claim prevents.
+     *
+     * The release is best-effort and deliberately swallows its own failure:
+     * if the store is unwell enough that the mutation failed, it may be too
+     * unwell to release, and the original error is the one the operator needs
+     * to see.
+     */
+    private inline fun <T> guarded(key: String, block: () -> T): T =
+        try {
+            block()
+        } catch (failure: Throwable) {
+            runCatching { store.releaseClaim(key) }
+            throw failure
+        }
+
     private inline fun operatorOnly(telegramUserId: Long, block: () -> String): String =
         if (roles.isOperator(telegramUserId)) block()
         // Deliberately identical to an unknown command. Telling a stranger
@@ -332,14 +369,16 @@ class CommandEngine(
         // command consumed the key -- so the operator corrected their typo,
         // sent it again, and was told "Already done" while no account existed.
         if (!store.claimOnce(key)) return ALREADY_DONE
-        val (customer, credentials) = store.createCustomer(
-            CreateCustomer(
-                handle = args[0],
-                planId = args[1],
-                telegramUserId = args.getOrNull(2)?.toLongOrNull(),
-            ),
-            actor,
-        )
+        val (customer, credentials) = guarded(key) {
+            store.createCustomer(
+                CreateCustomer(
+                    handle = args[0],
+                    planId = args[1],
+                    telegramUserId = args.getOrNull(2)?.toLongOrNull(),
+                ),
+                actor,
+            )
+        }
         // The password appears here and nowhere else, ever. Said plainly,
         // because the operator needs to know to pass it on now rather than
         // assume they can look it up later.
@@ -394,11 +433,13 @@ class CommandEngine(
         // can be rejected. A key consumed by a rejected command is a key that
         // blocks the operator's corrected retry.
         if (!store.claimOnce(key)) return ALREADY_DONE
-        val txn = store.adjustBalance(
-            customer.id,
-            BalanceAdjustment(amount, reason, reference = key),
-            actor,
-        )
+        val txn = guarded(key) {
+            store.adjustBalance(
+                customer.id,
+                BalanceAdjustment(amount, reason, reference = key),
+                actor,
+            )
+        }
         return "${customer.handle}: ${formatMoney(txn.amountMicros)} -> balance " +
             formatMoney(txn.balanceAfterMicros, customer.currency)
     }

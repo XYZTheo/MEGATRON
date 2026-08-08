@@ -1,0 +1,25 @@
+[Unit]
+Description=MEGATRON switch (OpenSIPS)
+# The switch fails CLOSED when the authorizer is unreachable -- it rejects
+# calls rather than carrying them free -- so starting it before switch-api is
+# safe but pointlessly noisy. rtpengine likewise: without it every call
+# connects and carries no audio.
+After=network-online.target megatron-switch-api.service megatron-rtpengine.service
+Wants=network-online.target
+# Conflicts with the packaged unit, which binds 127.0.0.1:5060 and would
+# silently take all loopback traffic away from this one -- a more specific
+# bind beats a wildcard. install.sh masks it; this is the second line of
+# defence for anyone who unmasks it later.
+Conflicts=opensips.service
+
+[Service]
+Type=forking
+# -m shared / -M package memory. shm_mem_size and pkg_mem_size are a
+# Kamailio-ism that OpenSIPS rejects with a bare "syntax error".
+ExecStart=/usr/sbin/opensips -f /etc/opensips/megatron.cfg -P /run/megatron-opensips.pid -m 256 -M 32
+PIDFile=/run/megatron-opensips.pid
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

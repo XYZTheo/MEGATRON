@@ -33,6 +33,14 @@ class SqlStore(
     /** Also the digest realm: HA1 bakes the realm in, so it is fixed here. */
     private val sipDomain: String = "sip.megatron.local",
     private val defaultTransport: Transport = Transport.UDP,
+    /**
+     * The clock, injectable so retention can be tested without waiting a day.
+     *
+     * Everything time-related in this store goes through it — audit
+     * timestamps and the idempotency sweep — so a test cannot accidentally
+     * exercise one and not the other.
+     */
+    private val clock: () -> Instant = Instant::now,
 ) : Store, AutoCloseable {
 
     private val connection: Connection = DriverManager.getConnection(jdbcUrl).apply {
@@ -175,8 +183,23 @@ class SqlStore(
         migrate()
         // Continue ids past anything already stored, so a restart cannot
         // reissue an id that is already in the audit trail.
+        // TRANSACTIONS IS IN THIS LIST, AND WAS THE ONE MISSING FROM IT.
+        //
+        // transactions.id is the column whose UNIQUE constraint actually fired
+        // in production, and it was the one table the rescan did not read —
+        // while the comment above claimed the scan existed so a restart could
+        // not reissue an id already in the audit trail. The audit trail was
+        // exactly what it skipped.
+        //
+        // The counter advances once per id and the clock once per millisecond,
+        // so any run issuing more than a thousand ids a second ends up ahead
+        // of the wall clock it is reseeded from — and settlement writes one
+        // transaction per call. An NTP correction or a snapshot restore does
+        // the same thing without any load at all. The per-process tag then
+        // becomes the only thing preventing a collision, which is a 1-in-65536
+        // bet taken twice per deploy.
         query("SELECT id FROM customers UNION ALL SELECT id FROM plans " +
-            "UNION ALL SELECT id FROM trunks") { rs ->
+            "UNION ALL SELECT id FROM trunks UNION ALL SELECT id FROM transactions") { rs ->
             while (rs.next()) {
                 // Ids are `prefix-counter` (older rows) or `prefix-counter-tag`
                 // (this process's format), so the counter is the SECOND
@@ -201,7 +224,7 @@ class SqlStore(
     // -- helpers ------------------------------------------------------------
 
     private fun nextId(prefix: String) = "$prefix-${ids.getAndIncrement()}-$processTag"
-    private fun now() = Instant.now().toString()
+    private fun now() = clock().toString()
 
     private fun <T> query(sql: String, vararg args: Any?, read: (ResultSet) -> T): T =
         synchronized(connection) {
@@ -668,7 +691,40 @@ class SqlStore(
      * insert, and the loser sees the constraint violation rather than a
      * check-then-act race.
      */
-    override fun claimOnce(key: String): Boolean =
+    override fun claimOnce(key: String): Boolean {
+        // BOUNDED, like its in-memory counterpart. One row per guarded command
+        // and nothing ever deleting one moved unbounded growth from the heap
+        // to the disk, which is the copy that lives forever. created_at was
+        // written and read by nothing.
+        //
+        // EVICTION IS BY AGE, AND ONLY BY AGE. A size cap would be the wrong
+        // bound here: a claim is what stops a redelivered command running
+        // twice, so dropping recent ones to stay under a count would silently
+        // re-enable the double-credit this table exists to prevent, and it
+        // would do so exactly when the operator is busiest.
+        //
+        // A day is far longer than any redelivery window — Telegram gives up
+        // well inside it — so a key older than that guards nothing. Steady
+        // state is therefore "one day of commands", which for any real
+        // operator is a few thousand rows.
+        //
+        // Swept opportunistically rather than on a timer, because a timer is a
+        // thread and this is a handful of rows.
+        if (claimsSinceSweep.incrementAndGet() >= CLAIM_SWEEP_EVERY) {
+            claimsSinceSweep.set(0)
+            runCatching {
+                update(
+                    "DELETE FROM idempotency WHERE created_at < ?",
+                    clock().minusSeconds(CLAIM_RETENTION_SECONDS).toString(),
+                )
+            }
+        }
+        return claimOnceInternal(key)
+    }
+
+    private val claimsSinceSweep = AtomicLong(0)
+
+    private fun claimOnceInternal(key: String): Boolean =
         try {
             update(
                 "INSERT INTO idempotency (key, body_hash, response, created_at) " +
@@ -690,6 +746,10 @@ class SqlStore(
                 throw duplicate
             }
         }
+
+    override fun releaseClaim(key: String) {
+        update("DELETE FROM idempotency WHERE key = ?", key)
+    }
 
     override fun sipDigestHa1(handle: String, realm: String): String? {
         // The stored HA1 is bound to this store's realm. Asking for a
@@ -738,6 +798,11 @@ class SqlStore(
         }
 
     private companion object {
+        /** Claims between opportunistic sweeps of expired idempotency rows. */
+        const val CLAIM_SWEEP_EVERY = 100L
+
+        /** How long a claim guards against a redelivery. */
+        const val CLAIM_RETENTION_SECONDS = 24L * 60 * 60
         val HANDLE = Regex("^[a-z0-9][a-z0-9._-]{2,31}$")
         val E164 = Regex("^\\+[1-9][0-9]{6,14}$")
         val CURRENCY = Regex("^[A-Za-z]{3}$")

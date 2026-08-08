@@ -1,0 +1,23 @@
+[Unit]
+Description=MEGATRON rtpengine (media anchor)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+# --daemon IS NOT A FLAG. rtpengine daemonises by default and --foreground is
+# the opposite one; passing --daemon makes it exit immediately, which with
+# stderr discarded is indistinguishable from a clean start.
+#
+# Kernel forwarding is not enabled here: the module is a separate DKMS build
+# and fails on some cloud kernels. Userspace forwarding is correct, just
+# slower -- a throughput concern, not a correctness one.
+ExecStart=/usr/bin/rtpengine --interface=0.0.0.0 --listen-ng=127.0.0.1:22222 \
+    --port-min=30000 --port-max=31000 --log-level=5 \
+    --pidfile=/run/megatron-rtpengine.pid
+PIDFile=/run/megatron-rtpengine.pid
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

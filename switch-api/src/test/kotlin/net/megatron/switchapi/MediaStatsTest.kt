@@ -22,6 +22,19 @@ class MediaStatsTest {
 
     private fun service(): Pair<InMemoryStore, CallService> {
         val store = InMemoryStore()
+
+        // A carrier, because a switch with none refuses every call and these
+        // tests are about what happens AFTER one connects. See RoutingTest.
+        store.createTrunk(
+            net.megatron.provisioning.CreateTrunk(
+                name = "carrier",
+                direction = net.megatron.provisioning.TrunkDirection.OUTBOUND,
+                host = "203.0.113.10",
+                port = 5060,
+                remoteIps = listOf("203.0.113.10"),
+            )
+        )
+
         val plan = store.createPlan(CreatePlan("Retail", "USD"))
         store.replaceRates(plan.id, ReplaceRates(rates = listOf(
             RateRow(prefix = "1", sellMicrosPerMinute = 60_000, incrementSeconds = 1)

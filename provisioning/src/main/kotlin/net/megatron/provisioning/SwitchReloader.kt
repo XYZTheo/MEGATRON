@@ -30,7 +30,7 @@ import java.time.Duration
  * provisioning down because the switch's management interface was briefly
  * unreachable would trade a delayed credential for an offline business.
  */
-class SwitchReloader(
+open class SwitchReloader(
     private val miUrl: String?,
     private val log: (String) -> Unit = { System.err.println(it) },
 ) {
@@ -40,7 +40,7 @@ class SwitchReloader(
         .build()
 
     /** True if the switch acknowledged the reload. */
-    fun reloadSubscribers(): Boolean {
+    open fun reloadSubscribers(): Boolean {
         if (miUrl.isNullOrBlank()) {
             // Deliberately not silent. "No reload configured" and "reload
             // failed" have completely different fixes, and an operator whose

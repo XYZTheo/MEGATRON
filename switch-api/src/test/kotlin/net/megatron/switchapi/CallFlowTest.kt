@@ -27,6 +27,23 @@ class CallFlowTest {
         maxConcurrent: Int = 2,
     ): Triple<InMemoryStore, CallService, MutableList<Cdr>> {
         val store = InMemoryStore()
+
+        // A CARRIER TO SEND CALLS TO. Every test here models a working
+        // switch, and a switch with no outbound trunk cannot complete a call
+        // -- the authorizer refuses rather than reserving against one that
+        // would connect to nothing. Adding it in setup() rather than to each
+        // test keeps that a property of the fixture, not a thing twelve tests
+        // remember to do; RoutingTest is where its absence is exercised.
+        store.createTrunk(
+            net.megatron.provisioning.CreateTrunk(
+                name = "carrier",
+                direction = net.megatron.provisioning.TrunkDirection.OUTBOUND,
+                host = "203.0.113.10",
+                port = 5060,
+                remoteIps = listOf("203.0.113.10"),
+            )
+        )
+
         val plan = store.createPlan(CreatePlan("Retail", "USD"))
         store.replaceRates(
             plan.id,

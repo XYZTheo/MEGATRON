@@ -88,6 +88,24 @@ interface Store {
      * true and one false, or concurrent retries defeat it entirely.
      */
     fun claimOnce(key: String): Boolean
+
+    /**
+     * Gives [key] back, so the operation it guarded can be attempted again.
+     *
+     * NEEDED BECAUSE A CLAIM AND ITS MUTATION ARE NOT ONE TRANSACTION. The
+     * claim commits on its own, so if the mutation then fails — a full disk, a
+     * lock timeout, a bug — the claim outlives the attempt that changed
+     * nothing. On the redelivery that claimOnce exists to handle, the caller
+     * is told "already done" and the operation is lost PERMANENTLY, with a
+     * reply saying it succeeded. That is worse than the double-credit the
+     * claim prevents.
+     *
+     * Releasing on failure is not perfect: a process that dies between the
+     * mutation failing and this call leaves the key claimed. That window is
+     * microseconds against a scenario measured in seconds, and the failure it
+     * leaves behind is the old one rather than a new one.
+     */
+    fun releaseClaim(key: String)
 }
 
 /**
@@ -134,10 +152,14 @@ class IdempotencyStore(
         // the life of the process. On a service that is meant to run for
         // months that is a memory leak with a customer record in every slot.
         //
-        // Eviction is by age first — a retry follows its original by seconds,
-        // so a day is already generous — and by size as a hard backstop,
-        // because a flood of unique keys must not be able to exhaust memory
-        // faster than the age sweep can help.
+        // SIZE IS THE TRIGGER; AGE IS THE FIRST THING TRIED ONCE IT FIRES.
+        //
+        // Said the other way round in an earlier comment, which described a
+        // sweep that ran on age regardless — it does not, and nothing here is
+        // evicted until the map is over its cap. That is the right shape (a
+        // walk of every entry on every request would be absurd for a map this
+        // is usually tiny) but the description has to match, because the next
+        // person to reason about memory will reason from the comment.
         if (entries.size > maxEntries) {
             val cutoff = now() - retainMillis
             entries.entries.removeAll { it.value.storedAt < cutoff }
@@ -503,6 +525,10 @@ class InMemoryStore(
     private val claimed = ConcurrentHashMap.newKeySet<String>()
 
     override fun claimOnce(key: String): Boolean = claimed.add(key)
+
+    override fun releaseClaim(key: String) {
+        claimed.remove(key)
+    }
 
     override fun sipDigestHa1(handle: String, realm: String): String? {
         // Same rule as SqlStore: this store holds credentials for exactly one

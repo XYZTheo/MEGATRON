@@ -74,6 +74,7 @@ object SubscriberExport {
         customers: List<Customer>,
         ha1For: (handle: String) -> String?,
         realm: String,
+        onBadCredential: (String) -> Unit = { System.err.println("WARNING: $it") },
     ): String {
         require(realm.isNotBlank()) { "a realm is required: HA1 is meaningless without one" }
         require(!UNSAFE.containsMatchIn(realm)) { "realm '$realm' is not safe for db_text" }
@@ -119,11 +120,23 @@ object SubscriberExport {
                 // earlier, and the reason given there was that the validation
                 // lives somewhere else and the day it moves, the failure here
                 // is silent.
-                require(!UNSAFE.containsMatchIn(ha1)) {
-                    "the stored credential for '${customer.handle}' is not safe for db_text"
-                }
-                require(HEX.matches(ha1)) {
-                    "the stored credential for '${customer.handle}' is not an MD5 digest"
+                // SKIPPED, NOT THROWN — one bad row must not deny service to
+                // everyone.
+                //
+                // A blank credential already skips one customer. Throwing on a
+                // malformed one meant NO customer got a file, which on a fresh
+                // deployment is a missing subscriber table and a 500 on every
+                // REGISTER. Same class of input, opposite blast radius; and
+                // the safe answer is the one the blank case already gave.
+                //
+                // Loud, because a credential that is neither blank nor valid
+                // means something wrote to that column that should not have.
+                if (UNSAFE.containsMatchIn(ha1) || !HEX.matches(ha1)) {
+                    onBadCredential(
+                        "the stored credential for '${customer.handle}' is not a valid MD5 " +
+                            "digest; skipping them. Rotate their credentials to fix it."
+                    )
+                    return@mapNotNull null
                 }
 
                 "${customer.handle}:$realm:$ha1"
