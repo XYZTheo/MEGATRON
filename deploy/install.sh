@@ -369,8 +369,17 @@ MEGATRON is running on $DOMAIN.
 
 Next:
   1. Point $DOMAIN at $PUBLIC_IP.
-  2. Create a plan and a rate, then a customer — see deploy/README.md.
-  3. For the Telegram bot, add MEGATRON_TELEGRAM_TOKEN and
-     MEGATRON_OPERATOR_TELEGRAM_IDS to $SECRETS and start megatron-bot.
-
+  2. Prove it carries a call:  sudo bash deploy/smoke-test.sh
 EOF
+
+# Told what to do, not told to do what is already done. A closing checklist
+# that lists a step you completed two minutes ago trains people to skip the
+# whole thing.
+if systemctl is-active --quiet megatron-bot; then
+    echo "  3. The Telegram bot is running. Message it and send /help."
+else
+    echo "  3. For the Telegram bot, add MEGATRON_TELEGRAM_TOKEN and"
+    echo "     MEGATRON_OPERATOR_TELEGRAM_IDS to $SECRETS, then:"
+    echo "         sudo systemctl enable --now megatron-bot"
+fi
+echo
