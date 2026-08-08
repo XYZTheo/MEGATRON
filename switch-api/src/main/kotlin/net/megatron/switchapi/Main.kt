@@ -49,9 +49,40 @@ fun main() {
     }
 
     val service = CallService(store, cdrSink = { cdr ->
-        // Stand-in for the ClickHouse pipeline (#8). Printed rather than
-        // dropped, because a CDR that is silently discarded is revenue that
-        // cannot be argued for with a carrier.
+        // STORED, NOT JUST PRINTED. Every charge on the ledger came from a
+        // call, and this is the row that says which one, how long it ran, at
+        // what rate, and whether audio flowed. Without it "why is my bill this
+        // much" has no answer and a disputed charge is settled by whoever
+        // sounds more certain.
+        //
+        // Wrapped, because this runs on the settlement path: a call that has
+        // already been charged must not fail because the history could not be
+        // written. Loud, though — a CDR that vanishes silently is revenue that
+        // cannot be argued for with a carrier either.
+        try {
+            store.recordCall(
+                net.megatron.provisioning.CallRecord(
+                    callId = cdr.callId,
+                    account = cdr.account,
+                    destination = cdr.destination,
+                    prefix = cdr.prefix,
+                    durationSeconds = cdr.durationSeconds,
+                    durationSource = cdr.durationSource,
+                    billedSeconds = cdr.billedSeconds,
+                    chargedMicros = cdr.chargedMicros,
+                    ratePerMinute = cdr.ratePerMinute,
+                    mediaBytes = cdr.mediaBytes,
+                    mediaStats = cdr.mediaStats,
+                    noMedia = cdr.noMedia,
+                    overran = cdr.overran,
+                    hangupCause = cdr.hangupCause,
+                    endedAt = cdr.endedAt,
+                )
+            )
+        } catch (failure: Throwable) {
+            System.err.println("WARNING: could not store the CDR for ${cdr.callId}: $failure")
+        }
+
         println("CDR ${cdr.callId} ${cdr.account} -> ${cdr.destination} " +
             "${cdr.billedSeconds}s ${cdr.chargedMicros}u [${cdr.durationSource}] " +
             "media=${cdr.mediaBytes ?: "unknown"}" +

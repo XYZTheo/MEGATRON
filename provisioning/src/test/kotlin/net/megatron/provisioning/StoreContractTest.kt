@@ -172,6 +172,123 @@ abstract class StoreContractTest {
             "other than a Conflict, which reaches the API as a 500")
     }
 
+    // -- call detail records --------------------------------------------------
+    //
+    // The evidence behind every charge. What is asserted here is what a
+    // disputed bill is argued from.
+
+    private fun call(
+        id: String,
+        account: String = "bigcorp",
+        charged: Long = 10_000,
+        noMedia: Boolean = false,
+        endedAt: String = "2026-08-08T12:00:00Z",
+    ) = CallRecord(
+        callId = id,
+        account = account,
+        destination = "12125551234",
+        prefix = "1",
+        durationSeconds = 42,
+        durationSource = "sip",
+        billedSeconds = 60,
+        chargedMicros = charged,
+        ratePerMinute = 10_000,
+        mediaBytes = if (noMedia) 0 else 42_084,
+        mediaStats = "RTP: 42084 bytes, 167 packets, 167 errors",
+        noMedia = noMedia,
+        endedAt = endedAt,
+    )
+
+    @Test
+    fun `a call is recorded and read back whole`() {
+        val store = store()
+        store.recordCall(call("c-1"))
+
+        val read = store.callsFor("bigcorp").single()
+        assertEquals("c-1", read.callId)
+        assertEquals(10_000L, read.chargedMicros)
+        assertEquals("sip", read.durationSource)
+        assertEquals(42_084L, read.mediaBytes)
+        assertEquals(60, read.billedSeconds)
+        assertTrue(read.mediaStats!!.contains("42084 bytes"), "the raw stats were lost")
+    }
+
+    @Test
+    fun `the same call recorded twice is one row`() {
+        // The switch retransmits settlements — SIP retransmits by design, and
+        // a slowly-answered BYE arrives again. A second row doubles the
+        // apparent spend on every report while the balance, guarded
+        // separately by the reservation id, shows the truth. Two records
+        // disagreeing is worse than either being wrong alone.
+        val store = store()
+        store.recordCall(call("c-dup"))
+        store.recordCall(call("c-dup"))
+
+        assertEquals(1, store.callsFor("bigcorp").size, "the retransmission was double-counted")
+    }
+
+    @Test
+    fun `recording a duplicate does not throw, because it is on the money path`() {
+        // Failing a settlement because the history already has the row would
+        // turn a harmless duplicate into a lost charge.
+        val store = store()
+        store.recordCall(call("c-dup"))
+        store.recordCall(call("c-dup"))  // must not throw
+    }
+
+    @Test
+    fun `calls come back most recent first`() {
+        val store = store()
+        store.recordCall(call("old", endedAt = "2026-08-01T09:00:00Z"))
+        store.recordCall(call("new", endedAt = "2026-08-08T09:00:00Z"))
+        store.recordCall(call("middle", endedAt = "2026-08-04T09:00:00Z"))
+
+        assertEquals(
+            listOf("new", "middle", "old"),
+            store.callsFor("bigcorp").map { it.callId },
+        )
+    }
+
+    @Test
+    fun `one customer never sees another's calls`() {
+        // Their call history is a list of who they phoned.
+        val store = store()
+        store.recordCall(call("mine", account = "bigcorp"))
+        store.recordCall(call("theirs", account = "rival"))
+
+        assertEquals(listOf("mine"), store.callsFor("bigcorp").map { it.callId })
+        assertEquals(listOf("theirs"), store.callsFor("rival").map { it.callId })
+    }
+
+    @Test
+    fun `silent calls can be listed, because each one is a possible refund`() {
+        val store = store()
+        store.recordCall(call("talked", noMedia = false))
+        store.recordCall(call("silent", noMedia = true))
+
+        assertEquals(listOf("silent"), store.noMediaCalls().map { it.callId })
+        assertEquals(2, store.recentCalls().size)
+    }
+
+    @Test
+    fun `unreadable media stats stay unknown, and are not read back as silence`() {
+        // 0 bytes is evidence of silence. Null is evidence of nothing. A store
+        // that collapses them turns every unreadable stat into a refund
+        // request the day rtpengine changes its wording.
+        val store = store()
+        store.recordCall(call("unknown").copy(mediaBytes = null, mediaStats = null))
+
+        assertNull(store.callsFor("bigcorp").single().mediaBytes)
+    }
+
+    @Test
+    fun `a limit is honoured`() {
+        val store = store()
+        (1..30).forEach { store.recordCall(call("c-%02d".format(it), endedAt = "2026-08-08T12:%02d:00Z".format(it))) }
+        assertEquals(5, store.callsFor("bigcorp", limit = 5).size)
+        assertEquals("c-30", store.callsFor("bigcorp", limit = 5).first().callId)
+    }
+
     // -- customers ----------------------------------------------------------
 
     @Test

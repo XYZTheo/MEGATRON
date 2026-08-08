@@ -102,6 +102,60 @@ CREATE TABLE IF NOT EXISTS transactions (
 CREATE INDEX IF NOT EXISTS transactions_customer
     ON transactions (customer_id, created_at);
 
+-- Call detail records.
+--
+-- THIS IS THE EVIDENCE. Every charge on the transactions table above came from
+-- a call, and this is the row that says which one, how long it ran, at what
+-- rate, and whether audio actually flowed. Without it "why is my bill this
+-- much" has no answer, and a disputed charge is decided by whoever is more
+-- confident.
+--
+-- APPEND-ONLY, like transactions, and for the same reason: a call history an
+-- operator can edit proves nothing about the calls.
+--
+-- SQLite here is a deliberate v1 choice and a known ceiling. CDR volume is the
+-- one thing in this schema that genuinely grows without bound, and the design
+-- (docs/ARCHITECTURE.md) puts it in ClickHouse at scale. Hundreds of calls a
+-- day is not scale, a million is. The read paths below are indexed so the
+-- switch never waits on this table.
+--
+-- NOTE FOR ANYONE EDITING THIS FILE: it is loaded by splitting on the
+-- semicolon, so a semicolon inside a COMMENT cuts the statement in half and
+-- every table after it silently fails to create. That is how this very block
+-- broke the whole schema once.
+CREATE TABLE IF NOT EXISTS cdrs (
+    call_id                 TEXT PRIMARY KEY,
+    account                 TEXT NOT NULL,
+    destination             TEXT NOT NULL,
+    prefix                  TEXT,
+    duration_seconds        INTEGER NOT NULL,
+    -- 'sip' or 'server-clock'. NEVER absent: a bill nobody can trace to a
+    -- source is a bill nobody can defend.
+    duration_source         TEXT NOT NULL,
+    billed_seconds          INTEGER NOT NULL,
+    charged_micros          INTEGER NOT NULL,
+    rate_micros_per_minute  INTEGER NOT NULL,
+    -- NULL means "we could not read the media stats", which is NOT the same as
+    -- zero. Zero is evidence of silence, null is evidence of nothing.
+    media_bytes             INTEGER,
+    media_stats             TEXT,
+    no_media                INTEGER NOT NULL DEFAULT 0,
+    overran                 INTEGER NOT NULL DEFAULT 0,
+    hangup_cause            TEXT,
+    ended_at                TEXT NOT NULL
+);
+
+-- "What did this customer spend, most recently first" — the question the bot
+-- asks and the one a dispute starts from.
+CREATE INDEX IF NOT EXISTS cdrs_account
+    ON cdrs (account, ended_at DESC);
+
+-- Calls that connected and carried no audio, across all customers. This is a
+-- refund queue: each one is a charge a customer may reasonably challenge, and
+-- an operator who cannot list them finds out from the complaints.
+CREATE INDEX IF NOT EXISTS cdrs_no_media
+    ON cdrs (no_media, ended_at DESC);
+
 CREATE TABLE IF NOT EXISTS trunks (
     id                    TEXT PRIMARY KEY,
     name                  TEXT NOT NULL,

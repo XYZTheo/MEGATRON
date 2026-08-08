@@ -223,6 +223,41 @@ data class Trunk(
 )
 
 /** RFC 9457 problem details. The only error shape this API emits. */
+/**
+ * A completed call, as stored.
+ *
+ * Deliberately a separate type from switch-api's `Cdr` rather than shared.
+ * That one is the SHAPE OF A MESSAGE between two services and may gain fields
+ * for the switch's convenience; this one is a row that will be read back in a
+ * dispute years later. Coupling them means a change made for the wire quietly
+ * changes what is on record.
+ *
+ * Money is integer micro-units, as everywhere.
+ */
+@Serializable
+data class CallRecord(
+    @SerialName("call_id") val callId: String,
+    val account: String,
+    val destination: String,
+    val prefix: String? = null,
+    @SerialName("duration_seconds") val durationSeconds: Int,
+    /** "sip" or "server-clock" — how the duration was measured. */
+    @SerialName("duration_source") val durationSource: String,
+    @SerialName("billed_seconds") val billedSeconds: Int,
+    @SerialName("charged_micros") val chargedMicros: Long,
+    @SerialName("rate_micros_per_minute") val ratePerMinute: Long,
+    /**
+     * Null means the media stats could not be read, which is NOT zero. Zero is
+     * evidence of silence; null is evidence of nothing.
+     */
+    @SerialName("media_bytes") val mediaBytes: Long? = null,
+    @SerialName("media_stats") val mediaStats: String? = null,
+    @SerialName("no_media") val noMedia: Boolean = false,
+    val overran: Boolean = false,
+    @SerialName("hangup_cause") val hangupCause: String? = null,
+    @SerialName("ended_at") val endedAt: String,
+)
+
 @Serializable
 data class Problem(
     val type: String = "about:blank",

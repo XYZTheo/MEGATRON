@@ -172,9 +172,29 @@ class SqlStore(
         val schema = SqlStore::class.java.getResourceAsStream("/schema.sql")
             ?.bufferedReader()?.readText()
             ?: error("schema.sql is missing from the jar")
+        // COMMENTS ARE STRIPPED BEFORE SPLITTING ON THE SEMICOLON.
+        //
+        // The loader splits statements on ";", so a semicolon inside a `--`
+        // comment cut a CREATE TABLE in half and every statement after it
+        // silently failed. The visible error was "incomplete input" from a
+        // statement that looked fine, and the real damage was tables that
+        // simply did not exist.
+        //
+        // It happened twice in one sitting, which is the definition of a trap
+        // rather than a mistake. schema.sql is heavily commented on purpose,
+        // so the loader accommodates that instead of asking every future
+        // editor to remember.
+        //
+        // Line-oriented and therefore blind to a `--` inside a string
+        // literal. There are none in schema.sql, and a schema that needs one
+        // needs a real parser rather than a cleverer regex.
+        val statements = schema.lineSequence()
+            .map { it.substringBefore("--") }
+            .joinToString("\n")
+
         transaction {
             connection.createStatement().use { statement ->
-                for (ddl in schema.split(";")) {
+                for (ddl in statements.split(";")) {
                     if (ddl.isBlank()) continue
                     statement.execute(ddl)
                 }
@@ -751,6 +771,79 @@ class SqlStore(
         update("DELETE FROM idempotency WHERE key = ?", key)
     }
 
+    // -- call detail records --------------------------------------------------
+
+    override fun recordCall(record: CallRecord) {
+        // INSERT OR IGNORE, not INSERT. The switch retransmits settlements --
+        // SIP retransmits by design, and a slowly-answered BYE arrives again --
+        // and a second row for one call doubles the apparent spend on every
+        // report while the balance, guarded separately by the reservation id,
+        // shows the truth. Two records disagreeing is worse than either being
+        // wrong on its own.
+        //
+        // It must also never throw. This is called from the settlement path,
+        // and failing a settlement because the history already has the row
+        // would turn a duplicate into a lost charge.
+        update(
+            "INSERT OR IGNORE INTO cdrs (call_id, account, destination, prefix, " +
+                "duration_seconds, duration_source, billed_seconds, charged_micros, " +
+                "rate_micros_per_minute, media_bytes, media_stats, no_media, overran, " +
+                "hangup_cause, ended_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            record.callId, record.account, record.destination, record.prefix,
+            record.durationSeconds, record.durationSource, record.billedSeconds,
+            record.chargedMicros, record.ratePerMinute, record.mediaBytes,
+            record.mediaStats, if (record.noMedia) 1 else 0, if (record.overran) 1 else 0,
+            record.hangupCause, record.endedAt,
+        )
+    }
+
+    override fun callsFor(account: String, limit: Int): List<CallRecord> =
+        query(
+            "SELECT * FROM cdrs WHERE account = ? ORDER BY ended_at DESC, call_id DESC LIMIT ?",
+            account, limit.coerceIn(1, MAX_CALL_PAGE),
+        ) { rs -> rs.toCallRecords() }
+
+    override fun recentCalls(limit: Int): List<CallRecord> =
+        query(
+            "SELECT * FROM cdrs ORDER BY ended_at DESC, call_id DESC LIMIT ?",
+            limit.coerceIn(1, MAX_CALL_PAGE),
+        ) { rs -> rs.toCallRecords() }
+
+    override fun noMediaCalls(limit: Int): List<CallRecord> =
+        query(
+            "SELECT * FROM cdrs WHERE no_media = 1 ORDER BY ended_at DESC, call_id DESC LIMIT ?",
+            limit.coerceIn(1, MAX_CALL_PAGE),
+        ) { rs -> rs.toCallRecords() }
+
+    private fun ResultSet.toCallRecords(): List<CallRecord> = buildList {
+        while (next()) {
+            add(
+                CallRecord(
+                    callId = getString("call_id"),
+                    account = getString("account"),
+                    destination = getString("destination"),
+                    prefix = getString("prefix"),
+                    durationSeconds = getInt("duration_seconds"),
+                    durationSource = getString("duration_source"),
+                    billedSeconds = getInt("billed_seconds"),
+                    chargedMicros = getLong("charged_micros"),
+                    ratePerMinute = getLong("rate_micros_per_minute"),
+                    // getLong returns 0 for SQL NULL, and 0 media bytes means
+                    // SILENCE while null means WE COULD NOT TELL. Collapsing
+                    // them would turn every unreadable stat into evidence of a
+                    // silent call, which is a refund request per healthy call
+                    // the day rtpengine changes its wording.
+                    mediaBytes = getLong("media_bytes").takeUnless { wasNull() },
+                    mediaStats = getString("media_stats"),
+                    noMedia = getInt("no_media") == 1,
+                    overran = getInt("overran") == 1,
+                    hangupCause = getString("hangup_cause"),
+                    endedAt = getString("ended_at"),
+                )
+            )
+        }
+    }
+
     override fun sipDigestHa1(handle: String, realm: String): String? {
         // The stored HA1 is bound to this store's realm. Asking for a
         // different one cannot be satisfied from storage and must fail rather
@@ -800,6 +893,15 @@ class SqlStore(
     private companion object {
         /** Claims between opportunistic sweeps of expired idempotency rows. */
         const val CLAIM_SWEEP_EVERY = 100L
+
+        /**
+         * A ceiling on how many calls one read can return.
+         *
+         * Not a page size — the caller picks that. This stops a caller asking
+         * for the whole table and pulling a year of call history into memory
+         * on a box that is also a switch.
+         */
+        const val MAX_CALL_PAGE = 500
 
         /** How long a claim guards against a redelivery. */
         const val CLAIM_RETENTION_SECONDS = 24L * 60 * 60

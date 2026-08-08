@@ -106,6 +106,41 @@ interface Store {
      * leaves behind is the old one rather than a new one.
      */
     fun releaseClaim(key: String)
+
+    /**
+     * Records a completed call.
+     *
+     * IDEMPOTENT ON call_id, because the switch will send the same settlement
+     * twice: SIP retransmits by design, and a BYE that is answered slowly is a
+     * BYE that arrives again. A second row for one call would double the
+     * apparent spend on every report while the balance — which is guarded
+     * separately — showed the truth, and the two disagreeing is worse than
+     * either being wrong.
+     *
+     * Never throws for a duplicate. The caller is the money path and must not
+     * fail a settlement because the history already has the row.
+     */
+    fun recordCall(record: CallRecord)
+
+    /**
+     * A customer's calls, most recent first.
+     *
+     * This is what a disputed bill is argued from, so it is a read the
+     * operator and the customer see the same answer to.
+     */
+    fun callsFor(account: String, limit: Int = 20): List<CallRecord>
+
+    /** Every customer's recent calls, most recent first. */
+    fun recentCalls(limit: Int = 20): List<CallRecord>
+
+    /**
+     * Calls that connected and carried no audio.
+     *
+     * A REFUND QUEUE, not a curiosity. Each one is a charge a customer may
+     * reasonably challenge, and an operator who cannot list them learns about
+     * them from complaints instead.
+     */
+    fun noMediaCalls(limit: Int = 20): List<CallRecord>
 }
 
 /**
@@ -525,6 +560,43 @@ class InMemoryStore(
     private val claimed = ConcurrentHashMap.newKeySet<String>()
 
     override fun claimOnce(key: String): Boolean = claimed.add(key)
+
+    private val calls = java.util.Collections.synchronizedList(mutableListOf<CallRecord>())
+
+    override fun recordCall(record: CallRecord) {
+        synchronized(calls) {
+            // Idempotent on call_id: the switch retransmits, and a second row
+            // would double the apparent spend on every report while the
+            // balance showed the truth.
+            if (calls.none { it.callId == record.callId }) calls.add(record)
+        }
+    }
+
+    /**
+     * ORDERED BY WHEN THE CALL ENDED, not by when we happened to record it.
+     *
+     * The first version reversed insertion order, which is the same thing
+     * only while settlements arrive in the order the calls finished — and
+     * they do not: a BYE can be retransmitted, delayed behind another
+     * settlement, or replayed after a restart. SqlStore orders by ended_at,
+     * so the two stores would have disagreed about what "most recent" means,
+     * which is exactly the divergence this suite exists to catch.
+     *
+     * call_id breaks ties so the order is total and a page boundary cannot
+     * show the same call twice.
+     */
+    private fun ordered(from: List<CallRecord>, limit: Int) =
+        from.sortedWith(compareByDescending<CallRecord> { it.endedAt }.thenByDescending { it.callId })
+            .take(limit)
+
+    override fun callsFor(account: String, limit: Int): List<CallRecord> =
+        synchronized(calls) { ordered(calls.filter { it.account == account }, limit) }
+
+    override fun recentCalls(limit: Int): List<CallRecord> =
+        synchronized(calls) { ordered(calls.toList(), limit) }
+
+    override fun noMediaCalls(limit: Int): List<CallRecord> =
+        synchronized(calls) { ordered(calls.filter { it.noMedia }, limit) }
 
     override fun releaseClaim(key: String) {
         claimed.remove(key)
