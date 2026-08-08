@@ -20,7 +20,57 @@ Seth, 2026-08-07, verbatim — this is the ground truth for the whole project:
 >
 > "i want to use this myself first then sell it to others."
 
-Two things follow from that, and they govern every decision in this repo.
+### Corrected and sharpened, 2026-08-08
+
+That description was right about the *business* and misled the build in one
+important way — it made the Telegram bot sound like the product. Seth's
+correction, verbatim:
+
+> "nah u dont need to make a bot for the megatron i already made that, i
+> already use magnus so u was suppose to make a magnus clone type shit that is
+> secure, I want u to use the voipx github repo on my github to do the UI and
+> other features, that should be linked to that from the softphone magnus clone
+> thing so i can tell my providers point the ip at the magnus clone server and
+> go bout business as usuual in a more secure way"
+>
+> "for megatron u just making the magnus/vos3000 type interface so i can have a
+> service made like that so i can use one made myself instead of their flawed
+> shit"
+>
+> "its not a magnus billing clone, i want all the features and functionality
+> magnus and vos3000 offer, that system"
+
+**So: MEGATRON is the switch and the platform — the thing Magnus and VOS3000
+are — with their feature surface and none of their defects. It is not a
+literal clone of MagnusBilling's code or its screens, and it is not a Telegram
+bot.**
+
+Three consequences, and they override anything below that contradicts them:
+
+1. **PROJECT-VOIPX is the management layer, and it already exists.** Seth's own
+   repo (Kotlin + Spring Boot) already has the bot, the admin console, plans,
+   balances, caller IDs, DIDs, teams, support and licensing. MEGATRON does not
+   re-implement any of it.
+
+2. **The seam is `VosClient`.** VOIPX talks to a switch through that one
+   interface, swappable by config (`vos.mode`). Implementing it against
+   MEGATRON is what connects the two — see `docs/VOIPX-INTEGRATION.md`. That is
+   the integration, and it is *one class* plus whatever MEGATRON has to grow to
+   satisfy it.
+
+3. **The test that matters is the takeover.** Seth points his providers' IPs at
+   the MEGATRON box and carries on. His existing customers keep their existing
+   SIP credentials. Anything that forces a customer to reconfigure a softphone
+   is a migration, not a takeover, and it is the wrong answer.
+
+**MEGATRON's own Telegram bot (`bot/`) is therefore not the product.** It is
+kept because `CommandEngine` holds tested decisions the management layer needs
+anyway — who may run what, how a typed amount becomes integer micros, what a
+retried message must not do twice — but no further work goes into its
+transport.
+
+Two things follow from the original description, and they still govern every
+decision in this repo.
 
 ### 1. The motive is security, not features
 
