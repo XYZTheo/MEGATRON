@@ -92,7 +92,40 @@ class CommandEngine(
     },
 ) {
 
-    fun handle(telegramUserId: Long, chatId: Long, messageId: Long, text: String): String {
+    /**
+     * The reply, and whether it is safe to say out loud.
+     *
+     * [containsSecret] is a decision, not a property of the string, and it
+     * belongs here rather than in the transport for the same reason everything
+     * else does: a transport that inspects replies to guess which are
+     * sensitive is a transport making business decisions, and it will guess
+     * differently from this file the first time a message is reworded.
+     *
+     * The case that matters: an operator runs /newuser in a group chat. The
+     * reply carries a SIP password, which is a working login for the switch,
+     * and Telegram group history is forever and searchable.
+     */
+    data class Reply(val text: String, val containsSecret: Boolean = false)
+
+    /** Convenience for callers that do not care about [Reply.containsSecret]. */
+    fun handle(telegramUserId: Long, chatId: Long, messageId: Long, text: String): String =
+        reply(telegramUserId, chatId, messageId, text).text
+
+    fun reply(telegramUserId: Long, chatId: Long, messageId: Long, text: String): Reply {
+        val command = parseCommand(text)
+        // Only /newuser hands back a credential. Listed by VERB rather than by
+        // scanning the reply text: a scan finds whatever it was taught to look
+        // for and silently misses the next command that returns a secret.
+        val secret = command?.verb == "newuser" && roles.isOperator(telegramUserId)
+        return Reply(handleText(telegramUserId, chatId, messageId, text), secret)
+    }
+
+    private fun handleText(
+        telegramUserId: Long,
+        chatId: Long,
+        messageId: Long,
+        text: String,
+    ): String {
         val command = parseCommand(text) ?: return help(roles.isOperator(telegramUserId))
         val actor = "telegram:$telegramUserId"
         val key = idempotencyKeyFor(chatId, messageId)
