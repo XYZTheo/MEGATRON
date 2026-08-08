@@ -185,7 +185,48 @@ echo "spent ${spent}u"
 [ "$spent" -eq 10000 ] \
     || fatal "expected 10000u for one 60s increment, billed ${spent}u"
 
-step "6. it was billed to who they PROVED they are"
+step "6. the same call again, this time carrying audio"
+
+# THE OTHER HALF OF THE MEDIA CHECK.
+#
+# The call above was billed with NO-MEDIA set, correctly -- it sent no RTP.
+# This one must be billed with the bytes counted and the flag clear. A switch
+# that cannot tell the two apart bills silence at the full rate, which is one
+# of the three money-losing failure modes.
+#
+# sudo, because play_pcap_audio opens a raw socket. Without it SIPp reports
+# success and sends nothing, which is indistinguishable from the silent
+# scenario -- the test would pass while measuring the wrong thing.
+timeout 60 sipp -sn uas -p 5070 -m 1 -bg > /dev/null 2>&1
+sleep 1
+
+before_audio=$(balance)
+printf 'SEQUENTIAL\n%s;labdialer;12125551234\n' "$REALM" > /tmp/lab-audio.csv
+sudo timeout 60 sipp -sf "$HERE/sipp-call-authenticated-audio.xml" 127.0.0.1:5060 \
+    -inf /tmp/lab-audio.csv -au labdialer -ap "$PASSWORD" \
+    -m 1 -r 1 -timeout 40 -trace_err -error_file /tmp/lab-audio.err \
+    > /tmp/lab-audio.log 2>&1
+rc=$?
+pkill -f 'sipp -sn uas' 2>/dev/null
+[ $rc -eq 0 ] || { sed -n '1,15p' /tmp/lab-audio.err 2>/dev/null; fatal "the audio call failed"; }
+
+sleep 2
+after_audio=$(balance)
+[ "$after_audio" != "$before_audio" ] || fatal "the audio call was not billed"
+
+CDR=$(grep '^CDR' /tmp/switch.log | tail -1)
+echo "$CDR"
+
+echo "$CDR" | grep -q 'NO-MEDIA' \
+    && fatal "a call that carried G.711 was flagged NO-MEDIA -- the flag is meaningless"
+
+# media=0 would mean the flag is clear only because the stats were unreadable,
+# which is the same blind spot wearing a different hat.
+echo "$CDR" | grep -qE 'media=[1-9][0-9]*' \
+    || fatal "no media bytes counted on a call that sent G.711: $CDR"
+echo "audio counted, NO-MEDIA correctly absent"
+
+step "7. it was billed to who they PROVED they are"
 
 # The whole reason authentication is on the call path. If the switch had used
 # the From header, this would still pass -- they match here -- so the negative
