@@ -141,6 +141,62 @@ interface Store {
      * them from complaints instead.
      */
     fun noMediaCalls(limit: Int = 20): List<CallRecord>
+
+    /**
+     * Moves a customer onto a different plan.
+     *
+     * In MEGATRON a plan IS the rate table, so this is what VOIPX calls both
+     * `setPlan` and `setTariff` — VOS3000 splits a recurring package from a
+     * fee-rate group and MEGATRON does not. See docs/VOIPX-INTEGRATION.md.
+     *
+     * Takes effect on the NEXT call, not on one in progress: a call was
+     * authorized at a price and gets settled at that price, or a customer's
+     * bill changes underneath a conversation they are already having.
+     */
+    fun setPlan(id: String, planId: String, actor: String): Customer
+
+    /**
+     * Stops presenting a caller ID.
+     *
+     * Distinct from setting a different one. A customer whose number is
+     * withdrawn — because it was never theirs, or the attestation lapsed —
+     * must fall back to the operator's default, not keep presenting the last
+     * number they were allowed.
+     */
+    fun clearCallerId(id: String, actor: String): Customer
+
+    /**
+     * Does this password authenticate this handle?
+     *
+     * Answers VOIPX's `verifyCredentials` without either service holding a
+     * plaintext password: the candidate is converted to HA1 and compared
+     * against the stored one.
+     *
+     * Null for "no such account", false for "wrong password" — the caller may
+     * need to tell those apart internally even though what it says OUT LOUD
+     * must not distinguish them. That is the enumeration oracle the switch
+     * config spends forty lines avoiding.
+     */
+    fun verifyPassword(handle: String, password: String): Boolean?
+
+    /**
+     * Creates a customer with a credential MEGATRON did not generate.
+     *
+     * THE ONE PLACE THE PASSWORD RULE BENDS, AND IT BENDS FOR A SPECIFIC
+     * REASON. Everywhere else a password is generated, returned once and
+     * never accepted, because a provisioning API that takes passwords is one
+     * that has them to leak. Here the caller supplies one — and the only
+     * justification is the takeover: importing an operator's existing
+     * customers from Magnus or VOS3000 must not require every one of them to
+     * reconfigure a softphone. A migration that breaks every customer is not
+     * a migration anyone performs.
+     *
+     * The plaintext is converted to HA1 and the SHA-256 hash immediately and
+     * is not stored. It is a separate method rather than an optional argument
+     * on [createCustomer] so that supplying a password is a deliberate,
+     * greppable act rather than a parameter somebody sets by accident.
+     */
+    fun importCustomer(request: CreateCustomer, password: String, actor: String): Customer
 }
 
 /**
@@ -600,6 +656,45 @@ class InMemoryStore(
 
     override fun releaseClaim(key: String) {
         claimed.remove(key)
+    }
+
+    override fun setPlan(id: String, planId: String, actor: String): Customer {
+        plans[planId] ?: throw NotFound("plan '$planId'")
+        val customer = getCustomer(id)
+        val updated = customer.copy(planId = planId)
+        customers[id] = updated
+        return updated
+    }
+
+    override fun clearCallerId(id: String, actor: String): Customer {
+        val updated = getCustomer(id).copy(callerId = null)
+        customers[id] = updated
+        return updated
+    }
+
+    override fun verifyPassword(handle: String, password: String): Boolean? {
+        val stored = ha1ByHandle[handle] ?: return null
+        // Constant-time, because this is a credential check and a timing
+        // difference is a slow oracle for the first differing character.
+        return java.security.MessageDigest.isEqual(
+            stored.toByteArray(),
+            ha1(handle, sipDomain, password).toByteArray(),
+        )
+    }
+
+    override fun importCustomer(
+        request: CreateCustomer,
+        password: String,
+        actor: String,
+    ): Customer {
+        require(password.length >= 8) {
+            "an imported password shorter than 8 characters is not worth importing"
+        }
+        val (customer, _) = createCustomer(request, actor)
+        // Overwrite the generated credential with the supplied one, so the
+        // customer's existing softphone keeps working untouched.
+        ha1ByHandle[customer.handle] = ha1(customer.handle, sipDomain, password)
+        return customer
     }
 
     override fun sipDigestHa1(handle: String, realm: String): String? {

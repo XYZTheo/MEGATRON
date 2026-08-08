@@ -9,6 +9,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotEquals
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -170,6 +171,122 @@ abstract class StoreContractTest {
         assertEquals(1, created.get(), "the handle was issued more than once")
         assertEquals(threads - 1, conflicts.get(), "a racing creation failed as something " +
             "other than a Conflict, which reaches the API as a 500")
+    }
+
+    // -- what VOIPX needs -----------------------------------------------------
+    //
+    // These exist to satisfy PROJECT-VOIPX's VosClient interface so its bot
+    // and console can drive MEGATRON in place of VOS3000. See
+    // docs/VOIPX-INTEGRATION.md.
+
+    @Test
+    fun `a customer can be moved to another plan`() {
+        // VosClient calls this setPlan AND setTariff — VOS3000 splits a
+        // package from a fee-rate group, MEGATRON has one concept.
+        val store = store()
+        val (plan, customer) = seed(store)
+        val premium = store.createPlan(CreatePlan("Premium", "USD"))
+
+        val moved = store.setPlan(customer.id, premium.id, "operator")
+
+        assertEquals(premium.id, moved.planId)
+        assertEquals(premium.id, store.getCustomer(customer.id).planId)
+        assertNotEquals(plan.id, moved.planId)
+    }
+
+    @Test
+    fun `moving to a plan that does not exist is refused`() {
+        // Silently accepting it leaves a customer whose calls cannot be rated,
+        // which the switch refuses as though their destination were unknown.
+        val store = store()
+        val (_, customer) = seed(store)
+        assertFailsWith<NotFound> { store.setPlan(customer.id, "plan-nope", "operator") }
+    }
+
+    @Test
+    fun `a caller id can be withdrawn, not just replaced`() {
+        // A number withdrawn because it was never theirs must fall back to the
+        // operator's default, not keep presenting the last one they were
+        // allowed.
+        val store = store()
+        val (_, customer) = seed(store)
+        store.setCallerId(customer.id, "+441632960123", "operator")
+        assertNotNull(store.getCustomer(customer.id).callerId)
+
+        store.clearCallerId(customer.id, "operator")
+        assertNull(store.getCustomer(customer.id).callerId, "the withdrawn number is still set")
+    }
+
+    @Test
+    fun `a password can be verified without anybody holding it`() {
+        val store = store()
+        val plan = store.createPlan(CreatePlan("Retail", "USD"))
+        val credentials = store.createCustomer(CreateCustomer("checkme", plan.id), "t").second
+
+        assertEquals(true, store.verifyPassword("checkme", credentials.sipPassword))
+        assertEquals(false, store.verifyPassword("checkme", "not-the-password"))
+    }
+
+    @Test
+    fun `an unknown handle is null, not false`() {
+        // The caller may need to tell "no such account" from "wrong password"
+        // internally — while what it says OUT LOUD must not distinguish them,
+        // which is the enumeration oracle the switch config avoids at length.
+        val store = store()
+        seed(store)
+        assertNull(store.verifyPassword("ghost", "anything"))
+    }
+
+    // -- the takeover ---------------------------------------------------------
+
+    @Test
+    fun `an imported customer keeps the password they already had`() {
+        // THE WHOLE POINT OF THE MIGRATION. Seth's existing Magnus customers
+        // must keep working without touching their softphones; a migration
+        // that breaks every customer is not one anybody performs.
+        val store = store()
+        val plan = store.createPlan(CreatePlan("Retail", "USD"))
+
+        val imported = store.importCustomer(
+            CreateCustomer("legacy", plan.id), "their-old-password", "import",
+        )
+
+        assertEquals(true, store.verifyPassword("legacy", "their-old-password"))
+        assertEquals(
+            java.security.MessageDigest.getInstance("MD5")
+                .digest("legacy:sip.megatron.local:their-old-password".toByteArray())
+                .joinToString("") { "%02x".format(it) },
+            store.sipDigestHa1("legacy", "sip.megatron.local"),
+            "the imported credential is not what a softphone will compute",
+        )
+        assertEquals("legacy", imported.handle)
+    }
+
+    @Test
+    fun `an imported password is not left recoverable`() {
+        // The rule bends for the import, it does not break: the plaintext is
+        // converted and dropped, exactly as a generated one is.
+        val store = store()
+        val plan = store.createPlan(CreatePlan("Retail", "USD"))
+        store.importCustomer(CreateCustomer("legacy", plan.id), "their-old-password", "import")
+
+        val serialised = Json.encodeToString(store.findByHandle("legacy")!!)
+        assertTrue(
+            !serialised.contains("their-old-password"),
+            "the imported plaintext is reachable through the customer record",
+        )
+    }
+
+    @Test
+    fun `a laughably short imported password is refused`() {
+        // Importing is not an excuse to carry somebody else's worst
+        // credentials onto a switch whose whole purpose is not being the one
+        // that gets attacked.
+        val store = store()
+        val plan = store.createPlan(CreatePlan("Retail", "USD"))
+        assertFailsWith<IllegalArgumentException> {
+            store.importCustomer(CreateCustomer("weak", plan.id), "1234", "import")
+        }
     }
 
     // -- call detail records --------------------------------------------------

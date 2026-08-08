@@ -771,6 +771,55 @@ class SqlStore(
         update("DELETE FROM idempotency WHERE key = ?", key)
     }
 
+    override fun setPlan(id: String, planId: String, actor: String): Customer {
+        listPlans().firstOrNull { it.id == planId } ?: throw NotFound("plan '$planId'")
+        getCustomer(id)
+        update("UPDATE customers SET plan_id = ? WHERE id = ?", planId, id)
+        return getCustomer(id)
+    }
+
+    override fun clearCallerId(id: String, actor: String): Customer {
+        getCustomer(id)
+        update(
+            "UPDATE customers SET caller_id_number = NULL, caller_id_verified = 0, " +
+                "caller_id_set_at = ?, caller_id_set_by = ? WHERE id = ?",
+            now(), actor, id,
+        )
+        return getCustomer(id)
+    }
+
+    override fun verifyPassword(handle: String, password: String): Boolean? {
+        val stored = query(
+            "SELECT sip_ha1 FROM customers WHERE handle = ?", handle
+        ) { rs -> if (rs.next()) rs.getString(1)?.ifBlank { null } else null } ?: return null
+        // Constant-time: a timing difference on a credential check is a slow
+        // oracle for the first differing character.
+        return java.security.MessageDigest.isEqual(
+            stored.toByteArray(),
+            ha1(handle, sipDomain, password).toByteArray(),
+        )
+    }
+
+    override fun importCustomer(
+        request: CreateCustomer,
+        password: String,
+        actor: String,
+    ): Customer {
+        require(password.length >= 8) {
+            "an imported password shorter than 8 characters is not worth importing"
+        }
+        val (customer, _) = createCustomer(request, actor)
+        // The supplied credential replaces the generated one, so the
+        // customer's existing softphone keeps working untouched. Both derived
+        // forms are written together — a stale sip_password_hash beside a new
+        // HA1 is two answers to "what is this customer's password".
+        update(
+            "UPDATE customers SET sip_password_hash = ?, sip_ha1 = ? WHERE id = ?",
+            hash(password), ha1(customer.handle, sipDomain, password), customer.id,
+        )
+        return getCustomer(customer.id)
+    }
+
     // -- call detail records --------------------------------------------------
 
     override fun recordCall(record: CallRecord) {
