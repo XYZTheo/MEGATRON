@@ -45,10 +45,28 @@ cd "$REPO" || fatal "no repo at $REPO"
 ./gradlew :provisioning:installDist :switch-api:installDist \
     --console=plain --no-daemon -q 2>&1 | tail -3
 
-pkill -f 'provisioning/bin/provisioning' 2>/dev/null
-pkill -f 'switch-api/bin/switch-api' 2>/dev/null
-sleep 1
-rm -f /home/ubuntu/megatron-auth.db
+# KILL THE JVM, NOT THE WRAPPER.
+#
+# installDist produces a shell script that execs java, so pkill -f on the
+# script's path matches nothing that is still running. The old process kept
+# port 8081 and the database file, the new one failed to start, and the health
+# check passed -- against the process we meant to replace. The run then failed
+# much later with "handle already exists", which reads like a test bug rather
+# than a stale service.
+pkill -f 'net.megatron.provisioning.MainKt' 2>/dev/null
+pkill -f 'net.megatron.switchapi.MainKt' 2>/dev/null
+pkill -f 'install/provisioning' 2>/dev/null
+pkill -f 'install/switch-api' 2>/dev/null
+for _ in $(seq 1 10); do
+    pgrep -f 'net.megatron' >/dev/null || break
+    sleep 1
+done
+pgrep -f 'net.megatron' >/dev/null && fatal "a previous service would not stop"
+
+# -wal and -shm too: SQLite recovers from them, so removing only the .db
+# leaves the previous run's customers in place.
+rm -f /home/ubuntu/megatron-auth.db /home/ubuntu/megatron-auth.db-wal \
+      /home/ubuntu/megatron-auth.db-shm
 
 # Provisioning owns the credential file, so it must be able to write it. Root
 # owns the directory because OpenSIPS reads it; this is the lab making them
