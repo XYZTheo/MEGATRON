@@ -58,7 +58,15 @@ class SubscriberExportTest {
         // value did not degrade one login -- the whole table failed to parse,
         // auth_db reported "table 'subscriber' does not exist", and every
         // customer got a 500 on REGISTER.
-        val out = SubscriberExport.render(listOf(customer("bigcorp")), { "deadbeef" }, realm)
+        val out = SubscriberExport.render(
+            listOf(customer("bigcorp")),
+            // A real-shaped digest: the exporter now requires 32 lower-case
+            // hex digits, because a value that is not an MD5 digest cannot
+            // authenticate anyone and writing it can only produce a customer
+            // who mysteriously cannot log in.
+            { "0123456789abcdef0123456789abcdef" },
+            realm,
+        )
         val columns = out.lines()[0].split(" ").size
         out.lines().filter { it.isNotBlank() }.drop(1).forEach { row ->
             val fields = row.split(":")

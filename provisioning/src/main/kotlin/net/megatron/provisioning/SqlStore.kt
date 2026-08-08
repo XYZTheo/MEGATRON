@@ -44,6 +44,17 @@ class SqlStore(
         //
         // Foreign keys and durable writes are both OFF by default in SQLite —
         // a reasonable default for a file format, and a poor one for money.
+        //
+        // The foreign_keys pragma had nothing to enforce for a while:
+        // schema.sql declared no FOREIGN KEY at all, so this line read as
+        // protection and provided none. They are declared now.
+        //
+        // CAVEAT: SQLite cannot add a foreign key to an existing table, and
+        // schema.sql is CREATE TABLE IF NOT EXISTS, so a database created
+        // before those declarations keeps its unconstrained tables. See
+        // migrate() — adding a column is safe, rebuilding a table to add a
+        // constraint is not, and a migration that can destroy data will
+        // eventually meet a database somebody cared about.
         createStatement().use { it.execute("PRAGMA foreign_keys = ON") }
         createStatement().use { it.execute("PRAGMA journal_mode = WAL") }
         createStatement().use { it.execute("PRAGMA synchronous = FULL") }
@@ -62,6 +73,43 @@ class SqlStore(
         // Multi-statement work uses transaction {} below, which turns
         // autoCommit off for exactly its own duration.
         autoCommit = true
+    }
+
+    /**
+     * Brings an EXISTING database up to the current schema.
+     *
+     * schema.sql is entirely `CREATE TABLE IF NOT EXISTS`, which does exactly
+     * nothing to a table that already exists. So adding a column to the file
+     * added it only for databases created afterwards — and every deployment
+     * that had ever run before was left without it. The first `INSERT INTO
+     * customers (... sip_ha1 ...)` then failed with
+     *
+     *     table customers has no column named sip_ha1
+     *
+     * which is not degraded behaviour: no customer could be created at all.
+     * An upgrade that bricks the database on start is worse than a feature
+     * that is missing from it.
+     *
+     * Deliberately additive only. Nothing here drops or rewrites a column,
+     * because a migration that can destroy data will eventually be run against
+     * a database somebody cared about.
+     */
+    private fun migrate() {
+        val existing = query("PRAGMA table_info(customers)") { rs ->
+            buildSet { while (rs.next()) add(rs.getString("name").lowercase()) }
+        }
+        // Matches the DEFAULT in schema.sql, so a migrated row and a freshly
+        // created one are indistinguishable. A blank HA1 means "no working
+        // login yet", and SubscriberExport skips those rather than writing a
+        // credential everybody in that position would share.
+        if ("sip_ha1" !in existing) {
+            update("ALTER TABLE customers ADD COLUMN sip_ha1 TEXT NOT NULL DEFAULT ''")
+            System.err.println(
+                "migrated: added customers.sip_ha1. Existing customers have no SIP digest " +
+                    "credential until their password is rotated, and cannot register until " +
+                    "then — rotate via POST /v1/customers/{id}/credentials."
+            )
+        }
     }
 
     /**
@@ -101,6 +149,7 @@ class SqlStore(
                 }
             }
         }
+        migrate()
         // Continue ids past anything already stored, so a restart cannot
         // reissue an id that is already in the audit trail.
         query("SELECT id FROM customers UNION ALL SELECT id FROM plans " +
@@ -205,34 +254,59 @@ class SqlStore(
 
         val plan = listPlans().firstOrNull { it.id == request.planId }
             ?: throw NotFound("plan '${request.planId}'")
-        if (findByHandle(request.handle) != null) {
-            throw Conflict("a customer with handle '${request.handle}' already exists")
-        }
 
         val id = nextId("cust")
         val password = generatePassword()
-        update(
-            "INSERT INTO customers (id, handle, display_name, status, plan_id, " +
-                "balance_micros, currency, max_concurrent_calls, telegram_user_id, " +
-                "sip_password_hash, sip_ha1, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            id, request.handle, request.displayName, CustomerStatus.ACTIVE.name,
-            plan.id, request.openingBalanceMicros, plan.currency,
-            request.maxConcurrentCalls, request.telegramUserId, hash(password),
-            ha1(request.handle, sipDomain, password), now(),
-        )
 
-        if (request.openingBalanceMicros > 0) {
-            update(
-                "INSERT INTO transactions (id, customer_id, amount_micros, " +
-                    "balance_after_micros, reason, created_at, actor) VALUES (?,?,?,?,?,?,?)",
-                nextId("txn"), id, request.openingBalanceMicros,
-                request.openingBalanceMicros, "opening balance", now(), actor,
+        // ONE TRANSACTION, for the same reason adjustBalance is one: the
+        // opening balance and its audit row commit together or not at all.
+        //
+        // These were two separate autocommitting statements, so a crash
+        // between them produced a customer holding money with no record of
+        // where it came from — and the opening balance is the FIRST money
+        // movement on every account, the one most likely to be asked about.
+        // adjustBalance's comment has always insisted on this; creation was
+        // the one path that did not do it.
+        //
+        // It also closes the check-then-act gap on the handle: findByHandle
+        // above and this INSERT now happen inside one transaction, so two
+        // concurrent creations cannot both pass the check. If one still slips
+        // through at the database level the UNIQUE constraint catches it, and
+        // it is reported as the Conflict it is rather than as a 500.
+        return transaction {
+            if (findByHandle(request.handle) != null) {
+                throw Conflict("a customer with handle '${request.handle}' already exists")
+            }
+            try {
+                update(
+                    "INSERT INTO customers (id, handle, display_name, status, plan_id, " +
+                        "balance_micros, currency, max_concurrent_calls, telegram_user_id, " +
+                        "sip_password_hash, sip_ha1, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    id, request.handle, request.displayName, CustomerStatus.ACTIVE.name,
+                    plan.id, request.openingBalanceMicros, plan.currency,
+                    request.maxConcurrentCalls, request.telegramUserId, hash(password),
+                    ha1(request.handle, sipDomain, password), now(),
+                )
+            } catch (clash: java.sql.SQLException) {
+                if (clash.message?.contains("UNIQUE", ignoreCase = true) == true) {
+                    throw Conflict("a customer with handle '${request.handle}' already exists")
+                }
+                throw clash
+            }
+
+            if (request.openingBalanceMicros > 0) {
+                update(
+                    "INSERT INTO transactions (id, customer_id, amount_micros, " +
+                        "balance_after_micros, reason, created_at, actor) VALUES (?,?,?,?,?,?,?)",
+                    nextId("txn"), id, request.openingBalanceMicros,
+                    request.openingBalanceMicros, "opening balance", now(), actor,
+                )
+            }
+
+            getCustomer(id) to SipCredentials(
+                request.handle, password, sipDomain, defaultTransport
             )
         }
-
-        return getCustomer(id) to SipCredentials(
-            request.handle, password, sipDomain, defaultTransport
-        )
     }
 
     override fun getCustomer(id: String): Customer =
@@ -299,20 +373,50 @@ class SqlStore(
             throw Invalid("a reason is required, including on credits")
         }
         getCustomer(id)
-        // Balance moved by SQL rather than read-modify-write, so two operators
-        // crediting at once cannot lose one of the credits.
-        connection.prepareStatement(
-            "UPDATE customers SET balance_micros = balance_micros + ? WHERE id = ?"
-        ).use { statement ->
-            statement.setLong(1, request.amountMicros)
-            statement.setString(2, id)
-            statement.executeUpdate()
-        }
-        val after = connection.prepareStatement(
+
+        // THE ARITHMETIC HAPPENS IN KOTLIN, NOT IN SQL, AND THAT IS THE POINT.
+        //
+        // This was `SET balance_micros = balance_micros + ?`, which reads well
+        // and is wrong for money: SQLITE SILENTLY CONVERTS AN OVERFLOWING
+        // INTEGER SUM TO A FLOAT. Two large credits produced a balance of
+        // 9223372036854775807 with no error, and wrote that number into the
+        // append-only audit row — the row a dispute is argued from. schema.sql
+        // says in capitals that there is no REAL anywhere in it; SQLite put
+        // one there anyway.
+        //
+        // It was also a divergence: InMemoryStore used Math.addExact and
+        // refused. Two stores that disagree about whether a credit succeeded
+        // is exactly what StoreContractTest exists to catch, and it did not,
+        // because nothing tested the boundary.
+        //
+        // Math.addExact throws rather than wrapping. Refusing a credit is
+        // recoverable; a corrupted balance is not.
+        //
+        // Read-modify-write is safe here despite appearances: the whole method
+        // runs inside transaction {}, which is synchronized on the single
+        // connection, and SQLite serialises writers between processes. A
+        // concurrent writer makes this transaction wait or fail — never lose a
+        // credit silently. The contract test with six racing credits pins it.
+        val before = connection.prepareStatement(
             "SELECT balance_micros FROM customers WHERE id = ?"
         ).use { statement ->
             statement.setString(1, id)
             statement.executeQuery().use { rs -> rs.next(); rs.getLong(1) }
+        }
+        val after = try {
+            Math.addExact(before, request.amountMicros)
+        } catch (overflow: ArithmeticException) {
+            throw Invalid(
+                "that adjustment would overflow the balance " +
+                    "($before + ${request.amountMicros} micro-units)"
+            )
+        }
+        connection.prepareStatement(
+            "UPDATE customers SET balance_micros = ? WHERE id = ?"
+        ).use { statement ->
+            statement.setLong(1, after)
+            statement.setString(2, id)
+            statement.executeUpdate()
         }
         val txn = Transaction(
             id = nextId("txn"),
@@ -522,6 +626,40 @@ class SqlStore(
         )
         return trunk
     }
+
+    /**
+     * Backed by the `idempotency` table, which until now was declared in the
+     * schema and read by nothing — the comment there claimed it was a table
+     * rather than a cache precisely so it would "survive the restart that a
+     * retry may well be reacting to", which was true of the schema and of no
+     * code. It is now true of both.
+     *
+     * Atomicity comes from the PRIMARY KEY: two concurrent claims cannot both
+     * insert, and the loser sees the constraint violation rather than a
+     * check-then-act race.
+     */
+    override fun claimOnce(key: String): Boolean =
+        try {
+            update(
+                "INSERT INTO idempotency (key, body_hash, response, created_at) " +
+                    "VALUES (?,?,?,?)",
+                key, 0, "", now(),
+            )
+            true
+        } catch (duplicate: java.sql.SQLException) {
+            // Only a duplicate key may be swallowed. Anything else — the table
+            // missing, the disk full — must not be reported as "already done",
+            // because that silently DROPS the operation instead of repeating
+            // it, and a dropped /credit is a customer who paid and got
+            // nothing.
+            if (duplicate.message?.contains("UNIQUE", ignoreCase = true) == true ||
+                duplicate.message?.contains("PRIMARY KEY", ignoreCase = true) == true
+            ) {
+                false
+            } else {
+                throw duplicate
+            }
+        }
 
     override fun sipDigestHa1(handle: String, realm: String): String? {
         // The stored HA1 is bound to this store's realm. Asking for a

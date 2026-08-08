@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS rates (
     connect_fee_micros      INTEGER NOT NULL DEFAULT 0,
     increment_seconds       INTEGER NOT NULL DEFAULT 60,
     minimum_seconds         INTEGER NOT NULL DEFAULT 0,
+    -- A rate for a plan that does not exist is a price nothing can charge.
+    FOREIGN KEY (plan_id) REFERENCES plans (id),
     -- One price per prefix per plan, enforced by the database rather than only
     -- by the application. Two prices for one prefix makes the bill depend on
     -- row ordering, and a constraint is the only thing that survives somebody
@@ -63,7 +65,11 @@ CREATE TABLE IF NOT EXISTS customers (
     -- the protocol, not a relaxation of the credential rules -- which is why
     -- sip_password_hash (SHA-256) is kept alongside rather than replaced.
     sip_ha1               TEXT NOT NULL DEFAULT '',
-    created_at            TEXT NOT NULL
+    created_at            TEXT NOT NULL,
+    -- A customer on a plan that does not exist has no prices, so every call
+    -- they make is unrated — which the switch refuses, correctly, as though
+    -- the destination were unknown. Better to make the state unreachable.
+    FOREIGN KEY (plan_id) REFERENCES plans (id)
 );
 
 -- Self-service lookup path: the bot resolves a Telegram user to an account on
@@ -86,7 +92,11 @@ CREATE TABLE IF NOT EXISTS transactions (
     reason                TEXT NOT NULL,
     reference             TEXT,
     created_at            TEXT NOT NULL,
-    actor                 TEXT NOT NULL
+    actor                 TEXT NOT NULL,
+    -- An audit row for a customer who does not exist is evidence about
+    -- nobody, and it is how a deletion elsewhere would quietly orphan the
+    -- money trail.
+    FOREIGN KEY (customer_id) REFERENCES customers (id)
 );
 
 CREATE INDEX IF NOT EXISTS transactions_customer
@@ -110,6 +120,13 @@ CREATE TABLE IF NOT EXISTS trunks (
 -- and then retries. Without this that is a double credit, every time. It is a
 -- TABLE rather than a cache because it has to survive the restart that a
 -- retry may well be reacting to.
+--
+-- That claim was aspirational for a while: the table was declared here and
+-- read by no code, while the only replay protection in the system was an
+-- in-memory map in front of the HTTP API. SqlStore.claimOnce now uses this
+-- table, which is what makes the bot's idempotency survive a restart — and
+-- the restart is the whole scenario, since Telegram redelivers anything the
+-- bot did not acknowledge before it died.
 CREATE TABLE IF NOT EXISTS idempotency (
     key        TEXT PRIMARY KEY,
     body_hash  INTEGER NOT NULL,

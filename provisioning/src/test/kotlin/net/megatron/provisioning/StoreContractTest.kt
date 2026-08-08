@@ -132,6 +132,46 @@ abstract class StoreContractTest {
         )
     }
 
+    @Test
+    fun `two racing creations of one handle produce exactly one customer`() {
+        // A check-then-act on a shared map is not a check under concurrency.
+        // Both callers saw "handle not taken", both inserted, and the result
+        // was two customers with one handle — of whom only one can be exported
+        // to the switch, so the other holds a password that can never work.
+        //
+        // SqlStore had a UNIQUE constraint and reported the clash as an
+        // internal fault rather than a Conflict; InMemoryStore had nothing at
+        // all. Two stores that disagree about whether a duplicate is possible
+        // is precisely what this suite exists to catch.
+        val store = store()
+        val plan = store.createPlan(CreatePlan("Retail", "USD"))
+        val threads = 6
+        val ready = java.util.concurrent.CountDownLatch(threads)
+        val go = java.util.concurrent.CountDownLatch(1)
+        val created = java.util.concurrent.atomic.AtomicInteger()
+        val conflicts = java.util.concurrent.atomic.AtomicInteger()
+
+        val workers = (1..threads).map {
+            Thread {
+                ready.countDown()
+                go.await()
+                try {
+                    store.createCustomer(CreateCustomer("racer", plan.id), "test")
+                    created.incrementAndGet()
+                } catch (expected: Conflict) {
+                    conflicts.incrementAndGet()
+                }
+            }.apply { start() }
+        }
+        ready.await()
+        go.countDown()
+        workers.forEach { it.join(10_000) }
+
+        assertEquals(1, created.get(), "the handle was issued more than once")
+        assertEquals(threads - 1, conflicts.get(), "a racing creation failed as something " +
+            "other than a Conflict, which reaches the API as a 500")
+    }
+
     // -- customers ----------------------------------------------------------
 
     @Test

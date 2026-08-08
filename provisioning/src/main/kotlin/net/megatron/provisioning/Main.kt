@@ -39,6 +39,15 @@ fun main() {
         )
     }
 
+    // ONE REALM, READ ONCE, PASSED TO BOTH.
+    //
+    // The store bakes this into every HA1 it generates, and the exporter asks
+    // for credentials by it. Reading it in two places let them differ: the
+    // store was constructed with its hardcoded default while the exporter read
+    // the environment variable, so setting MEGATRON_SIP_REALM to anything else
+    // meant every lookup missed and the credential file emptied itself.
+    val realm = System.getenv("MEGATRON_SIP_REALM") ?: "sip.megatron.local"
+
     val dbUrl = System.getenv("MEGATRON_DB_URL")
     val store: Store = if (dbUrl.isNullOrBlank()) {
         System.err.println(
@@ -46,15 +55,15 @@ fun main() {
                 "every customer and balance is lost on exit. Set it to something like " +
                 "jdbc:sqlite:/var/lib/megatron/megatron.db before this carries real money."
         )
-        InMemoryStore()
+        InMemoryStore(sipDomain = realm)
     } else {
-        SqlStore(dbUrl)
+        SqlStore(dbUrl, sipDomain = realm)
     }
     val authenticator = Authenticator { token ->
         if (token == operatorToken) Caller.Operator("operator") else null
     }
 
-    startSubscriberExport(store)
+    startSubscriberExport(store, realm)
 
     embeddedServer(Netty, port = port, host = host) {
         provisioningModule(store, IdempotencyStore(), authenticator)
@@ -75,7 +84,7 @@ fun main() {
  * authorizer decides on every call whether an account may spend, live, and it
  * is not reading this file. See SubscriberExport for that split.
  */
-private fun startSubscriberExport(store: Store) {
+private fun startSubscriberExport(store: Store, realm: String) {
     val path = System.getenv("MEGATRON_SUBSCRIBER_FILE")
     if (path.isNullOrBlank()) {
         System.err.println(
@@ -84,15 +93,26 @@ private fun startSubscriberExport(store: Store) {
         )
         return
     }
-    val realm = System.getenv("MEGATRON_SIP_REALM") ?: "sip.megatron.local"
     val seconds = System.getenv("MEGATRON_SUBSCRIBER_INTERVAL_SECONDS")?.toLongOrNull() ?: 15L
     val writer = SubscriberFile(java.nio.file.Path.of(path))
+
+    // WRITING THE FILE IS NOT ENOUGH. OpenSIPS's db_text module reads its
+    // tables into memory ONCE, at startup, and serves them from there. A file
+    // that changes on disk changes nothing until the switch is told to reload.
+    //
+    // Without this, everything downstream looked correct and did nothing: a
+    // new customer's credential reached the file and they still could not
+    // register; a rotated password left the OLD one working indefinitely; a
+    // suspended account kept registering forever. All silent, because from
+    // provisioning's side the write succeeded.
+    val reloader = SwitchReloader(System.getenv("MEGATRON_SWITCH_MI_URL"))
 
     val thread = Thread {
         while (!Thread.currentThread().isInterrupted) {
             try {
                 if (writer.writeFrom(store, realm)) {
                     System.err.println("subscriber file updated: $path")
+                    reloader.reloadSubscribers()
                 }
             } catch (failure: Throwable) {
                 // Never fatal. A provisioning API that dies because a switch's

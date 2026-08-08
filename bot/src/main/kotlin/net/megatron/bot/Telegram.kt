@@ -28,9 +28,34 @@ data class Incoming(
     val chatId: Long,
     val messageId: Long,
     val text: String,
-    /** "private", "group", "supergroup", "channel". */
+    /** "private", "group", "supergroup", "channel", or "unknown". */
     val chatType: String,
-)
+) {
+    /**
+     * Whether this is a one-to-one chat with the operator.
+     *
+     * TWO INDEPENDENT SIGNALS, BOTH REQUIRED, because this is the only thing
+     * standing between a SIP password and permanent group history.
+     *
+     * [chatType] can be absent from a malformed or future update, and an
+     * earlier version defaulted it to "private" — a security control whose
+     * default was the unsafe answer. The chat id settles it independently:
+     * Telegram gives users positive ids and groups, supergroups and channels
+     * negative ones. Requiring both means neither a missing field nor an
+     * unfamiliar chat type can produce a false "private".
+     */
+    val isPrivate: Boolean get() = chatType == "private" && chatId > 0
+}
+
+/**
+ * Telegram could not be reached, or answered with something that was not an
+ * answer — 429, 5xx, an unparseable body, a refused connection.
+ *
+ * Distinct from "there were no updates", and the distinction is load-bearing:
+ * collapsing the two leaves the polling loop unable to tell a quiet minute
+ * from a rate-limit, so its response to being rate-limited is to poll harder.
+ */
+class TelegramUnavailable(message: String) : RuntimeException(message)
 
 /**
  * What the transport needs from Telegram, and nothing more.
@@ -76,8 +101,30 @@ class HttpTelegramApi(
         // ends in a client-side timeout that looks exactly like Telegram being
         // unreachable.
         val response = call("getUpdates", body, Duration.ofSeconds(timeoutSeconds + 10L))
-            ?: return emptyList()
-        return response["result"]?.jsonArray.orEmpty().mapNotNull { parseUpdate(it.jsonObject) }
+            ?: throw TelegramUnavailable("getUpdates did not return a usable response")
+
+        // EVERY UPDATE IS PARSED IN ISOLATION.
+        //
+        // kotlinx's .jsonObject / .jsonPrimitive THROW on a wrong-shaped
+        // field. Parsing the batch as one expression meant a single malformed
+        // update discarded the whole batch AND left the offset where it was --
+        // so the same batch came back, threw again, forever. The guard for
+        // that was one layer lower, in dispatch(), which is never reached.
+        //
+        // One bad update is now one dropped message.
+        val result = try {
+            response["result"]?.jsonArray.orEmpty()
+        } catch (malformed: Exception) {
+            throw TelegramUnavailable("getUpdates result was not an array: $malformed")
+        }
+        return result.mapNotNull { element ->
+            try {
+                parseUpdate(element.jsonObject)
+            } catch (malformed: Exception) {
+                System.err.println("telegram: dropped an unparseable update: $malformed")
+                null
+            }
+        }
     }
 
     override fun sendMessage(chatId: Long, text: String): Boolean {
@@ -130,7 +177,12 @@ class HttpTelegramApi(
             chatId = chat["id"]?.jsonPrimitive?.longOrNull ?: return null,
             messageId = message["message_id"]?.jsonPrimitive?.longOrNull ?: return null,
             text = text,
-            chatType = chat["type"]?.jsonPrimitive?.contentOrNull ?: "private",
+            // "unknown", NOT "private". This field gates whether a SIP
+            // password may be sent to this chat, and the default of a security
+            // control must be the safe answer. See Incoming.isPrivate, which
+            // also requires a positive chat id, so a forged or absent type
+            // cannot produce a false private on its own.
+            chatType = chat["type"]?.jsonPrimitive?.contentOrNull ?: "unknown",
         )
     }
 }
@@ -211,7 +263,7 @@ class BotLoop(
         // never started it -- the group gets an instruction and NOT the
         // password. Falling back to posting it would defeat the entire check
         // at exactly the moment it is doing its job.
-        if (reply.containsSecret && update.chatType != "private") {
+        if (reply.containsSecret && !update.isPrivate) {
             val delivered = api.sendMessage(update.telegramUserId, reply.text)
             val notice = if (delivered) {
                 "Sent to you privately — a SIP password does not belong in a group."
@@ -231,24 +283,65 @@ class BotLoop(
         }
     }
 
-    /** Runs until the thread is interrupted. */
+    /**
+     * Runs until the thread is interrupted.
+     *
+     * IT MUST NOT BE POSSIBLE FOR THIS LOOP TO SPIN.
+     *
+     * A healthy poll blocks at Telegram for [pollSeconds], so iterations are
+     * naturally paced and nothing here has to do anything. The dangerous case
+     * is a poll that returns IMMEDIATELY and empty — which is exactly what a
+     * 429 looks like. Without pacing, the bot's answer to being rate-limited
+     * is to poll flat out, which is the one response guaranteed to keep it
+     * rate-limited.
+     *
+     * So consecutive fast, empty polls back off, doubling to a ceiling. A
+     * single normal poll resets it, because one quiet minute is not a fault.
+     */
     fun run() {
         log("bot: polling")
+        var backoffMs = 0L
         while (!Thread.currentThread().isInterrupted) {
-            try {
-                pollOnce()
+            val started = System.nanoTime()
+            val suspicious = try {
+                val handled = pollOnce()
+                val elapsedMs = (System.nanoTime() - started) / 1_000_000
+                // A long poll that came back in a fraction of its timeout did
+                // not long-poll. Something answered instead of waiting.
+                handled == 0 && elapsedMs < pollSeconds * 250L
             } catch (failure: Exception) {
                 // Telegram being down must not end the process: the bot is the
                 // only way the business is operated, so it has to still be
                 // here when Telegram comes back.
                 log("bot: poll failed, retrying: $failure")
+                true
+            }
+
+            backoffMs = if (suspicious) {
+                (if (backoffMs == 0L) MIN_BACKOFF_MS else backoffMs * 2).coerceAtMost(MAX_BACKOFF_MS)
+            } else {
+                0L
+            }
+
+            if (backoffMs > 0) {
                 try {
-                    Thread.sleep(5000)
+                    Thread.sleep(backoffMs)
                 } catch (stop: InterruptedException) {
                     Thread.currentThread().interrupt()
                 }
             }
         }
+    }
+
+    private companion object {
+        const val MIN_BACKOFF_MS = 250L
+
+        /**
+         * Long enough that a rate-limited bot stops contributing to the
+         * problem; short enough that a returning Telegram is noticed within a
+         * minute, since nothing else operates this business.
+         */
+        const val MAX_BACKOFF_MS = 30_000L
     }
 }
 
@@ -271,14 +364,38 @@ class RateLimit(
         val cutoff = now() - 60_000
         val seen = windows.getOrPut(telegramUserId) { mutableListOf() }
         seen.removeAll { it < cutoff }
-        if (seen.size >= perMinute) return false
-        seen.add(now())
+        val allowed = seen.size < perMinute
+        if (allowed) seen.add(now())
 
-        // Users who stopped talking are forgotten, or this map is a slow leak
-        // that only shows up after the bot has been up for months.
-        if (windows.size > 10_000) {
+        // SWEEP EVERY ENTRY, NOT JUST EMPTY ONES.
+        //
+        // The previous version pruned entries whose list was empty. A list is
+        // only emptied by the stale sweep three lines above, after which
+        // allow() immediately adds a fresh timestamp — so no entry was ever
+        // observed empty and the prune removed nothing, ever. The map kept one
+        // entry per Telegram user id that had ever messaged the bot, for the
+        // life of the process, which is precisely the leak the old comment
+        // claimed to prevent.
+        //
+        // This walks every entry and drops those with nothing inside the
+        // window. It is O(n) and therefore rate-limited itself, by size and by
+        // time, so a busy bot does not pay for it on every message.
+        if (windows.size > SWEEP_ABOVE && now() - lastSweep > SWEEP_INTERVAL_MS) {
+            lastSweep = now()
+            windows.values.forEach { it.removeAll { seenAt -> seenAt < cutoff } }
             windows.entries.removeAll { it.value.isEmpty() }
         }
-        return true
+        return allowed
+    }
+
+    private var lastSweep = 0L
+
+    /** Visible for tests: how many users are currently remembered. */
+    @Synchronized
+    fun trackedUsers(): Int = windows.size
+
+    private companion object {
+        const val SWEEP_ABOVE = 1_000
+        const val SWEEP_INTERVAL_MS = 60_000L
     }
 }

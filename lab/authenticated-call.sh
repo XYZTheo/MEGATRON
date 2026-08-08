@@ -133,7 +133,7 @@ echo "asked the switch to reload it"
 
 step "3. the softphone registers"
 
-printf 'SEQUENTIAL\n%s;labdialer\n' "$REALM" > /tmp/lab-reg.csv
+printf 'SEQUENTIAL\n%s;labdialer;labdialer\n' "$REALM" > /tmp/lab-reg.csv
 timeout 25 sipp -sf "$HERE/sipp-register.xml" 127.0.0.1:5060 \
     -inf /tmp/lab-reg.csv -au labdialer -ap "$PASSWORD" \
     -m 1 -r 1 -timeout 10 -trace_err -error_file /tmp/lab-reg.err > /dev/null 2>&1 \

@@ -56,6 +56,17 @@ object SubscriberExport {
     private val UNSAFE = Regex("[:\\n\\r\\\\]")
 
     /**
+     * What an HA1 may look like: exactly 32 lower-case hex digits.
+     *
+     * Stricter than "contains nothing structural", because the shape is known
+     * exactly. A value that is not an MD5 digest cannot authenticate anyone,
+     * so writing it can only ever produce a customer who mysteriously cannot
+     * log in — better to refuse loudly at export than to publish a row that
+     * looks like a credential and is not.
+     */
+    private val HEX = Regex("^[0-9a-f]{32}$")
+
+    /**
      * @param realm the SIP domain. It is baked into every HA1, so a file
      *   rendered for one realm authenticates nobody on another.
      */
@@ -78,11 +89,43 @@ object SubscriberExport {
                 require(!UNSAFE.containsMatchIn(customer.handle)) {
                     "handle '${customer.handle}' is not safe for db_text"
                 }
-                // A customer created before HA1 was stored has none. Skipping
-                // is correct — they must rotate credentials to get a working
-                // login, and rotation is a Telegram command away. Writing a
-                // placeholder would be a shared password.
+                // A customer created before HA1 was stored has none, including
+                // every row an upgraded database migrated. Skipping is
+                // correct: writing a placeholder would be a password shared by
+                // everyone in that position.
+                //
+                // They recover by having their credentials rotated — `/rotate
+                // <handle>` in the bot, or POST /v1/customers/{id}/credentials.
+                // That command was written because this sentence claimed it
+                // existed and it did not, which made the documented recovery
+                // from "your customers cannot register" a dead end.
                 val ha1 = ha1For(customer.handle)?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+
+                // THE CREDENTIAL IS CHECKED TOO, not just the handle and the
+                // realm. It arrives from a lambda this object does not own —
+                // SqlStore hands back the sip_ha1 column unexamined — so it is
+                // exactly as untrusted as the other two fields, and the
+                // argument written above UNSAFE applies to it word for word.
+                //
+                // A value containing a newline forges an ENTIRE EXTRA
+                // SUBSCRIBER ROW: an account nobody created, with a password
+                // the writer chose, holding a working login for the switch.
+                // One containing ':' shifts every column after it. Anything
+                // with write access to that single column — a bad migration,
+                // an operator with sqlite3, a future import path — gets in.
+                //
+                // HA1 is always generated today, so this is defence in depth.
+                // It is also the standard this file set for itself two fields
+                // earlier, and the reason given there was that the validation
+                // lives somewhere else and the day it moves, the failure here
+                // is silent.
+                require(!UNSAFE.containsMatchIn(ha1)) {
+                    "the stored credential for '${customer.handle}' is not safe for db_text"
+                }
+                require(HEX.matches(ha1)) {
+                    "the stored credential for '${customer.handle}' is not an MD5 digest"
+                }
+
                 "${customer.handle}:$realm:$ha1"
             }
 

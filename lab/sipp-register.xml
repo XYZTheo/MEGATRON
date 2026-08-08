@@ -18,7 +18,15 @@
 
     -au / -ap        the account being AUTHENTICATED as, and its password
     -inf field0      realm / SIP domain
-    -inf field1      the account CLAIMED in From
+    -inf field1      the account claimed in From
+    -inf field2      the account claimed in To — the ADDRESS OF RECORD
+
+  From and To are separate fields because OpenSIPS's registrar takes the AOR
+  from the TO header (RFC 3261 §10.2), not From. A scenario that puts one value
+  in both cannot exercise the takeover where a caller authenticates correctly,
+  satisfies a From check, and registers a binding for somebody else — which is
+  exactly the hole an earlier config had, and exactly why an earlier version of
+  this file could not see it.
 
   The credentials cannot be injection fields: SIPp substitutes [fieldN] before
   it parses keywords, so [authentication username=[field1]] does not nest --
@@ -39,7 +47,7 @@
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
       Max-Forwards: 70
       From: <sip:[field1]@[field0]>;tag=[call_number]
-      To: <sip:[field1]@[field0]>
+      To: <sip:[field2]@[field0]>
       Call-ID: [call_id]
       CSeq: 1 REGISTER
       Contact: <sip:[field1]@[local_ip]:[local_port]>
@@ -60,7 +68,7 @@
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
       Max-Forwards: 70
       From: <sip:[field1]@[field0]>;tag=[call_number]
-      To: <sip:[field1]@[field0]>
+      To: <sip:[field2]@[field0]>
       Call-ID: [call_id]
       CSeq: 2 REGISTER
       Contact: <sip:[field1]@[local_ip]:[local_port]>

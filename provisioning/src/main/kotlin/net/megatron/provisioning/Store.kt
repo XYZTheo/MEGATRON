@@ -69,6 +69,25 @@ interface Store {
      * be returned by accident as part of a Customer object.
      */
     fun sipDigestHa1(handle: String, realm: String): String?
+
+    /**
+     * Claims [key] for a one-time operation. True the first time, false ever
+     * after.
+     *
+     * FOR CALLERS THAT REACH THE STORE DIRECTLY, which the Telegram bot does.
+     * The HTTP API gets replay protection from its Idempotency-Key middleware;
+     * the bot does not go through HTTP, so before this existed its idempotency
+     * key was written into an audit field and never checked. Telegram
+     * redelivers any update the bot has not acknowledged, so a restart between
+     * handling a `/credit` and the next poll credited the account twice.
+     *
+     * It must be DURABLE to be worth anything — the restart is the scenario —
+     * which is why it is on the Store and not a map in the bot.
+     *
+     * It must also be ATOMIC: two threads claiming the same key must see one
+     * true and one false, or concurrent retries defeat it entirely.
+     */
+    fun claimOnce(key: String): Boolean
 }
 
 /**
@@ -78,8 +97,18 @@ interface Store {
  * has already committed, and it WILL retry. Without this, that is a double
  * credit — every time — and the operator finds out from the balance sheet.
  */
-class IdempotencyStore {
-    private data class Entry(val bodyHash: Int, val response: String)
+class IdempotencyStore(
+    /**
+     * How long a key is remembered.
+     *
+     * A retry arrives seconds after the original, not days. Remembering
+     * forever bought nothing and cost unbounded memory — see [remember].
+     */
+    private val retainMillis: Long = 24 * 60 * 60 * 1000L,
+    private val maxEntries: Int = 100_000,
+    private val now: () -> Long = System::currentTimeMillis,
+) {
+    private data class Entry(val bodyHash: Int, val response: String, val storedAt: Long)
 
     private val entries = ConcurrentHashMap<String, Entry>()
 
@@ -96,7 +125,33 @@ class IdempotencyStore {
     }
 
     fun remember(key: String, bodyHash: Int, response: String) {
-        entries[key] = Entry(bodyHash, response)
+        entries[key] = Entry(bodyHash, response, now())
+
+        // BOUNDED, BECAUSE IT HOLDS FULL RESPONSE BODIES.
+        //
+        // This was a ConcurrentHashMap with no eviction at all: one entry per
+        // mutating request ever made, each carrying the entire response, for
+        // the life of the process. On a service that is meant to run for
+        // months that is a memory leak with a customer record in every slot.
+        //
+        // Eviction is by age first — a retry follows its original by seconds,
+        // so a day is already generous — and by size as a hard backstop,
+        // because a flood of unique keys must not be able to exhaust memory
+        // faster than the age sweep can help.
+        if (entries.size > maxEntries) {
+            val cutoff = now() - retainMillis
+            entries.entries.removeAll { it.value.storedAt < cutoff }
+            // Still over after the sweep means the traffic is genuinely recent
+            // — drop the oldest rather than let the map grow without limit.
+            // Losing replay protection on the oldest keys is the right thing
+            // to give up: those requests completed long ago.
+            if (entries.size > maxEntries) {
+                entries.entries
+                    .sortedBy { it.value.storedAt }
+                    .take(entries.size - maxEntries)
+                    .forEach { entries.remove(it.key) }
+            }
+        }
     }
 
     val size: Int get() = entries.size
@@ -114,7 +169,19 @@ class InMemoryStore(
 ) : Store {
 
     private val customers = ConcurrentHashMap<String, Customer>()
-    private val passwords = ConcurrentHashMap<String, String>()
+    // NO MAP OF PLAINTEXT PASSWORDS. There used to be one — `passwords`,
+    // written at creation and at rotation and READ NOWHERE. An unbounded,
+    // live, plaintext copy of every SIP password ever issued, sitting in any
+    // heap dump or core file, for no purpose at all.
+    //
+    // SqlStore has never had an equivalent, and says so: "not recoverable
+    // afterwards by anybody — including us". The two stores disagreed about
+    // the single most sensitive value in the system, and the doc a few lines
+    // below claimed a second copy of the plaintext "does not exist" while it
+    // was declared directly above the sentence.
+    //
+    // A password is generated, returned once, and reduced to HA1. Nothing
+    // else keeps it.
     /**
      * handle -> HA1, computed once at creation for THIS store's realm.
      *
@@ -127,6 +194,16 @@ class InMemoryStore(
      * password that then does not exist.
      */
     private val ha1ByHandle = ConcurrentHashMap<String, String>()
+
+    /**
+     * handle -> customer id, the uniqueness constraint this store lacked.
+     *
+     * Exists so a handle can be CLAIMED atomically at creation. SqlStore gets
+     * the same guarantee from a UNIQUE column; without this the two stores
+     * disagreed about whether two customers could share a handle, which is
+     * exactly the divergence StoreContractTest exists to prevent.
+     */
+    private val handles = ConcurrentHashMap<String, String>()
     private val plans = ConcurrentHashMap<String, Plan>()
     private val rates = ConcurrentHashMap<String, List<RateRow>>()
     private val trunks = ConcurrentHashMap<String, Trunk>()
@@ -177,11 +254,20 @@ class InMemoryStore(
             throw Invalid("opening_balance_micros must not be negative")
         }
         val plan = plans[request.planId] ?: throw NotFound("plan '${request.planId}'")
-        if (findByHandle(request.handle) != null) {
-            throw Conflict("a customer with handle '${request.handle}' already exists")
-        }
 
         val id = nextId("cust")
+        // CLAIM THE HANDLE ATOMICALLY, rather than checking and then inserting.
+        //
+        // A check-then-act on a shared map is not a check at all under
+        // concurrency: two creations of the same handle both saw "not taken"
+        // and both inserted, producing TWO customers with one handle — and
+        // since the exporter renders one row per handle, one of them received
+        // a password that could never work. SqlStore has a UNIQUE constraint;
+        // this store had nothing, so the two implementations disagreed about
+        // whether a duplicate was possible.
+        if (handles.putIfAbsent(request.handle, id) != null) {
+            throw Conflict("a customer with handle '${request.handle}' already exists")
+        }
         val password = generatePassword()
         val customer = Customer(
             id = id,
@@ -196,7 +282,6 @@ class InMemoryStore(
             createdAt = now(),
         )
         customers[id] = customer
-        passwords[id] = password
         ha1ByHandle[request.handle] = ha1(request.handle, sipDomain, password)
 
         if (request.openingBalanceMicros > 0) {
@@ -259,7 +344,6 @@ class InMemoryStore(
     override fun rotateCredentials(id: String): SipCredentials {
         val customer = getCustomer(id)
         val password = generatePassword()
-        passwords[id] = password
         // Rotates with the password. A stale HA1 means the old password still
         // registers, which is a rotation that rotates nothing.
         ha1ByHandle[customer.handle] = ha1(customer.handle, sipDomain, password)
@@ -281,7 +365,18 @@ class InMemoryStore(
         // and the bot, can credit the same customer at the same moment.
         while (true) {
             val current = getCustomer(id)
-            val after = Math.addExact(current.balanceMicros, request.amountMicros)
+            // Invalid, not a raw ArithmeticException: the two stores must
+            // refuse identically, and an ArithmeticException escapes the API's
+            // StatusPages handlers as a 500 — an internal fault, when this is
+            // a rejected request. SqlStore does the same.
+            val after = try {
+                Math.addExact(current.balanceMicros, request.amountMicros)
+            } catch (overflow: ArithmeticException) {
+                throw Invalid(
+                    "that adjustment would overflow the balance " +
+                        "(${current.balanceMicros} + ${request.amountMicros} micro-units)"
+                )
+            }
             val updated = current.copy(balanceMicros = after)
             if (customers.replace(id, current, updated)) {
                 val txn = Transaction(
@@ -399,6 +494,15 @@ class InMemoryStore(
     }
 
     override fun listTrunks(): List<Trunk> = trunks.values.sortedBy { it.id }
+
+    /**
+     * Not durable, because nothing in this store is. It is still atomic, so
+     * the concurrency half of the contract holds and the contract suite tests
+     * the same behaviour against both implementations.
+     */
+    private val claimed = ConcurrentHashMap.newKeySet<String>()
+
+    override fun claimOnce(key: String): Boolean = claimed.add(key)
 
     override fun sipDigestHa1(handle: String, realm: String): String? {
         // Same rule as SqlStore: this store holds credentials for exactly one

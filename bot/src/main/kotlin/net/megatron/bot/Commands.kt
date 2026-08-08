@@ -58,20 +58,58 @@ fun parseMoney(raw: String): Long {
     val body = text.removePrefix("-")
     val whole = body.substringBefore('.')
     val fraction = body.substringAfter('.', "").padEnd(6, '0')
-    val micros = Math.addExact(
-        Math.multiplyExact(whole.toLong(), 1_000_000L),
-        fraction.toLong()
-    )
+    // BOTH OVERFLOW PATHS BECOME Invalid, WHICH IS WHAT THIS IS.
+    //
+    // "99999999999999999999" satisfies the regex above and then fails in
+    // whole.toLong() with NumberFormatException; a smaller-but-still-huge
+    // number survives that and fails in multiplyExact with
+    // ArithmeticException. Neither is an internal fault — the operator typed
+    // a number too big to be money — but both used to escape this function
+    // unconverted, past the handler that catches Invalid, out to the
+    // transport, which logged "dropped update" and SENT NOTHING. The operator
+    // saw silence and their next move was to send it again.
+    val micros = try {
+        Math.addExact(Math.multiplyExact(whole.toLong(), 1_000_000L), fraction.toLong())
+    } catch (tooBig: NumberFormatException) {
+        throw Invalid("'$raw' is too large to be an amount")
+    } catch (tooBig: ArithmeticException) {
+        throw Invalid("'$raw' is too large to be an amount")
+    }
     return if (negative) -micros else micros
 }
 
+/**
+ * Money for a human to read.
+ *
+ * TWO DECIMALS, EXCEPT WHEN TWO DECIMALS WOULD LIE.
+ *
+ * Balances are micro-units and telephony rates are routinely fractions of a
+ * cent, so truncating to 2dp made `/credit acme 0.005 promo` — a real movement
+ * of 5,000 micros — reply "0.00 -> balance 0.00". The operator's only
+ * confirmation that a money command did anything said it did nothing, which
+ * invites them to run it again.
+ *
+ * So a value that is not exact at 2dp is shown at full micro precision
+ * instead. Ugly on those values, and being ugly is the point: an unusual
+ * number should look unusual.
+ */
 fun formatMoney(micros: Long, currency: String = ""): String {
     val negative = micros < 0
     val abs = if (negative) -micros else micros
-    val whole = abs / 1_000_000L
-    val cents = (abs % 1_000_000L) / 10_000L
+    val sign = if (negative) "-" else ""
     val suffix = if (currency.isEmpty()) "" else " $currency"
-    return "${if (negative) "-" else ""}$whole.${cents.toString().padStart(2, '0')}$suffix"
+    val whole = abs / 1_000_000L
+    val fraction = abs % 1_000_000L
+
+    // Exact at 2dp when the remainder is a whole number of cents.
+    if (fraction % 10_000L == 0L) {
+        val cents = fraction / 10_000L
+        return "$sign$whole.${cents.toString().padStart(2, '0')}$suffix"
+    }
+    // Otherwise show every digit that exists, with trailing zeroes trimmed so
+    // 0.0005 does not become 0.000500.
+    val digits = fraction.toString().padStart(6, '0').trimEnd('0')
+    return "$sign$whole.$digits$suffix"
 }
 
 /**
@@ -113,10 +151,10 @@ class CommandEngine(
 
     fun reply(telegramUserId: Long, chatId: Long, messageId: Long, text: String): Reply {
         val command = parseCommand(text)
-        // Only /newuser hands back a credential. Listed by VERB rather than by
-        // scanning the reply text: a scan finds whatever it was taught to look
-        // for and silently misses the next command that returns a secret.
-        val secret = command?.verb == "newuser" && roles.isOperator(telegramUserId)
+        // Listed by VERB rather than by scanning the reply text: a scan finds
+        // whatever it was taught to look for and silently misses the next
+        // command that returns a secret. See SECRET_REPLIES.
+        val secret = command?.verb in SECRET_REPLIES && roles.isOperator(telegramUserId)
         return Reply(handleText(telegramUserId, chatId, messageId, text), secret)
     }
 
@@ -139,6 +177,14 @@ class CommandEngine(
                 "cli", "callerid" -> setCallerId(telegramUserId, command.args, actor)
 
                 // -- operator ----------------------------------------------
+                //
+                // These two are wrapped in onlyOnce because they are the two
+                // that change the world irreversibly: one moves money, the
+                // other creates an account and issues a credential. Everything
+                // else in this list is idempotent by nature -- suspending a
+                // suspended customer, or reading a balance twice, costs
+                // nothing -- so guarding them would add a failure mode without
+                // removing one.
                 "newuser" -> operatorOnly(telegramUserId) {
                     newUser(command.args, actor, key)
                 }
@@ -151,6 +197,11 @@ class CommandEngine(
                 "enable" -> operatorOnly(telegramUserId) {
                     setStatus(command.args, CustomerStatus.ACTIVE, actor)
                 }
+                // Not guarded by claimOnce. Rotating twice is not harmful the
+                // way crediting twice is -- the second rotation simply wins --
+                // and a customer whose password has leaked must never be told
+                // "already done" when they ask for a new one.
+                "rotate" -> operatorOnly(telegramUserId) { rotate(command.args) }
                 "who" -> operatorOnly(telegramUserId) { who(command.args) }
                 "users" -> operatorOnly(telegramUserId) { users() }
 
@@ -166,6 +217,23 @@ class CommandEngine(
             "That did not work: ${e.message}"
         } catch (e: net.megatron.provisioning.Conflict) {
             "Cannot do that: ${e.message}"
+        } catch (e: ArithmeticException) {
+            // parseMoney throws this on an amount too large to hold in micros.
+            // It used to escape to the transport, which logged "dropped
+            // update" and sent NOTHING -- so the operator saw silence,
+            // indistinguishable from the bot being down, and their next move
+            // was to send it again.
+            "That amount is too large to handle."
+        } catch (e: Exception) {
+            // NOTHING REACHES THE OPERATOR AS SILENCE.
+            //
+            // Every unhandled type above was a command that ran, or failed to
+            // run, with no reply -- and an operator who gets no answer retries,
+            // which on a money command is the worst possible response to an
+            // error. The detail goes to the log; they get an answer.
+            System.err.println("bot: unhandled failure on '${command.verb}': $e")
+            "Something went wrong handling that. It has been logged; nothing was changed " +
+                "unless you see a confirmation."
         }
     }
 
@@ -178,6 +246,42 @@ class CommandEngine(
 
     private companion object {
         const val UNKNOWN_COMMAND = "Unknown command. Send /help."
+
+        /**
+         * Commands whose reply contains a credential.
+         *
+         * Listed by VERB, never by scanning the reply text for something that
+         * looks like a password: a scanner finds what it was taught to look
+         * for and silently misses the next command that returns a secret. This
+         * list is the one place to update when a command starts handing one
+         * out — and forgetting it means a SIP password in permanent group
+         * history.
+         */
+        val SECRET_REPLIES = setOf("newuser", "rotate")
+
+        /**
+         * The reply when an operation has already been performed under this
+         * message's key.
+         *
+         * WHY A CLAIM IS NEEDED AT ALL. The key was already derived from
+         * chat_id and message_id — stable across a retry, which is the hard
+         * part — and then passed to `BalanceAdjustment.reference`, a free-text
+         * audit field nothing compares. The HTTP API deduplicates on
+         * Idempotency-Key, but the bot reaches the Store directly and never
+         * crosses that middleware, so the key was recorded and never checked.
+         *
+         * The scenario it must survive: an operator sends `/credit acme 500`,
+         * the bot handles it, and the process dies before its next poll
+         * acknowledges the update. Telegram redelivers anything
+         * unacknowledged, and the offset — being per-process — restarts at
+         * zero. Without a durable claim that is a second five hundred dollars.
+         *
+         * It says plainly that nothing changed. Reporting success would be
+         * worse than the double-credit it prevents, because the operator would
+         * believe a second top-up had landed.
+         */
+        const val ALREADY_DONE =
+            "Already done — that message was handled before, so nothing changed."
     }
 
     private fun help(operator: Boolean): String = buildString {
@@ -192,6 +296,7 @@ class CommandEngine(
             appendLine("/credit <handle> <amount> <why>  add balance")
             appendLine("/suspend <handle> <why>          stop their calls")
             appendLine("/enable <handle> <why>           let them call again")
+            appendLine("/rotate <handle>                 issue a new password")
             appendLine("/who <handle>                    one account")
             appendLine("/users                           everyone")
         }
@@ -222,6 +327,11 @@ class CommandEngine(
 
     private fun newUser(args: List<String>, actor: String, key: String): String {
         if (args.size < 2) return "Use: /newuser <handle> <plan-id>"
+        // Claimed AFTER validation and immediately before the mutation. An
+        // earlier version claimed it in the dispatcher, which meant a mistyped
+        // command consumed the key -- so the operator corrected their typo,
+        // sent it again, and was told "Already done" while no account existed.
+        if (!store.claimOnce(key)) return ALREADY_DONE
         val (customer, credentials) = store.createCustomer(
             CreateCustomer(
                 handle = args[0],
@@ -245,12 +355,45 @@ class CommandEngine(
         }
     }
 
+    /**
+     * A new SIP password for an existing customer.
+     *
+     * IT EXISTS BECAUSE SOMETHING ELSE ALREADY DEPENDED ON IT. SubscriberExport
+     * skips any customer with no stored digest credential — every account
+     * created before HA1 was stored, and every one migrated into an upgraded
+     * database — and told them that "rotation is a Telegram command away". It
+     * was not; rotation was reachable only through the HTTP API. The documented
+     * recovery from "your customers cannot register" did not exist.
+     *
+     * The reply carries a password, so it is treated as a secret by the
+     * transport and never posted into a group.
+     */
+    private fun rotate(args: List<String>): String {
+        val handle = args.firstOrNull() ?: return "Use: /rotate <handle>"
+        val customer = store.findByHandle(handle) ?: throw NotFound("customer '$handle'")
+        val credentials = store.rotateCredentials(customer.id)
+        return buildString {
+            appendLine("New password for ${customer.handle}.")
+            appendLine()
+            appendLine("Server:   ${credentials.sipDomain}")
+            appendLine("Username: ${credentials.sipUsername}")
+            appendLine("Password: ${credentials.sipPassword}")
+            appendLine()
+            appendLine("The old password stops working as soon as the switch reloads.")
+            append("This password is shown once and cannot be looked up again.")
+        }
+    }
+
     private fun credit(args: List<String>, actor: String, key: String): String {
         if (args.size < 3) return "Use: /credit <handle> <amount> <reason>"
         val customer = store.findByHandle(args[0])
             ?: throw NotFound("customer '${args[0]}'")
         val amount = parseMoney(args[1])
         val reason = args.drop(2).joinToString(" ")
+        // Last thing before the money moves, and after every way this command
+        // can be rejected. A key consumed by a rejected command is a key that
+        // blocks the operator's corrected retry.
+        if (!store.claimOnce(key)) return ALREADY_DONE
         val txn = store.adjustBalance(
             customer.id,
             BalanceAdjustment(amount, reason, reference = key),

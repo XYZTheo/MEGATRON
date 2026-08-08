@@ -163,10 +163,17 @@ class CommandEngineTest {
     }
 
     @Test
-    fun `money formatting rounds down to cents for display only`() {
+    fun `money formatting shows cents, and more when cents would lie`() {
+        // REWRITTEN. This previously asserted formatMoney(129_999) == "0.12",
+        // pinning truncation as intended behaviour. It is not: telephony rates
+        // are routinely fractions of a cent, so truncating made a real credit
+        // of 5,000 micros reply "0.00 -> balance 0.00" — the operator's only
+        // confirmation of a money command saying nothing happened.
+        //
+        // Two decimals when they are exact; every digit when they are not.
         assertEquals("25.00 USD", formatMoney(25_000_000, "USD"))
-        assertEquals("0.12", formatMoney(129_999))
         assertEquals("-3.50", formatMoney(-3_500_000))
+        assertEquals("0.129999", formatMoney(129_999))
     }
 
     // -- command parsing ----------------------------------------------------

@@ -31,7 +31,7 @@
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
       Max-Forwards: 70
       From: <sip:[field1]@[field0]>;tag=[call_number]
-      To: <sip:[field1]@[field0]>
+      To: <sip:[field2]@[field0]>
       Call-ID: [call_id]
       CSeq: 1 REGISTER
       Contact: <sip:[field1]@[local_ip]:[local_port]>
@@ -51,7 +51,7 @@
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
       Max-Forwards: 70
       From: <sip:[field1]@[field0]>;tag=[call_number]
-      To: <sip:[field1]@[field0]>
+      To: <sip:[field2]@[field0]>
       Call-ID: [call_id]
       CSeq: 2 REGISTER
       Contact: <sip:[field1]@[local_ip]:[local_port]>

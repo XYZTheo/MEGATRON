@@ -250,18 +250,46 @@ class HttpTelegramApiTest {
     }
 
     @Test
-    fun `a non-200 response yields no updates rather than an exception`() {
-        // Telegram returns 429 under rate limiting and 5xx when it is unwell.
-        // Neither may take the bot down: it is the only way the business is
-        // operated, so it has to still be running when Telegram recovers.
+    fun `a non-200 response is reported as unavailable, not as no updates`() {
+        // REWRITTEN. This test previously asserted that a 429 yields an empty
+        // list, on the reasoning that nothing may take the bot down -- true,
+        // and it does not follow. Collapsing "Telegram said 429 in 3ms" into
+        // the same value as "Telegram was quiet for 30 seconds" left the
+        // polling loop with nothing to pace it, so the bot's response to being
+        // rate-limited was to poll flat out. The test pinned the defect.
+        //
+        // The exception is caught by BotLoop.run(), which backs off. Nothing
+        // takes the bot down; it now knows the difference.
         status = 429
         response = """{"ok":false,"parameters":{"retry_after":30}}"""
-        assertEquals(emptyList(), api.getUpdates(0, 1))
+        kotlin.test.assertFailsWith<TelegramUnavailable> { api.getUpdates(0, 1) }
     }
 
     @Test
-    fun `a malformed body yields no updates rather than an exception`() {
+    fun `a malformed body is reported as unavailable`() {
         response = "this is not json"
-        assertEquals(emptyList(), api.getUpdates(0, 1))
+        kotlin.test.assertFailsWith<TelegramUnavailable> { api.getUpdates(0, 1) }
+    }
+
+    @Test
+    fun `one malformed update does not discard the whole batch`() {
+        // kotlinx's .jsonObject and .jsonPrimitive THROW on a wrong-shaped
+        // field. Parsing the batch as a single expression meant one bad update
+        // discarded every good one alongside it AND left the offset unmoved,
+        // so the same batch returned and threw again, forever -- the exact
+        // wedge the loop's own guard was written to prevent, one layer too low
+        // to catch it.
+        response = """
+        {"ok":true,"result":[
+          {"update_id":1,"message":{"message_id":1,"from":{"id":"not-a-number"},
+            "chat":{"id":555,"type":"private"},"text":"/help"}},
+          {"update_id":2,"message":{"message_id":2,"from":{"id":555},
+            "chat":{"id":555,"type":"private"},"text":"/balance"}}
+        ]}
+        """.trimIndent()
+
+        val updates = api.getUpdates(0, 1)
+        assertEquals(1, updates.size, "a good update was discarded with the bad one")
+        assertEquals("/balance", updates.single().text)
     }
 }

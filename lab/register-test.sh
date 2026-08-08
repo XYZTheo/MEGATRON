@@ -42,8 +42,12 @@ inject() {
 # failing it.
 run() {
     local name=$1 scenario=$2 realm=$3 authuser=$4 password=$5 fromuser=$6
+    # The To user defaults to the From user, which is what a real phone sends.
+    # It is a separate parameter because the registrar takes the AOR from To,
+    # so a scenario that cannot make them differ cannot test the takeover.
+    local touser=${7:-$fromuser}
     local inf="$WORK/$name.csv"
-    inject "$inf" "$realm" "$fromuser"
+    inject "$inf" "$realm" "$fromuser" "$touser"
 
     # -au/-ap rather than injection fields: SIPp substitutes [fieldN] before
     # it parses keywords, so [authentication username=[field1]] does not nest.
@@ -90,7 +94,22 @@ echo "3. an account that does not exist"
 run unknown-user   sipp-register-denied.xml "$REALM" ghost   "$PASSWORD" ghost
 
 echo "4. a valid login claiming somebody else's account in From"
-run from-spoof     sipp-register-denied.xml "$REALM" bigcorp "$PASSWORD" victim
+# From says victim, To says bigcorp. The AOR is correct, so this reaches the
+# From check specifically -- with To also set to victim, the AOR check fires
+# first and this branch is never exercised at all.
+run from-spoof     sipp-register-denied.xml "$REALM" bigcorp "$PASSWORD" victim bigcorp
+
+echo "4b. a valid login registering somebody else's ADDRESS OF RECORD"
+# THE ONE THAT ACTUALLY TAKES OVER AN ACCOUNT.
+#
+# From says bigcorp, so a From-only check is satisfied; To says victim, and To
+# is what the registrar binds. Without this case the config checked the wrong
+# header for a whole day and every test still passed, because the scenario put
+# the same user in both.
+#
+# Success here means: a customer with a valid login receives another
+# customer's inbound calls, with no protocol violation anywhere.
+run aor-spoof      sipp-register-denied.xml "$REALM" bigcorp "$PASSWORD" bigcorp victim
 
 echo
 echo "5. a wrong password and an unknown account are indistinguishable"
@@ -140,14 +159,17 @@ else
 fi
 
 echo
-echo "7. the switch logged the spoof attempt (a silent refusal teaches nobody)"
-if sudo journalctl -t opensips --since '-2 min' 2>/dev/null | grep -q 'IDENTITY MISMATCH'; then
-    echo "  PASS  the identity mismatch was logged"
-    pass=$((pass + 1))
-else
-    echo "  FAIL  nothing in the log about the spoof attempt"
-    fail=$((fail + 1))
-fi
+echo "7. the switch logged both spoof attempts (a silent refusal teaches nobody)"
+LOG=$(sudo journalctl -t opensips --since '-3 min' 2>/dev/null)
+for pattern in 'IDENTITY MISMATCH' 'AOR MISMATCH'; do
+    if echo "$LOG" | grep -q "$pattern"; then
+        echo "  PASS  '$pattern' was logged"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL  nothing in the log about '$pattern'"
+        fail=$((fail + 1))
+    fi
+done
 
 echo
 echo "$pass passed, $fail failed"
