@@ -13,6 +13,19 @@ on a public interface.
 
 Point `sip.example.com` at the box, and it is a switch.
 
+Then prove it:
+
+```sh
+sudo bash deploy/smoke-test.sh
+```
+
+That creates a throwaway carrier, plan and customer, registers a softphone
+against the real switch, places a call, and checks the balance moved by
+exactly what the rate says. The installer's own checks confirm each process is
+*up*; this one confirms the thing that matters, which is that a call gets
+authorized, connected and charged. A switch can be running, answering, and
+billing nothing — and that looks like a quiet week.
+
 ## What you get
 
 | | |
