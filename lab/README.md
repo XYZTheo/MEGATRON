@@ -51,7 +51,8 @@ bill.*
 | [`sipp-call-authenticated.xml`](sipp-call-authenticated.xml) | A registered customer placing a call, answering a 407 |
 | [`dbtext-setup.sh`](dbtext-setup.sh) | Seeds the credential file OpenSIPS reads |
 | [`one-call.sh`](one-call.sh) · [`one-call-with-audio.sh`](one-call-with-audio.sh) | Build, start everything, place the call, check the balance |
-| [`register-test.sh`](register-test.sh) | 8 checks: a login, three forgeries, and the enumeration oracle |
+| [`sipp-call-authenticated-audio.xml`](sipp-call-authenticated-audio.xml) | The same, sending real G.711 |
+| [`register-test.sh`](register-test.sh) | 10 checks: a login, four forgeries, and the enumeration oracle |
 | [`authenticated-call.sh`](authenticated-call.sh) | The whole business: create a customer, log in, call, bill |
 
 ```sh
@@ -222,6 +223,21 @@ at will. Deliberately *not* the same test as "no dialog found": a matched call
 with a missing dialog still needs settling from the server clock. The
 distinction is **"I cannot measure this call"** versus **"this is not a
 call"**.
+
+## The script was testing itself
+
+`authenticated-call.sh` used to call OpenSIPS's `dbt_reload` with a curl of its
+own, right after checking that the credential file had been written. So it
+passed whether or not **provisioning** made that call — and provisioning did
+not. Nothing in the product told the switch to re-read the file, which meant a
+new customer could never register, a rotated password left the old one working
+indefinitely, and a suspended account kept registering. All silent, because
+from provisioning's side the write succeeded.
+
+The curl is gone. `SwitchReloader` owns it, and step 3 — the softphone
+registering — now fails if the service ever stops making that call.
+
+A test that performs the step it is testing proves nothing about the product.
 
 ## What is still missing
 
