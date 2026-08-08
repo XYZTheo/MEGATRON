@@ -54,7 +54,65 @@ fun main() {
         if (token == operatorToken) Caller.Operator("operator") else null
     }
 
+    startSubscriberExport(store)
+
     embeddedServer(Netty, port = port, host = host) {
         provisioningModule(store, IdempotencyStore(), authenticator)
     }.start(wait = true)
+}
+
+/**
+ * Keeps the switch's credential file in step with the customer list.
+ *
+ * A poll rather than a hook on every write, deliberately. Rendering inside the
+ * request path would put a filesystem write between a customer's top-up and
+ * its response, and would fail the request if the disk did — a provisioning
+ * API that refuses to take money because a switch's credential file could not
+ * be written has the dependency exactly backwards.
+ *
+ * The interval is what bounds how long a NEW customer waits for a login and
+ * how long a CLOSED one keeps registering. Neither is a money question: the
+ * authorizer decides on every call whether an account may spend, live, and it
+ * is not reading this file. See SubscriberExport for that split.
+ */
+private fun startSubscriberExport(store: Store) {
+    val path = System.getenv("MEGATRON_SUBSCRIBER_FILE")
+    if (path.isNullOrBlank()) {
+        System.err.println(
+            "NOTE: MEGATRON_SUBSCRIBER_FILE is not set, so no credential file is being " +
+                "written. Customers created here will not be able to register until it is."
+        )
+        return
+    }
+    val realm = System.getenv("MEGATRON_SIP_REALM") ?: "sip.megatron.local"
+    val seconds = System.getenv("MEGATRON_SUBSCRIBER_INTERVAL_SECONDS")?.toLongOrNull() ?: 15L
+    val writer = SubscriberFile(java.nio.file.Path.of(path))
+
+    val thread = Thread {
+        while (!Thread.currentThread().isInterrupted) {
+            try {
+                if (writer.writeFrom(store, realm)) {
+                    System.err.println("subscriber file updated: $path")
+                }
+            } catch (failure: Throwable) {
+                // Never fatal. A provisioning API that dies because a switch's
+                // credential file could not be written takes the business
+                // offline over a file the business can run without for a few
+                // seconds. Loud, though: silence here is customers who cannot
+                // log in and no reason given.
+                System.err.println("WARNING: could not write $path: $failure")
+            }
+            try {
+                Thread.sleep(seconds * 1000)
+            } catch (stop: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+    }
+    // Daemon: this must never be the thread that keeps a shutting-down process
+    // alive.
+    thread.isDaemon = true
+    thread.name = "subscriber-export"
+    thread.start()
+    System.err.println("writing $path every ${seconds}s for realm $realm")
 }
