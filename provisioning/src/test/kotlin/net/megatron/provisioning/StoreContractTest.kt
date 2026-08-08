@@ -1,6 +1,8 @@
 ﻿package net.megatron.provisioning
 
 import java.nio.file.Files
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import kotlin.io.path.absolutePathString
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -35,6 +37,99 @@ abstract class StoreContractTest {
             "test",
         )
         return plan to customer
+    }
+
+    // -- sip digest credentials ---------------------------------------------
+    //
+    // These decide whether a customer's softphone can register at all. Every
+    // one of them is a failure that presents to the customer as "Zoiper says
+    // Forbidden" with nothing in the logs to explain it.
+
+    /**
+     * The reference HA1, computed here independently of the production code.
+     *
+     * Written out longhand rather than by calling the store's own helper: a
+     * test that asks the implementation to check itself passes just as
+     * happily when the implementation is wrong. The expected values below are
+     * what a softphone will compute, which is the only definition that
+     * matters.
+     */
+    private fun referenceHa1(user: String, realm: String, password: String): String =
+        java.security.MessageDigest.getInstance("MD5")
+            .digest("$user:$realm:$password".toByteArray())
+            .joinToString("") { "%02x".format(it) }
+
+    @Test
+    fun `the stored digest credential is the one a softphone will compute`() {
+        val store = store()
+        val plan = store.createPlan(CreatePlan("Retail", "USD"))
+        val credentials = store.createCustomer(CreateCustomer("dialer", plan.id), "t").second
+
+        assertEquals(
+            referenceHa1("dialer", credentials.sipDomain, credentials.sipPassword),
+            store.sipDigestHa1("dialer", credentials.sipDomain),
+            "the stored HA1 does not match the password the customer was handed",
+        )
+    }
+
+    @Test
+    fun `rotating the password rotates the digest credential with it`() {
+        // A rotation that leaves a stale HA1 behind is a rotation that rotates
+        // nothing: the old password still registers, and the customer who
+        // asked for a new one because the old leaked is no better off.
+        val store = store()
+        val (_, customer) = seed(store)
+
+        val before = store.sipDigestHa1("bigcorp", "sip.megatron.local")
+        val rotated = store.rotateCredentials(customer.id)
+        val after = store.sipDigestHa1("bigcorp", rotated.sipDomain)
+
+        assertNotEquals(before, after, "the old password would still register")
+        assertEquals(
+            referenceHa1("bigcorp", rotated.sipDomain, rotated.sipPassword),
+            after,
+            "after rotation the new password does not authenticate",
+        )
+    }
+
+    @Test
+    fun `an unknown handle has no digest credential`() {
+        // Must be null, not an empty string or a hash of nothing. Anything
+        // that looks like a credential invites the registrar to compare
+        // against it, and a comparison against a fixed value is a password
+        // every non-existent account shares.
+        val store = store()
+        seed(store)
+        assertNull(store.sipDigestHa1("nobody", "sip.megatron.local"))
+    }
+
+    @Test
+    fun `the digest credential is bound to its realm`() {
+        // HA1 bakes the realm in. Handing back this realm's value for a
+        // different one produces a credential that cannot authenticate, and
+        // the customer sees a rejected registration with no cause.
+        val store = store()
+        seed(store)
+        assertNull(store.sipDigestHa1("bigcorp", "evil.example.net"))
+    }
+
+    @Test
+    fun `the digest credential is not exposed on the customer record`() {
+        // HA1 is password-equivalent for SIP. The customer read path is the
+        // one thing in this service that a customer-facing caller reaches, so
+        // it is the one place the value must never appear -- including
+        // through a field somebody adds to Customer later without thinking
+        // about it.
+        val store = store()
+        val (_, customer) = seed(store)
+        val ha1 = store.sipDigestHa1("bigcorp", "sip.megatron.local")!!
+
+        val serialised = Json.encodeToString(store.getCustomer(customer.id))
+        assertTrue(!serialised.contains(ha1), "HA1 is reachable through the customer record")
+        assertTrue(
+            !serialised.contains(ha1.uppercase()),
+            "HA1 is reachable through the customer record",
+        )
     }
 
     // -- customers ----------------------------------------------------------

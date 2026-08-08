@@ -1,5 +1,6 @@
 package net.megatron.provisioning
 
+import java.security.MessageDigest
 import java.security.SecureRandom
 import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
@@ -51,6 +52,23 @@ interface Store {
     fun ratesFor(planId: String): List<RateRow>
     fun createTrunk(request: CreateTrunk): Trunk
     fun listTrunks(): List<Trunk>
+
+    /**
+     * The SIP digest credential for a handle, or null if there is no such
+     * account.
+     *
+     * HA1 = MD5(username:realm:password). Every softphone in the target set
+     * authenticates with MD5 digest, and a server cannot verify a digest
+     * response without either the plaintext password or this.
+     *
+     * IT IS PASSWORD-EQUIVALENT. Anyone holding it can register and place
+     * calls as that customer, at the operator's expense. It must never appear
+     * in a response any customer can reach, never cross a public interface,
+     * and never be logged. It exists on the Store interface rather than being
+     * fetched through the normal customer read specifically so that it cannot
+     * be returned by accident as part of a Customer object.
+     */
+    fun sipDigestHa1(handle: String, realm: String): String?
 }
 
 /**
@@ -97,6 +115,18 @@ class InMemoryStore(
 
     private val customers = ConcurrentHashMap<String, Customer>()
     private val passwords = ConcurrentHashMap<String, String>()
+    /**
+     * handle -> HA1, computed once at creation for THIS store's realm.
+     *
+     * Deliberately not "handle -> plaintext, hash on demand". Deriving HA1
+     * from a realm the caller supplies turns this method into an oracle that
+     * mints a working SIP credential for any realm somebody names — the
+     * caller does not need to know the password to get a usable one. Baking
+     * the realm in at creation is what makes [sipDigestHa1] a lookup rather
+     * than a computation, and it is also the second copy of the plaintext
+     * password that then does not exist.
+     */
+    private val ha1ByHandle = ConcurrentHashMap<String, String>()
     private val plans = ConcurrentHashMap<String, Plan>()
     private val rates = ConcurrentHashMap<String, List<RateRow>>()
     private val trunks = ConcurrentHashMap<String, Trunk>()
@@ -167,6 +197,7 @@ class InMemoryStore(
         )
         customers[id] = customer
         passwords[id] = password
+        ha1ByHandle[request.handle] = ha1(request.handle, sipDomain, password)
 
         if (request.openingBalanceMicros > 0) {
             transactions += Transaction(
@@ -229,6 +260,9 @@ class InMemoryStore(
         val customer = getCustomer(id)
         val password = generatePassword()
         passwords[id] = password
+        // Rotates with the password. A stale HA1 means the old password still
+        // registers, which is a rotation that rotates nothing.
+        ha1ByHandle[customer.handle] = ha1(customer.handle, sipDomain, password)
         return SipCredentials(customer.handle, password, sipDomain, defaultTransport)
     }
 
@@ -365,6 +399,30 @@ class InMemoryStore(
     }
 
     override fun listTrunks(): List<Trunk> = trunks.values.sortedBy { it.id }
+
+    override fun sipDigestHa1(handle: String, realm: String): String? {
+        // Same rule as SqlStore: this store holds credentials for exactly one
+        // realm. Answering for another would return something that cannot
+        // authenticate, and a silently wrong credential is a customer who
+        // cannot register with no indication why.
+        if (!realm.equals(sipDomain, ignoreCase = true)) return null
+        return ha1ByHandle[handle]
+    }
+
+    /**
+     * HA1 = MD5(username:realm:password), the SIP digest credential.
+     *
+     * MD5 is not a choice here and must not be "fixed": RFC 2617 digest
+     * defines HA1 this way, and every softphone MEGATRON targets speaks it.
+     * Replacing it with something stronger would simply mean no customer
+     * could register. The mitigation is that this value never leaves the
+     * private network -- see the Store interface.
+     */
+    private fun ha1(username: String, realm: String, password: String): String =
+        MessageDigest.getInstance("MD5")
+            .digest("$username:$realm:$password".toByteArray())
+            .joinToString("") { "%02x".format(it) }
+
 
     private companion object {
         val HANDLE = Regex("^[a-z0-9][a-z0-9._-]{2,31}$")

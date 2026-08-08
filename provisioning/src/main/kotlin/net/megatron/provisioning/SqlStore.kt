@@ -30,6 +30,7 @@ import java.util.concurrent.atomic.AtomicLong
  */
 class SqlStore(
     private val jdbcUrl: String,
+    /** Also the digest realm: HA1 bakes the realm in, so it is fixed here. */
     private val sipDomain: String = "sip.megatron.local",
     private val defaultTransport: Transport = Transport.UDP,
 ) : Store, AutoCloseable {
@@ -155,10 +156,11 @@ class SqlStore(
      * rotation, and is not recoverable afterwards by anybody — including us.
      *
      * NOTE FOR THE SIP SIDE: HTTP digest authentication needs the HA1 value
-     * (MD5 of user:realm:password), not a modern password hash, so the
-     * registrar will store HA1 alongside this. That is a constraint of SIP
-     * digest and not a choice; it is recorded here so nobody "fixes" this to
-     * match and breaks registration.
+     * (MD5 of user:realm:password), not a modern password hash. That is why
+     * sip_ha1 is stored alongside this column and written by the same code
+     * paths — see ha1() below. Neither replaces the other: this one is the
+     * strong hash nothing on the call path reads, and HA1 is the weak one SIP
+     * forces on us. Do not "fix" the mismatch by deleting either.
      */
     private fun hash(password: String): String =
         MessageDigest.getInstance("SHA-256")
@@ -212,10 +214,11 @@ class SqlStore(
         update(
             "INSERT INTO customers (id, handle, display_name, status, plan_id, " +
                 "balance_micros, currency, max_concurrent_calls, telegram_user_id, " +
-                "sip_password_hash, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "sip_password_hash, sip_ha1, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             id, request.handle, request.displayName, CustomerStatus.ACTIVE.name,
             plan.id, request.openingBalanceMicros, plan.currency,
-            request.maxConcurrentCalls, request.telegramUserId, hash(password), now(),
+            request.maxConcurrentCalls, request.telegramUserId, hash(password),
+            ha1(request.handle, sipDomain, password), now(),
         )
 
         if (request.openingBalanceMicros > 0) {
@@ -277,7 +280,13 @@ class SqlStore(
     override fun rotateCredentials(id: String): SipCredentials {
         val customer = getCustomer(id)
         val password = generatePassword()
-        update("UPDATE customers SET sip_password_hash = ? WHERE id = ?", hash(password), id)
+        // Both credentials rotate together. Leaving a stale HA1 behind would
+        // mean the old password still registers -- a rotation that rotates
+        // nothing, which is worse than not offering one.
+        update(
+            "UPDATE customers SET sip_password_hash = ?, sip_ha1 = ? WHERE id = ?",
+            hash(password), ha1(customer.handle, sipDomain, password), id,
+        )
         return SipCredentials(customer.handle, password, sipDomain, defaultTransport)
     }
 
@@ -513,6 +522,32 @@ class SqlStore(
         )
         return trunk
     }
+
+    override fun sipDigestHa1(handle: String, realm: String): String? {
+        // The stored HA1 is bound to this store's realm. Asking for a
+        // different one cannot be satisfied from storage and must fail rather
+        // than return something that will not authenticate -- a silently
+        // wrong credential is a customer who cannot register and no
+        // indication why.
+        if (!realm.equals(sipDomain, ignoreCase = true)) return null
+        return query(
+            "SELECT sip_ha1 FROM customers WHERE handle = ?", handle
+        ) { rs -> if (rs.next()) rs.getString(1)?.ifBlank { null } else null }
+    }
+
+    /**
+     * HA1 = MD5(username:realm:password), the SIP digest credential.
+     *
+     * MD5 is not a choice here and must not be "fixed": RFC 2617 digest
+     * defines HA1 this way, and every softphone MEGATRON targets speaks it.
+     * Replacing it with something stronger would simply mean no customer
+     * could register. The mitigation is that this value never leaves the
+     * private network -- see the Store interface.
+     */
+    private fun ha1(username: String, realm: String, password: String): String =
+        MessageDigest.getInstance("MD5")
+            .digest("$username:$realm:$password".toByteArray())
+            .joinToString("") { "%02x".format(it) }
 
     override fun listTrunks(): List<Trunk> =
         query("SELECT * FROM trunks ORDER BY id") { rs ->

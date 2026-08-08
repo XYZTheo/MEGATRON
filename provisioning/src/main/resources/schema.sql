@@ -49,6 +49,20 @@ CREATE TABLE IF NOT EXISTS customers (
     max_concurrent_calls  INTEGER NOT NULL DEFAULT 2,
     telegram_user_id      INTEGER,
     sip_password_hash     TEXT NOT NULL,
+    -- HA1 = MD5(username:realm:password), which is what SIP digest
+    -- authentication requires. It is NOT a second, weaker password hash by
+    -- choice: RFC 8760 notwithstanding, every softphone in the target set
+    -- (MicroSIP, Zoiper, PortSIP) authenticates with MD5 digest, and the
+    -- server cannot verify a digest response without either the plaintext
+    -- password or this value.
+    --
+    -- HA1 IS PASSWORD-EQUIVALENT for SIP: anyone holding it can register and
+    -- place calls as that customer. It therefore never leaves the private
+    -- network, never appears in an API response a customer can reach, and is
+    -- the reason the switch API binds loopback. Storing it is a constraint of
+    -- the protocol, not a relaxation of the credential rules -- which is why
+    -- sip_password_hash (SHA-256) is kept alongside rather than replaced.
+    sip_ha1               TEXT NOT NULL DEFAULT '',
     created_at            TEXT NOT NULL
 );
 
