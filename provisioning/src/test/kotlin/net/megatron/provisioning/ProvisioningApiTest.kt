@@ -87,6 +87,149 @@ class ProvisioningApiTest {
         assertEquals(HttpStatusCode.Created, response.status)
     }
 
+    // -- what a management layer needs ----------------------------------------
+    //
+    // These endpoints exist so PROJECT-VOIPX's console can drive MEGATRON in
+    // place of VOS3000. See docs/VOIPX-INTEGRATION.md.
+
+    @Test
+    fun `a customer can be found by the name they are known by`() = testApp {
+        makeCustomer(handle = "acme")
+        val response = client.get("/v1/customers/by-handle/acme") { operator() }
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertTrue(response.bodyAsText().contains("\"handle\":\"acme\""), response.bodyAsText())
+    }
+
+    @Test
+    fun `an unknown handle is a 404, not an empty success`() = testApp {
+        makeCustomer()
+        assertEquals(
+            HttpStatusCode.NotFound,
+            client.get("/v1/customers/by-handle/ghost") { operator() }.status,
+        )
+    }
+
+    @Test
+    fun `a customer can be moved to another plan over HTTP`() = testApp {
+        val created = makeCustomer()
+        val premium = client.post("/v1/plans") {
+            operator("plan-premium-01")
+            setBody("""{"name":"Premium","currency":"USD"}""")
+        }.let { json.decodeFromString<Plan>(it.bodyAsText()).id }
+
+        val response = client.put("/v1/customers/${created.customer.id}/plan") {
+            operator("move-plan-01")
+            setBody("""{"plan_id":"$premium"}""")
+        }
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertTrue(response.bodyAsText().contains(premium), response.bodyAsText())
+    }
+
+    @Test
+    fun `a caller id can be withdrawn over HTTP`() = testApp {
+        val created = makeCustomer()
+        client.put("/v1/customers/${created.customer.id}/caller-id") {
+            operator("cli-set-01")
+            setBody("""{"caller_id":"+441632960123"}""")
+        }
+
+        val cleared = client.delete("/v1/customers/${created.customer.id}/caller-id") {
+            operator()
+        }
+
+        assertEquals(HttpStatusCode.OK, cleared.status)
+        val after = client.get("/v1/customers/${created.customer.id}") { operator() }.bodyAsText()
+        assertTrue(!after.contains("441632960123"), "the withdrawn number is still present: $after")
+    }
+
+    @Test
+    fun `a password can be checked without anybody sending it back`() = testApp {
+        val created = makeCustomer(handle = "checkme")
+
+        val good = client.post("/v1/auth/verify") {
+            operator()
+            setBody("""{"handle":"checkme","password":"${created.credentials.sipPassword}"}""")
+        }
+        assertEquals(HttpStatusCode.OK, good.status)
+        assertTrue(good.bodyAsText().contains("\"valid\":true"), good.bodyAsText())
+
+        val bad = client.post("/v1/auth/verify") {
+            operator()
+            setBody("""{"handle":"checkme","password":"wrong"}""")
+        }
+        assertTrue(bad.bodyAsText().contains("\"valid\":false"), bad.bodyAsText())
+    }
+
+    @Test
+    fun `a wrong password and an unknown account are indistinguishable over HTTP`() = testApp {
+        // THE ENUMERATION CHECK, again, at a second door. The switch config
+        // closes this on SIP; an HTTP endpoint that answers "no such account"
+        // differently reopens it for anyone who can reach the API.
+        makeCustomer(handle = "realuser")
+
+        val wrongPassword = client.post("/v1/auth/verify") {
+            operator()
+            setBody("""{"handle":"realuser","password":"nope"}""")
+        }
+        val noSuchUser = client.post("/v1/auth/verify") {
+            operator()
+            setBody("""{"handle":"ghost","password":"nope"}""")
+        }
+
+        assertEquals(wrongPassword.status, noSuchUser.status)
+        assertEquals(
+            wrongPassword.bodyAsText(), noSuchUser.bodyAsText(),
+            "the reply distinguishes a real account from a missing one",
+        )
+    }
+
+    @Test
+    fun `an imported customer keeps the password they arrived with`() = testApp {
+        // The takeover: a customer carried over from another switch registers
+        // with the credential already in their softphone.
+        val planId = makePlan()
+        val imported = client.post("/v1/customers/import") {
+            operator("import-01")
+            setBody("""{"handle":"legacy","plan_id":"$planId","password":"their-old-password"}""")
+        }
+        assertEquals(HttpStatusCode.Created, imported.status)
+
+        val check = client.post("/v1/auth/verify") {
+            operator()
+            setBody("""{"handle":"legacy","password":"their-old-password"}""")
+        }
+        assertTrue(check.bodyAsText().contains("\"valid\":true"), check.bodyAsText())
+    }
+
+    @Test
+    fun `an import never echoes the password back`() = testApp {
+        // The caller already has it. Returning it puts it in one more log.
+        val planId = makePlan()
+        val body = client.post("/v1/customers/import") {
+            operator("import-02")
+            setBody("""{"handle":"legacy","plan_id":"$planId","password":"their-old-password"}""")
+        }.bodyAsText()
+
+        assertTrue(!body.contains("their-old-password"), "the import echoed the password: $body")
+    }
+
+    @Test
+    fun `importing requires an operator like everything else`() = testApp {
+        val planId = makePlan()
+        val response = client.post("/v1/customers/import") {
+            header(HttpHeaders.Authorization, "Bearer $customerToken")
+            header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+            header("Idempotency-Key", "import-forbidden-1")
+            setBody("""{"handle":"sneaky","plan_id":"$planId","password":"whatever12"}""")
+        }
+        assertTrue(
+            response.status == HttpStatusCode.Forbidden || response.status == HttpStatusCode.Unauthorized,
+            "a customer token could import an account: ${response.status}",
+        )
+    }
+
     private suspend fun ApplicationTestBuilder.makePlan(): String {
         val response = client.post("/v1/plans") {
             operator("plan-key-00001")

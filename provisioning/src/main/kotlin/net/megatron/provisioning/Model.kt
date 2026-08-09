@@ -235,6 +235,49 @@ data class Trunk(
  * Money is integer micro-units, as everywhere.
  */
 @Serializable
+data class SetPlan(@SerialName("plan_id") val planId: String)
+
+/**
+ * Creating a customer with a credential MEGATRON did not generate.
+ *
+ * Deliberately NOT [CreateCustomer] with an optional password. A separate type
+ * means "this request carries a plaintext password" is visible in the type
+ * system, greppable in the codebase, and impossible to trigger by accident
+ * from the ordinary create path.
+ */
+@Serializable
+data class ImportCustomer(
+    val handle: String,
+    @SerialName("plan_id") val planId: String,
+    /**
+     * The customer's EXISTING password, from the switch being replaced.
+     *
+     * Converted to HA1 and SHA-256 on arrival and not stored. It is never
+     * echoed back: the caller already has it, and returning it would put it in
+     * one more log.
+     */
+    val password: String,
+    @SerialName("display_name") val displayName: String? = null,
+    @SerialName("telegram_user_id") val telegramUserId: Long? = null,
+    @SerialName("opening_balance_micros") val openingBalanceMicros: Long = 0,
+    @SerialName("max_concurrent_calls") val maxConcurrentCalls: Int = 2,
+)
+
+@Serializable
+data class VerifyCredentials(val handle: String, val password: String)
+
+/**
+ * The answer to "does this password work", and nothing else.
+ *
+ * No reason, no distinction between an unknown handle and a wrong password.
+ * Reporting which would be a username oracle: one request per guess tells an
+ * attacker whether an account exists. The store knows the difference; this
+ * type is how it is stopped from saying so.
+ */
+@Serializable
+data class CredentialCheck(val valid: Boolean)
+
+@Serializable
 data class CallRecord(
     @SerialName("call_id") val callId: String,
     val account: String,

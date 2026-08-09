@@ -98,23 +98,38 @@ explicit, auditable act.
 
 Then `MegatronClient` in VOIPX, which becomes mostly mechanical.
 
-## The takeover test
+## VOIPX drives EITHER backend. Both stay working.
 
-Seth's proposal, and it is the right one: point VOIPX/MEGATRON at his real
-Magnus data and see whether his actual customers can register.
+Seth, 2026-08-08:
 
-MagnusBilling stores SIP credentials in a way that allows the server to
-authenticate them, which means they can be converted to HA1 and imported. If
-that works, the switchover is: import, point the providers' IPs at the new box,
-done — **no customer reconfigures anything.**
+> "nah im not connecting my magnus to this - u can make it so it can accept
+> magnus (voipx) but the system megatron u are suppose to be making is suppose
+> to be used in place of magnus so make it work for magnus/vos and megatron"
 
-Reading Magnus's **database schema** for this is the one clean-room exception
-in this project (`CONTRIBUTING.md`): the importer needs it, and it is confined
-to the importer. Magnus's *source* remains off limits.
+**The live Magnus is not a test target and must not become one.** It is the
+running business. Nothing in this repo connects to it, reads its database, or
+requires it to be reachable.
 
-What is needed to run it:
+What that means concretely:
 
-- read-only access to the Magnus database, or a dump of `pkg_user` and the
-  plan/rate tables;
-- one real account to test registration with, ideally a spare rather than a
-  customer's.
+- `vos.mode` keeps selecting the backend, and **`Vos3000Client` is not
+  touched**. VOIPX against Magnus/VOS3000 must work exactly as it does today
+  after this change, or the change is wrong.
+- `MegatronClient` is added beside it. Same interface, same screens, different
+  switch.
+- Both are exercised the same way: VOIPX's existing tests keep covering the
+  VOS3000 path, and `MegatronClient` gets its own against a real MEGATRON.
+
+The point of the abstraction is that Seth can run one, the other, or both, and
+move when *he* decides — not when a migration tool says he must.
+
+### Importing existing customers, when he wants it
+
+`Store.importCustomer` exists and works: it takes a credential MEGATRON did not
+generate, converts it to HA1, and the customer's softphone keeps working
+untouched. That is what makes a switchover a takeover rather than a migration.
+
+It runs from a **dump or an export the operator chooses to give it** — never
+from a live connection to a production Magnus. The importer that reads Magnus's
+schema is future work (issue #11) and is gated on Seth wanting it, not on
+MEGATRON needing it.

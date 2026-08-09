@@ -178,6 +178,66 @@ fun Application.provisioningModule(
                     call.respond(store.getCustomer(call.customerId()))
                 }
 
+                /**
+                 * A customer by the name they are known by, rather than by id.
+                 *
+                 * Management layers key on the handle — it is what the
+                 * operator typed, what the softphone registers with, and what
+                 * appears on a CDR — while everything internal keys on the id.
+                 * Without this, every by-name call becomes list-and-scan.
+                 *
+                 * Registered BEFORE "/{customerId}" would be ambiguous, so it
+                 * sits under a literal prefix that no id can collide with.
+                 */
+                get("/by-handle/{handle}") {
+                    call.requireOperator(authenticator)
+                    val handle = call.parameters["handle"] ?: throw Invalid("handle required")
+                    call.respond(
+                        store.findByHandle(handle) ?: throw NotFound("customer '$handle'")
+                    )
+                }
+
+                get("/by-handle/{handle}/calls") {
+                    call.requireOperator(authenticator)
+                    val handle = call.parameters["handle"] ?: throw Invalid("handle required")
+                    store.findByHandle(handle) ?: throw NotFound("customer '$handle'")
+                    call.respond(store.callsFor(handle, call.callLimit()))
+                }
+
+                /** A customer's own call history, by id. */
+                get("/{customerId}/calls") {
+                    call.requireOperator(authenticator)
+                    val customer = store.getCustomer(call.customerId())
+                    call.respond(store.callsFor(customer.handle, call.callLimit()))
+                }
+
+                /**
+                 * Moves a customer onto another plan.
+                 *
+                 * PUT, not POST: setting the plan to X twice leaves them on X.
+                 * Naming it after the thing being replaced rather than an
+                 * action is also what makes that obvious.
+                 */
+                put("/{customerId}/plan") {
+                    val caller = call.requireOperator(authenticator)
+                    call.idempotencyKey()
+                    val body = call.receive<SetPlan>()
+                    call.respond(store.setPlan(call.customerId(), body.planId, caller.id))
+                }
+
+                /**
+                 * Withdraws a caller ID.
+                 *
+                 * Distinct from setting a different one. A number withdrawn
+                 * because it was never theirs must fall back to the
+                 * operator's default, not leave the last authorised number in
+                 * place.
+                 */
+                delete("/{customerId}/caller-id") {
+                    val caller = call.requireOperator(authenticator)
+                    call.respond(store.clearCallerId(call.customerId(), caller.id))
+                }
+
                 put("/{customerId}/status") {
                     val caller = call.requireOperator(authenticator)
                     call.idempotencyKey()
@@ -223,6 +283,71 @@ fun Application.provisioningModule(
                     val body = call.receive<SetCallerId>()
                     call.respond(store.setCallerId(call.customerId(), body.callerId, caller.id))
                 }
+
+                /**
+                 * Creates a customer with a credential MEGATRON did not
+                 * generate.
+                 *
+                 * THE ONLY ENDPOINT IN THIS API THAT ACCEPTS A PASSWORD, and
+                 * it is a separate path rather than a flag on POST /customers
+                 * precisely so that is greppable and deliberate.
+                 *
+                 * It exists for one reason: taking over from an existing
+                 * switch must not require every customer to reconfigure a
+                 * softphone. A migration that breaks every customer is not one
+                 * anybody performs, so the alternative to this endpoint is
+                 * that nobody ever moves.
+                 *
+                 * The plaintext is converted to HA1 and SHA-256 and is not
+                 * stored. It is not returned either — the caller already has
+                 * it, and echoing it back would put it in one more log.
+                 */
+                post("/import") {
+                    val caller = call.requireOperator(authenticator)
+                    val key = call.idempotencyKey()
+                    val body = call.receive<ImportCustomer>()
+                    val hash = body.hashCode()
+                    idempotency.replay(key, hash)?.let {
+                        call.respondText(it, ContentType.Application.Json)
+                        return@post
+                    }
+                    val customer = store.importCustomer(
+                        CreateCustomer(
+                            handle = body.handle,
+                            planId = body.planId,
+                            displayName = body.displayName,
+                            telegramUserId = body.telegramUserId,
+                            openingBalanceMicros = body.openingBalanceMicros,
+                            maxConcurrentCalls = body.maxConcurrentCalls,
+                        ),
+                        body.password,
+                        caller.id,
+                    )
+                    val encoded = json.encodeToString(Customer.serializer(), customer)
+                    idempotency.remember(key, hash, encoded)
+                    call.respondText(encoded, ContentType.Application.Json, HttpStatusCode.Created)
+                }
+            }
+
+            /**
+             * Does this password authenticate this handle?
+             *
+             * For a management layer that lets a customer prove ownership of a
+             * SIP login they already have. Neither service ends up holding a
+             * plaintext: the candidate is converted to HA1 and compared
+             * against the stored one.
+             *
+             * THE ANSWER IS THE SAME SHAPE WHATEVER THE REASON. "No such
+             * account" and "wrong password" both return valid=false, because
+             * distinguishing them is a username oracle — the same one the
+             * switch config spends forty lines closing. The store CAN tell
+             * them apart and deliberately does not say so here.
+             */
+            post("/auth/verify") {
+                call.requireOperator(authenticator)
+                val body = call.receive<VerifyCredentials>()
+                val valid = store.verifyPassword(body.handle, body.password) ?: false
+                call.respond(CredentialCheck(valid = valid))
             }
 
             route("/plans") {
@@ -291,6 +416,15 @@ fun Application.provisioningModule(
 
 private fun ApplicationCall.customerId(): String =
     parameters["customerId"] ?: throw Invalid("customerId is required")
+
+/**
+ * How many calls to return, bounded.
+ *
+ * Capped because this box is also a switch: a caller asking for a year of call
+ * history would pull it all into memory beside the thing carrying live calls.
+ */
+private fun ApplicationCall.callLimit(): Int =
+    (request.queryParameters["limit"]?.toIntOrNull() ?: 20).coerceIn(1, 500)
 
 private suspend fun ApplicationCall.problem(
     status: HttpStatusCode,
