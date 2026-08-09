@@ -66,7 +66,15 @@ fun main() {
     startSubscriberExport(store, realm)
 
     embeddedServer(Netty, port = port, host = host) {
-        provisioningModule(store, IdempotencyStore(), authenticator)
+        provisioningModule(
+            store,
+            IdempotencyStore(),
+            authenticator,
+            // Same MI endpoint the credential reload uses. Absent, the
+            // registration endpoint answers "unknown" rather than claiming
+            // every phone is offline.
+            SwitchRegistry(System.getenv("MEGATRON_SWITCH_MI_URL")),
+        )
     }.start(wait = true)
 }
 

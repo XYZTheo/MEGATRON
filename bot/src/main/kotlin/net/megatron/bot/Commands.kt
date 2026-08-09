@@ -466,8 +466,13 @@ class CommandEngine(
             appendLine("${customer.handle}  (${customer.status.name.lowercase()})")
             appendLine("Balance:  ${formatMoney(customer.balanceMicros, customer.currency)}")
             appendLine("Caller ID: ${customer.callerId?.number ?: "not set"}")
-            appendLine("Max calls: ${customer.maxConcurrentCalls}")
-            append("Registered: ${if (customer.registered) "yes" else "no"}")
+            // NO "Registered:" LINE. It read `customer.registered`, which
+            // nothing ever set, so this printed "Registered: no" for every
+            // customer including ones with a phone registered and a call up.
+            // Registration is live switch state and is answered by
+            // GET /v1/customers/{id}/registration, which asks OpenSIPS.
+            // Printing a confident wrong answer is worse than printing none.
+            append("Max calls: ${customer.maxConcurrentCalls}")
         }
     }
 

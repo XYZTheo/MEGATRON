@@ -77,8 +77,18 @@ data class Customer(
     @SerialName("balance_micros") val balanceMicros: Long,
     val currency: String,
     @SerialName("caller_id") val callerId: CallerId? = null,
-    val registered: Boolean = false,
-    @SerialName("active_calls") val activeCalls: Int = 0,
+    // NO `registered` OR `active_calls` HERE, and they were removed rather
+    // than left.
+    //
+    // Both were placeholders that nothing ever set, so every response asserted
+    // "not registered, no calls in progress" about every customer — including
+    // ones with a phone registered and a call up. A field that is always false
+    // does not fail to answer the question, it answers it WRONGLY, and it
+    // reads as authoritative because it sits on the customer record.
+    //
+    // Both are live switch state, not customer attributes. Registration is
+    // GET /v1/customers/{id}/registration, which asks OpenSIPS. Calls in
+    // progress belong to switch-api, which is holding them.
     @SerialName("max_concurrent_calls") val maxConcurrentCalls: Int = 2,
     @SerialName("telegram_user_id") val telegramUserId: Long? = null,
     @SerialName("created_at") val createdAt: String? = null,
@@ -105,8 +115,9 @@ data class SelfView(
     @SerialName("caller_id") val callerId: CallerId? = null,
     @SerialName("sip_username") val sipUsername: String? = null,
     @SerialName("sip_domain") val sipDomain: String? = null,
-    val registered: Boolean = false,
-    @SerialName("active_calls") val activeCalls: Int = 0,
+    // Same removal as on Customer, and it matters more here: this is the view
+    // a CUSTOMER sees. Telling them "not registered" while their phone is
+    // registered sends them to reconfigure a softphone that was working.
 )
 
 @Serializable

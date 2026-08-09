@@ -64,6 +64,15 @@ fun Application.provisioningModule(
     store: Store,
     idempotency: IdempotencyStore = IdempotencyStore(),
     authenticator: Authenticator,
+    /**
+     * Reads live registrations from the switch.
+     *
+     * Defaults to one with no MI URL, which answers "unknown" rather than
+     * "not registered" — a test or a deployment with no switch configured
+     * must not report every customer's phone as offline, because that is a
+     * confident wrong answer to the question an operator asks first.
+     */
+    registry: SwitchRegistry = SwitchRegistry(null) { },
 ) {
     install(ContentNegotiation) {
         // JSON only, and no HTML anywhere. MagnusBilling's CVE-2025-2609 and
@@ -202,6 +211,24 @@ fun Application.provisioningModule(
                     val handle = call.parameters["handle"] ?: throw Invalid("handle required")
                     store.findByHandle(handle) ?: throw NotFound("customer '$handle'")
                     call.respond(store.callsFor(handle, call.callLimit()))
+                }
+
+                /**
+                 * Is this customer's phone registered right now?
+                 *
+                 * Asked of the SWITCH, not the database: registrations are
+                 * soft state in OpenSIPS's memory and no table here knows
+                 * about them. It is the first question anyone asks when a
+                 * customer says calls are not working.
+                 *
+                 * Diagnostics, not authority. A registered phone is not
+                 * permission to call and an unregistered one is not a
+                 * suspension — the authorizer decides that live, per call.
+                 */
+                get("/{customerId}/registration") {
+                    call.requireOperator(authenticator)
+                    val customer = store.getCustomer(call.customerId())
+                    call.respond(registry.registrationFor(customer.handle))
                 }
 
                 /** A customer's own call history, by id. */
@@ -396,8 +423,6 @@ fun Application.provisioningModule(
                         currency = customer.currency,
                         callerId = customer.callerId,
                         sipUsername = customer.handle,
-                        registered = customer.registered,
-                        activeCalls = customer.activeCalls,
                     )
                 )
             }
