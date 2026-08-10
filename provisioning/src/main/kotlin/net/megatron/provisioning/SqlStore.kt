@@ -820,6 +820,81 @@ class SqlStore(
         return getCustomer(customer.id)
     }
 
+    // -- DIDs -----------------------------------------------------------------
+
+    override fun assignDid(request: AssignDid, actor: String): Did {
+        val number = normaliseDid(request.number)
+        val customer = getCustomer(request.customerId)
+        val did = Did(
+            number = number,
+            customerId = customer.id,
+            description = request.description,
+            enabled = true,
+            assignedAt = now(),
+            assignedBy = actor,
+        )
+        try {
+            update(
+                "INSERT INTO dids (number, customer_id, description, enabled, " +
+                    "assigned_at, assigned_by) VALUES (?,?,?,?,?,?)",
+                number, customer.id, request.description, 1, did.assignedAt, actor,
+            )
+        } catch (clash: java.sql.SQLException) {
+            // The primary key is what actually stops two owners for one
+            // number. Reported as the Conflict it is rather than as a 500:
+            // "somebody already has that number" is a business answer.
+            if (clash.message?.contains("UNIQUE", ignoreCase = true) == true ||
+                clash.message?.contains("PRIMARY KEY", ignoreCase = true) == true
+            ) {
+                val owner = query(
+                    "SELECT customer_id FROM dids WHERE number = ?", number
+                ) { rs -> if (rs.next()) rs.getString(1) else null }
+                if (owner == customer.id) return did
+                throw Conflict("+$number already belongs to another customer")
+            }
+            throw clash
+        }
+        return did
+    }
+
+    override fun releaseDid(number: String, actor: String) {
+        update("DELETE FROM dids WHERE number = ?", normaliseDid(number))
+    }
+
+    override fun listDids(customerId: String?): List<Did> =
+        if (customerId == null) {
+            query("SELECT * FROM dids ORDER BY number") { rs -> rs.toDids() }
+        } else {
+            query(
+                "SELECT * FROM dids WHERE customer_id = ? ORDER BY number", customerId
+            ) { rs -> rs.toDids() }
+        }
+
+    override fun customerForDid(number: String): Customer? {
+        val customerId = query(
+            "SELECT customer_id FROM dids WHERE number = ? AND enabled = 1",
+            normaliseDid(number),
+        ) { rs -> if (rs.next()) rs.getString(1) else null } ?: return null
+        return query("SELECT * FROM customers WHERE id = ?", customerId) { rs ->
+            if (rs.next()) rs.toCustomer() else null
+        }
+    }
+
+    private fun ResultSet.toDids(): List<Did> = buildList {
+        while (next()) {
+            add(
+                Did(
+                    number = getString("number"),
+                    customerId = getString("customer_id"),
+                    description = getString("description"),
+                    enabled = getInt("enabled") == 1,
+                    assignedAt = getString("assigned_at"),
+                    assignedBy = getString("assigned_by"),
+                )
+            )
+        }
+    }
+
     // -- call detail records --------------------------------------------------
 
     override fun recordCall(record: CallRecord) {

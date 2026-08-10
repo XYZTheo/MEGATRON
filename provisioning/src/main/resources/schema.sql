@@ -102,6 +102,33 @@ CREATE TABLE IF NOT EXISTS transactions (
 CREATE INDEX IF NOT EXISTS transactions_customer
     ON transactions (customer_id, created_at);
 
+-- DIDs: the numbers customers RECEIVE calls on.
+--
+-- A carrier sends an inbound call to a number, and the only question that
+-- matters is which customer owns it. Without this table a switch can dial out
+-- and cannot be dialled, which is half a phone service.
+--
+-- ONE CUSTOMER PER NUMBER, enforced by the primary key rather than only by the
+-- application. Two owners for one number means an inbound call is delivered by
+-- whichever row is read first — non-deterministic call routing, and a customer
+-- receiving somebody else's calls.
+CREATE TABLE IF NOT EXISTS dids (
+    -- E.164, normalised on the way in. Stored without the leading + so it
+    -- matches what carriers actually send in the request URI, which varies.
+    number       TEXT PRIMARY KEY,
+    customer_id  TEXT NOT NULL,
+    description  TEXT,
+    -- A DID can be parked: owned by a customer, not currently delivering. That
+    -- is different from not existing, which is a number to reject.
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    assigned_at  TEXT NOT NULL,
+    assigned_by  TEXT NOT NULL,
+    FOREIGN KEY (customer_id) REFERENCES customers (id)
+);
+
+CREATE INDEX IF NOT EXISTS dids_customer
+    ON dids (customer_id);
+
 -- Call detail records.
 --
 -- THIS IS THE EVIDENCE. Every charge on the transactions table above came from

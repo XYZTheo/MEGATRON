@@ -255,6 +255,36 @@ data class Trunk(
 @Serializable
 data class ServiceHealth(val healthy: Boolean, val service: String)
 
+/**
+ * A number a customer receives calls on.
+ *
+ * [number] is stored WITHOUT a leading `+`, because that is what carriers put
+ * in a request URI — and inconsistently. Normalising on the way in means the
+ * inbound lookup is an exact match on one representation rather than a set of
+ * guesses at call time, when there is a caller waiting.
+ */
+@Serializable
+data class Did(
+    val number: String,
+    @SerialName("customer_id") val customerId: String,
+    val description: String? = null,
+    /**
+     * A parked DID is owned and not delivering, which is NOT the same as a
+     * number nobody owns. The first is a customer's number held back; the
+     * second is a call to reject.
+     */
+    val enabled: Boolean = true,
+    @SerialName("assigned_at") val assignedAt: String? = null,
+    @SerialName("assigned_by") val assignedBy: String? = null,
+)
+
+@Serializable
+data class AssignDid(
+    val number: String,
+    @SerialName("customer_id") val customerId: String,
+    val description: String? = null,
+)
+
 @Serializable
 data class SetPlan(@SerialName("plan_id") val planId: String)
 

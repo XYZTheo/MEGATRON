@@ -197,6 +197,34 @@ interface Store {
      * greppable act rather than a parameter somebody sets by accident.
      */
     fun importCustomer(request: CreateCustomer, password: String, actor: String): Customer
+
+    // -- DIDs: the numbers customers receive calls on -------------------------
+
+    /**
+     * Gives a number to a customer.
+     *
+     * Refuses if it already belongs to someone. Reassigning silently would
+     * move a working number between customers with no record of it, and the
+     * first anyone knows is the previous owner's calls arriving somewhere
+     * else.
+     */
+    fun assignDid(request: AssignDid, actor: String): Did
+
+    /** Takes a number back. */
+    fun releaseDid(number: String, actor: String)
+
+    /** Every number, or one customer's. */
+    fun listDids(customerId: String? = null): List<Did>
+
+    /**
+     * Who should receive a call to this number?
+     *
+     * THE INBOUND CALL PATH, so it is the one lookup that runs with a caller
+     * waiting. Returns null for a number nobody owns AND for a parked one —
+     * the switch rejects both, and the difference matters to an operator
+     * reading a log, not to the call.
+     */
+    fun customerForDid(number: String): Customer?
 }
 
 /**
@@ -268,6 +296,32 @@ class IdempotencyStore(
     }
 
     val size: Int get() = entries.size
+}
+
+/**
+ * One representation of a phone number, so an inbound lookup is an exact match
+ * rather than a set of guesses.
+ *
+ * CARRIERS ARE NOT CONSISTENT. The same DID arrives as `+441632960123`,
+ * `441632960123`, `00441632960123` or with spaces, sometimes from the same
+ * carrier on different routes. Storing whatever arrived and comparing strings
+ * means a number that works on one trunk and silently does not on another —
+ * an inbound call rejected for a customer who is definitely paying for that
+ * number.
+ *
+ * So everything is reduced to bare digits with the international prefix
+ * stripped: `+` and `00` both mean "what follows is international".
+ *
+ * Deliberately NOT a full E.164 library. Interpreting national dialling
+ * without knowing the country is guesswork, and guessing wrong here delivers
+ * somebody else's calls. What is not recognised is stored as it arrived and
+ * simply will not match — a number that never rings is a support ticket; a
+ * number that rings the wrong customer is a breach.
+ */
+internal fun normaliseDid(raw: String): String {
+    val digitsAndPlus = raw.trim().filter { it.isDigit() || it == '+' }
+    val withoutPlus = digitsAndPlus.removePrefix("+")
+    return if (withoutPlus.startsWith("00")) withoutPlus.removePrefix("00") else withoutPlus
 }
 
 /**
@@ -656,6 +710,43 @@ class InMemoryStore(
 
     override fun releaseClaim(key: String) {
         claimed.remove(key)
+    }
+
+    private val dids = ConcurrentHashMap<String, Did>()
+
+    override fun assignDid(request: AssignDid, actor: String): Did {
+        val number = normaliseDid(request.number)
+        val customer = getCustomer(request.customerId)
+        val did = Did(
+            number = number,
+            customerId = customer.id,
+            description = request.description,
+            enabled = true,
+            assignedAt = now(),
+            assignedBy = actor,
+        )
+        // putIfAbsent, not put: a check followed by a write is not a check
+        // under concurrency, and the loser of that race silently steals a
+        // working number from another customer.
+        val existing = dids.putIfAbsent(number, did)
+        if (existing != null && existing.customerId != customer.id) {
+            throw Conflict("+$number already belongs to another customer")
+        }
+        return did
+    }
+
+    override fun releaseDid(number: String, actor: String) {
+        dids.remove(normaliseDid(number))
+    }
+
+    override fun listDids(customerId: String?): List<Did> =
+        dids.values.filter { customerId == null || it.customerId == customerId }
+            .sortedBy { it.number }
+
+    override fun customerForDid(number: String): Customer? {
+        val did = dids[normaliseDid(number)] ?: return null
+        if (!did.enabled) return null
+        return customers[did.customerId]
     }
 
     override fun setPlan(id: String, planId: String, actor: String): Customer {

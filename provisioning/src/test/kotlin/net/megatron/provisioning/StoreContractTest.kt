@@ -289,6 +289,111 @@ abstract class StoreContractTest {
         }
     }
 
+    // -- DIDs -----------------------------------------------------------------
+    //
+    // The inbound half. A switch that can dial out and cannot be dialled is
+    // half a phone service.
+
+    @Test
+    fun `a number delivers to the customer it was given to`() {
+        val store = store()
+        val (_, customer) = seed(store)
+        store.assignDid(AssignDid("+441632960123", customer.id), "operator")
+
+        assertEquals(customer.id, store.customerForDid("+441632960123")?.id)
+    }
+
+    @Test
+    fun `the same number is found however the carrier writes it`() {
+        // CARRIERS ARE NOT CONSISTENT. The same DID arrives as +44...,
+        // 44..., 0044... and with spaces, sometimes from one carrier on
+        // different routes. A number that works on one trunk and silently does
+        // not on another is an inbound call rejected for a customer who is
+        // definitely paying for that number.
+        val store = store()
+        val (_, customer) = seed(store)
+        store.assignDid(AssignDid("+44 1632 960123", customer.id), "operator")
+
+        listOf("+441632960123", "441632960123", "00441632960123", "+44 1632 960123")
+            .forEach { asWritten ->
+                assertEquals(
+                    customer.id,
+                    store.customerForDid(asWritten)?.id,
+                    "'$asWritten' did not reach the owner",
+                )
+            }
+    }
+
+    @Test
+    fun `a number cannot belong to two customers`() {
+        // Two owners means an inbound call is delivered by whichever row is
+        // read first — non-deterministic routing, and a customer receiving
+        // somebody else's calls.
+        val store = store()
+        val plan = store.createPlan(CreatePlan("Retail", "USD"))
+        val first = store.createCustomer(CreateCustomer("first", plan.id), "t").first
+        val second = store.createCustomer(CreateCustomer("second", plan.id), "t").first
+
+        store.assignDid(AssignDid("+441632960123", first.id), "operator")
+        assertFailsWith<Conflict> {
+            store.assignDid(AssignDid("+441632960123", second.id), "operator")
+        }
+        assertEquals(first.id, store.customerForDid("+441632960123")?.id)
+    }
+
+    @Test
+    fun `assigning the same number to the same customer again is not an error`() {
+        // Idempotent: a retried assignment must not look like a clash with
+        // itself.
+        val store = store()
+        val (_, customer) = seed(store)
+        store.assignDid(AssignDid("+441632960123", customer.id), "operator")
+        store.assignDid(AssignDid("+441632960123", customer.id), "operator")
+        assertEquals(1, store.listDids(customer.id).size)
+    }
+
+    @Test
+    fun `a released number reaches nobody`() {
+        val store = store()
+        val (_, customer) = seed(store)
+        store.assignDid(AssignDid("+441632960123", customer.id), "operator")
+        store.releaseDid("+441632960123", "operator")
+
+        assertNull(store.customerForDid("+441632960123"))
+        assertTrue(store.listDids(customer.id).isEmpty())
+    }
+
+    @Test
+    fun `a number nobody owns reaches nobody`() {
+        val store = store()
+        seed(store)
+        assertNull(store.customerForDid("+441632999999"))
+    }
+
+    @Test
+    fun `a number for a customer who does not exist is refused`() {
+        val store = store()
+        seed(store)
+        assertFailsWith<NotFound> {
+            store.assignDid(AssignDid("+441632960123", "cust-nope"), "operator")
+        }
+    }
+
+    @Test
+    fun `dids are listed per customer, not everybody's`() {
+        // A customer's DID list is a list of their numbers. Leaking the whole
+        // table tells one customer what every other customer owns.
+        val store = store()
+        val plan = store.createPlan(CreatePlan("Retail", "USD"))
+        val mine = store.createCustomer(CreateCustomer("mine", plan.id), "t").first
+        val theirs = store.createCustomer(CreateCustomer("theirs", plan.id), "t").first
+        store.assignDid(AssignDid("+441632960001", mine.id), "operator")
+        store.assignDid(AssignDid("+441632960002", theirs.id), "operator")
+
+        assertEquals(listOf("441632960001"), store.listDids(mine.id).map { it.number })
+        assertEquals(2, store.listDids().size)
+    }
+
     // -- call detail records --------------------------------------------------
     //
     // The evidence behind every charge. What is asserted here is what a

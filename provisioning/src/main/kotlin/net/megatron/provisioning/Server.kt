@@ -420,6 +420,48 @@ fun Application.provisioningModule(
                 }
             }
 
+            /**
+             * DIDs — the numbers customers receive calls on.
+             *
+             * A switch that can dial out and cannot be dialled is half a phone
+             * service, and this is the table that makes an inbound call
+             * findable: a carrier sends a number, and the only question is who
+             * owns it.
+             */
+            route("/dids") {
+                get {
+                    call.requireOperator(authenticator)
+                    call.respond(store.listDids(call.request.queryParameters["customer_id"]))
+                }
+                post {
+                    val caller = call.requireOperator(authenticator)
+                    call.idempotencyKey()
+                    call.respond(
+                        HttpStatusCode.Created,
+                        store.assignDid(call.receive(), caller.id),
+                    )
+                }
+                delete("/{number}") {
+                    val caller = call.requireOperator(authenticator)
+                    val number = call.parameters["number"] ?: throw Invalid("number required")
+                    store.releaseDid(number, caller.id)
+                    call.respond(HttpStatusCode.NoContent)
+                }
+                /**
+                 * Who owns this number? Used by the switch on every inbound
+                 * call, so it is the one read here that runs with a caller
+                 * waiting.
+                 */
+                get("/{number}/owner") {
+                    call.requireOperator(authenticator)
+                    val number = call.parameters["number"] ?: throw Invalid("number required")
+                    call.respond(
+                        store.customerForDid(number)
+                            ?: throw NotFound("no customer receives calls on '$number'")
+                    )
+                }
+            }
+
             route("/trunks") {
                 get {
                     call.requireOperator(authenticator)
