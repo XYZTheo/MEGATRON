@@ -49,8 +49,12 @@ cleanup() {
     # tidy. Suspending removes them from the credential file, which is the
     # property that matters.
     if [ -n "${CUST_ID:-}" ]; then
+        # PUT and LOWERCASE. This was POST with "SUSPENDED", which is the wrong
+        # verb AND a status the enum does not accept — so the cleanup silently
+        # did nothing for every run, and the discarded output hid it. The
+        # customer stayed active and kept a working login.
         curl -s -m 5 "${OP[@]}" -H "Idempotency-Key: smoke-off-$STAMP" \
-            -X POST -d '{"status":"SUSPENDED","reason":"smoke test finished"}' \
+            -X PUT -d '{"status":"suspended","reason":"smoke test finished"}' \
             "$PROV/v1/customers/$CUST_ID/status" > /dev/null 2>&1
     fi
 }

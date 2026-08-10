@@ -152,6 +152,31 @@ fun Application.provisioningModule(
     routing {
         route("/v1") {
 
+            /**
+             * Is this service up, and can it reach its database?
+             *
+             * UNAUTHENTICATED, deliberately. A health check that needs a
+             * credential is one a monitor cannot make, and it reveals nothing:
+             * the service answering at all is already observable to anyone who
+             * can reach the port, and this binds loopback.
+             *
+             * It TOUCHES THE DATABASE rather than returning a constant. A
+             * process that is running but cannot read its own store is exactly
+             * the state a health check exists to catch, and "the socket
+             * accepted my connection" does not catch it.
+             */
+            get("/health") {
+                val healthy = runCatching { store.listPlans(); true }.getOrDefault(false)
+                call.respond(
+                    if (healthy) HttpStatusCode.OK else HttpStatusCode.ServiceUnavailable,
+                    ServiceHealth(
+                        healthy = healthy,
+                        service = "provisioning",
+                    ),
+                )
+            }
+
+
             // ---- operator scope ------------------------------------------
 
             route("/customers") {

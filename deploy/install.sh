@@ -145,12 +145,28 @@ fi
 # exits 0 and the child dies before writing a pidfile. Nothing in that message
 # mentions the port. Meanwhile `ss` still shows an opensips on 5060, so even
 # a careful check afterwards says the switch is up.
+# `|| true` because grep exits 1 when it matches NOTHING -- which is the
+# HEALTHY case here, a free port -- and under `set -e` a failed command
+# substitution in an assignment ends the script. So a clean box made the
+# installer stop silently, mid-preflight, having printed no error whatsoever.
+#
+# The same trap bit twice in five minutes on adjacent lines. Any `$( ... )`
+# containing grep, ps or pgrep needs this: those commands report "found
+# nothing" as failure, and "found nothing" is usually what we are hoping for.
 SQUATTER=$(ss -lunp 2>/dev/null | awk '/:5060 /{print $NF}' \
-    | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+    | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2 || true)
 if [ -n "${SQUATTER:-}" ]; then
-    OWNER=$(ps -p "$SQUATTER" -o args= 2>/dev/null | head -1)
-    case "$OWNER" in
-        *"/etc/opensips/megatron.cfg"*)
+    # `|| true` because `set -e` treats a failed command substitution in an
+    # assignment as fatal — and `ps -p` fails when the process has already
+    # gone, which is the common case for a PID read a moment earlier. The
+    # installer then exited SILENTLY, mid-preflight, with no message at all.
+    # An installer that stops without saying why is worse than one that
+    # crashes.
+    OWNER=$(ps -p "$SQUATTER" -o args= 2>/dev/null | head -1 || true)
+    case "${OWNER:-}" in
+        # Ours, or a process that vanished between reading the port and
+        # looking it up. Either way there is nothing to warn about.
+        ""|*"/etc/opensips/megatron.cfg"*)
             systemctl stop megatron-opensips 2>/dev/null || true
             ;;
         *)

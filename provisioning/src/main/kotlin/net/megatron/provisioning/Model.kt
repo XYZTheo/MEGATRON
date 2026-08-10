@@ -245,6 +245,16 @@ data class Trunk(
  *
  * Money is integer micro-units, as everywhere.
  */
+/**
+ * The answer to "are you alive and can you read your own database".
+ *
+ * No version, no build id, no uptime. Those are useful and they are also a
+ * free fingerprint for anyone deciding which exploit to try, and this endpoint
+ * is the one thing here that answers without a credential.
+ */
+@Serializable
+data class ServiceHealth(val healthy: Boolean, val service: String)
+
 @Serializable
 data class SetPlan(@SerialName("plan_id") val planId: String)
 
