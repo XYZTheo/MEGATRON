@@ -87,16 +87,49 @@ explicit, auditable act.
 
 ## What to build, in order
 
-1. **`GET /v1/customers/by-handle/{handle}`** — unblocks every by-name call.
-2. **`POST /v1/customers/{id}/plan`** — `setPlan` / `setTariff`.
-3. **`DELETE /v1/customers/{id}/caller-id`** — `revokeCallerId`.
-4. **`POST /v1/auth/verify`** — `verifyCredentials`, against stored HA1.
-5. **`GET /v1/customers/{id}/registration`** — via OpenSIPS MI `ul_dump`.
-6. **Import path accepting a supplied credential** — the takeover.
-7. **`POST /v1/calls/originate`** — click-to-call, via MI. Last: it is the only
-   one that is not needed to run the business.
+**Items 1–6 are built and proven against a running switch.** The table above is
+kept as the record of what the gaps were; `MegatronClientLiveTest` is what says
+whether they are still gaps, because it is the only thing that talks to a real
+MEGATRON. Field names, verbs and status codes disagreed three times, and every
+one of those was invisible from the VOIPX side.
 
-Then `MegatronClient` in VOIPX, which becomes mostly mechanical.
+1. ~~`GET /v1/customers/by-handle/{handle}`~~ — done.
+2. ~~`PUT /v1/customers/{id}/plan`~~ — done. **PUT**, not POST: setting the plan
+   to X twice leaves them on X.
+3. ~~`PUT /v1/customers/{id}/caller-id`~~ — done; an empty value withdraws it.
+4. ~~`POST /v1/auth/verify`~~ — done, against stored HA1.
+5. ~~`GET /v1/customers/{id}/registration`~~ — done, via MI `ul_show_contact`.
+   Distinguishes "not registered" from "the switch could not be asked".
+6. ~~Import path accepting a supplied credential~~ — done.
+7. **`POST /v1/calls/originate`** — click-to-call, via MI. Still open, and still
+   last: it is the only one that is not needed to run the business.
+
+## Carriers: what connecting a real one actually took
+
+The trunk half of the admin console is not symmetric with the customer half, and
+a live provider is what showed why.
+
+| `VosAdminClient` method | MEGATRON | Note |
+|---|---|---|
+| `listRoutes()` / `listInboundGateways()` | `GET /v1/trunks`, split by direction | `priority` is real and is reported: MEGATRON picks a carrier by it. |
+| `createRoute(spec)` / `createInboundGateway(spec)` | `POST /v1/trunks` | `priority` is passed through. Dropping it would put every console-created trunk on one value, where the tie-break by id sends all traffic to whichever was added first — so adding a carrier appears to do nothing. |
+| `deleteRoute(name)` / `deleteInboundGateway(name)` | `DELETE /v1/trunks/{id}` | VOIPX names a gateway, MEGATRON keys a trunk by id, so the name is looked up. A name matching nothing is refused **locally** — a 404 from the switch reads to an operator as "the switch is broken". |
+| `setRoute*` / `setInbound*` | — | Still refused locally. MEGATRON has no partial update for a trunk; retire and re-add. |
+
+Three things a carrier needs that were not obvious until one was connected:
+
+- **`auth_realm` is what they challenge with, not their domain.** A real
+  provider handed over the domain `privatesip.com` and then challenged with
+  `realm="asterisk"` — the Asterisk default, which nobody documents because
+  nobody looks. A wrong realm produces a digest the carrier reads as a bad
+  password. Read it off the wire; do not infer it.
+- **`from_user` decides whether the call is theirs to accept.** MEGATRON's From
+  carries the customer's handle, because that is who authenticated and who gets
+  billed. A carrier that authenticates by account looks up the peer by From
+  user, finds nothing, and answers **403 Forbidden with the digest perfectly
+  correct**. Defaults to the account name on a credentialed trunk.
+- **Trunks must be removable.** Without that, test carriers accumulate, tie on
+  priority, and the oldest wins every call.
 
 ## VOIPX drives EITHER backend. Both stay working.
 
