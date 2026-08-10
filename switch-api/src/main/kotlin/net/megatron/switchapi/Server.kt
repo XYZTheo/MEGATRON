@@ -57,6 +57,18 @@ fun Application.switchApiModule(service: CallService) {
                 call.respond(service.authorize(call.receive<AuthorizeRequest>()))
             }
 
+            /**
+             * A call ARRIVING from a carrier, for one of our DIDs.
+             *
+             * Separate from /authorize because the two answer different
+             * questions from different evidence: that one is handed an
+             * authenticated account, this one is handed a source address and
+             * a dialled number and has to work out whose call it is.
+             */
+            post("/authorize-inbound") {
+                call.respond(service.authorizeInbound(call.receive<InboundAuthorizeRequest>()))
+            }
+
             post("/session/end") {
                 call.respond(service.endSession(call.receive<EndSessionRequest>()))
             }

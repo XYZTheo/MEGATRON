@@ -60,25 +60,7 @@ fun main() {
         // written. Loud, though — a CDR that vanishes silently is revenue that
         // cannot be argued for with a carrier either.
         try {
-            store.recordCall(
-                net.megatron.provisioning.CallRecord(
-                    callId = cdr.callId,
-                    account = cdr.account,
-                    destination = cdr.destination,
-                    prefix = cdr.prefix,
-                    durationSeconds = cdr.durationSeconds,
-                    durationSource = cdr.durationSource,
-                    billedSeconds = cdr.billedSeconds,
-                    chargedMicros = cdr.chargedMicros,
-                    ratePerMinute = cdr.ratePerMinute,
-                    mediaBytes = cdr.mediaBytes,
-                    mediaStats = cdr.mediaStats,
-                    noMedia = cdr.noMedia,
-                    overran = cdr.overran,
-                    hangupCause = cdr.hangupCause,
-                    endedAt = cdr.endedAt,
-                )
-            )
+            store.recordCall(cdr.toCallRecord())
         } catch (failure: Throwable) {
             System.err.println("WARNING: could not store the CDR for ${cdr.callId}: $failure")
         }

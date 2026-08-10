@@ -169,6 +169,10 @@ CREATE TABLE IF NOT EXISTS cdrs (
     no_media                INTEGER NOT NULL DEFAULT 0,
     overran                 INTEGER NOT NULL DEFAULT 0,
     hangup_cause            TEXT,
+    -- 'outbound' or 'inbound'. A customer must be able to tell a call they
+    -- made from one they received; "I never dialled that" is where most
+    -- billing disputes start.
+    direction               TEXT NOT NULL DEFAULT 'outbound',
     ended_at                TEXT NOT NULL
 );
 

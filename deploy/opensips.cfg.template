@@ -324,8 +324,113 @@ route {
         exit;
     }
 
+    # A CALL FROM A CARRIER IS NOT A CALL FROM A CUSTOMER.
+    #
+    # Tried FIRST, because an inbound INVITE carries no credentials and the
+    # authenticate route would answer it with a 407 the carrier has no way to
+    # satisfy. That is exactly what happened before this existed: an operator
+    # points a provider at this address, the provider sees 407 on every call,
+    # and the switch looks like it is rejecting their traffic on purpose.
+    #
+    # The decision is NOT made here -- route[inbound] asks the same service
+    # that prices calls, because "is this address one of our carriers" and "who
+    # owns the number they dialled" are database questions, and answering them
+    # in config would put the allowlist in two places.
+    #
+    # ONLY WHEN THE REQUEST CARRIES NO CREDENTIALS, which keeps it off the hot
+    # path. A carrier never sends credentials; a customer's INVITE arrives
+    # without them exactly once and then carries them for the retry. So an
+    # authenticated call costs nothing here, and the one message that does pay
+    # for the lookup is the same message that would otherwise be answered with
+    # a 407 -- cheap either way. Doing it unconditionally would put a second
+    # HTTP round trip in front of every call on a 5 ms budget.
+    if ($hdr(Authorization) == NULL && $hdr(Proxy-Authorization) == NULL) {
+        route(inbound);
+    }
+
     route(authenticate);
     route(authorize);
+}
+
+# -- calls arriving from a carrier -------------------------------------------
+
+/**
+ * Returns without doing anything unless the source is a known inbound trunk,
+ * so a customer's INVITE falls straight through to the authenticated path.
+ *
+ * NOTHING HERE TRUSTS THE REQUEST. The source address is what the switch saw,
+ * not a header; the account is looked up from the dialled number rather than
+ * taken from From. A carrier can tell us who is calling, and it may well be
+ * false -- that value reaches the CDR and never a decision.
+ */
+route[inbound] {
+    $json(inb) := "{}";
+    $json(inb/source_ip) = $si;
+    $json(inb/did)       = $rU;
+    $json(inb/caller_id) = $fU;
+    $json(inb/call_id)   = $ci;
+
+    if (!rest_post("http://127.0.0.1:8082/v1/authorize-inbound", $json(inb),
+                   "application/json", $var(ibody), $var(ictype), $var(icode))) {
+        # FAILS CLOSED, like the outbound path, and for a plainer reason: with
+        # the service unreachable there is no way to know whose call this is,
+        # and delivering it to a guess is worse than not delivering it.
+        xlog("L_ERR", "MEGATRON: inbound authorizer unreachable for $ci from $si\n");
+        send_reply(503, "Service Unavailable");
+        exit;
+    }
+
+    $json(irsp) := $var(ibody);
+
+    # Not one of our carriers: this is an ordinary customer call. Say nothing
+    # and let route[authenticate] challenge it as usual.
+    if ($json(irsp/reason) == "source_not_a_trunk") {
+        return;
+    }
+
+    if ($json(irsp/decision) != "allow") {
+        $var(isip) = $json(irsp/sip_code);
+        # The REASON is logged and the CODE is sent. Never the detail: "no
+        # customer receives calls on that number" told to a caller lets anyone
+        # dial a range and map which of our DIDs are live.
+        xlog("L_NOTICE", "MEGATRON: inbound refused $fU -> $rU from $si "
+             "($json(irsp/reason)) -> $var(isip)\n");
+        send_reply($var(isip), "Refused");
+        exit;
+    }
+
+    $var(iaccount) = $json(irsp/account);
+    $var(imaxdur)  = $json(irsp/max_seconds);
+
+    # WHERE THE CALL IS DELIVERED IS THE CUSTOMER'S REGISTRATION.
+    #
+    # The request URI is rewritten from the DID to the account, because that is
+    # what the customer's phone registered as -- lookup() searches by the URI's
+    # user part and would find nothing under the dialled number.
+    $rU = $var(iaccount);
+
+    create_dialog();
+    $DLG_timeout = $var(imaxdur);
+
+    if (!rtpengine_offer()) {
+        xlog("L_ERR", "MEGATRON: rtpengine_offer FAILED for inbound $ci\n");
+    }
+
+    record_route();
+    t_on_reply("handle_reply");
+
+    if (!lookup("location")) {
+        # THE CUSTOMER IS NOT REGISTERED. 480, not 404: the number is real and
+        # the account is fine, they simply have no phone online right now, and
+        # a 404 would tell the caller the number does not exist.
+        xlog("L_NOTICE", "MEGATRON: inbound $rU has no registration -- 480\n");
+        send_reply(480, "Temporarily Unavailable");
+        exit;
+    }
+
+    xlog("L_NOTICE", "MEGATRON: inbound $fU -> $var(iaccount) via $si for $var(imaxdur)s\n");
+    t_relay();
+    exit;
 }
 
 # -- who are you? ------------------------------------------------------------
@@ -507,7 +612,12 @@ route[authorize] {
 
     if ($json(rsp/decision) != "allow") {
         $var(sip) = $json(rsp/sip_code);
-        xlog("L_INFO", "MEGATRON: reject $au -> $rU  $json(rsp/reason) -> $var(sip)\n");
+        # The DETAIL is logged, never sent. Two refusals can share a reason and
+        # a code -- "this plan has no rates" and "no carrier is configured" both
+        # come back as no_rate_for_destination/503 -- and they are fixed in
+        # completely different places.
+        xlog("L_INFO", "MEGATRON: reject $au -> $rU  $json(rsp/reason) -> $var(sip)"
+             "  [$json(rsp/detail)]\n");
         send_reply($var(sip), "Refused");
         exit;
     }

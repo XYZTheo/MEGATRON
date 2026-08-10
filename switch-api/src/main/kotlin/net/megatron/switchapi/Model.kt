@@ -84,11 +84,79 @@ data class AuthorizeResponse(
     /** Machine-readable refusal, for the switch to map onto a SIP response. */
     val reason: String? = null,
     /**
+     * The sentence an operator needs, for the switch's log — never for the
+     * wire.
+     *
+     * "Plan has no rates" and "no carrier is configured" were both reported as
+     * `no_rate_for_destination` with a 503, which is one message for two
+     * problems that are fixed in completely different places. The operator was
+     * left to guess, and so was I: it cost a full test cycle to work out which
+     * of the two a run of 503s actually was.
+     *
+     * Safe to return here, unlike on the inbound path: this call is already
+     * authenticated, so nothing in the sentence tells the caller something
+     * they could not learn by having the credential they just used.
+     */
+    val detail: String? = null,
+    /**
      * The SIP response the edge should send. Chosen here rather than in
      * config: "no balance" and "no rate for that destination" are different
      * facts and a customer's softphone should not show the same message for
      * both.
      */
+    @SerialName("sip_code") val sipCode: Int? = null,
+)
+
+/**
+ * A call ARRIVING from a carrier, addressed to one of our DIDs.
+ *
+ * A separate request from [AuthorizeRequest] because nothing about it is the
+ * same. There is no authenticated account — the caller is a stranger on the
+ * internet and the carrier is identified by its source address. The account is
+ * something we look UP, from the number dialled, rather than something the
+ * request asserts.
+ */
+@Serializable
+data class InboundAuthorizeRequest(
+    /**
+     * Where the INVITE came from, as the switch saw it.
+     *
+     * THIS IS THE ONLY AUTHENTICATION AN INBOUND TRUNK HAS. A carrier sending
+     * us traffic does not log in; the allowlist is the credential. Which is
+     * also why it is checked here and not in switch config: an open inbound
+     * path is how a switch ends up carrying somebody else's calls at the
+     * operator's expense.
+     */
+    @SerialName("source_ip") val sourceIp: String,
+    /** The number dialled — one of our DIDs, or the call goes nowhere. */
+    val did: String,
+    /** The caller's number, for the CDR. Untrusted: the far end sets it. */
+    @SerialName("caller_id") val callerId: String? = null,
+    @SerialName("call_id") val callId: String,
+)
+
+@Serializable
+data class InboundAuthorizeResponse(
+    val decision: String,
+    /**
+     * The handle whose registration the switch should look up. Present only on
+     * an allow — an operator's inbound routing is "find who owns this number,
+     * then find where their phone currently is".
+     */
+    val account: String? = null,
+    @SerialName("max_seconds") val maxSeconds: Int? = null,
+    @SerialName("rate_micros_per_minute") val ratePerMinute: Long? = null,
+    @SerialName("reserved_micros") val reservedMicros: Long? = null,
+    /**
+     * Whether this call costs the customer anything.
+     *
+     * Said explicitly rather than inferred from a zero rate, because "this
+     * plan prices inbound at zero" and "this plan does not price inbound at
+     * all" are different operator intentions and only one of them is a
+     * mistake worth noticing.
+     */
+    val charged: Boolean = false,
+    val reason: String? = null,
     @SerialName("sip_code") val sipCode: Int? = null,
 )
 
@@ -177,6 +245,16 @@ data class Cdr(
     @SerialName("no_media") val noMedia: Boolean,
     val overran: Boolean,
     @SerialName("hangup_cause") val hangupCause: String?,
+    /**
+     * "outbound" or "inbound".
+     *
+     * On the record because a customer reading their own call list must be
+     * able to tell a call they made from a call they received. Without it an
+     * inbound DID call and an outbound call to the same number are one row
+     * shape, and the first question in any billing dispute — "I never dialled
+     * that" — has no answer here.
+     */
+    val direction: String = "outbound",
     @SerialName("ended_at") val endedAt: String,
 )
 

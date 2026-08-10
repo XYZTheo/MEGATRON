@@ -427,6 +427,16 @@ data class CallRecord(
     @SerialName("no_media") val noMedia: Boolean = false,
     val overran: Boolean = false,
     @SerialName("hangup_cause") val hangupCause: String? = null,
+    /**
+     * "outbound" or "inbound".
+     *
+     * A customer reading their own history must be able to tell a call they
+     * made from one they received; "I never dialled that number" is the first
+     * sentence of most billing disputes, and without this field the record has
+     * no answer to it. Defaults to outbound so rows written before inbound
+     * existed keep their meaning.
+     */
+    val direction: String = "outbound",
     @SerialName("ended_at") val endedAt: String,
 )
 

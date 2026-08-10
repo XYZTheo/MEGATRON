@@ -115,8 +115,19 @@ class Ledger {
         return Micros(state.balance.get() + headroom - state.reserved.get())
     }
 
+    /**
+     * How many calls this account has up right now.
+     *
+     * AN ACCOUNT THE LEDGER HAS NEVER SEEN HAS ZERO CALLS, which is a fact
+     * rather than an error. This used to be `getValue`, which throws on a
+     * missing key — so asking about a customer who had not yet made a call
+     * blew up instead of answering "none". Nothing hit it while every caller
+     * happened to sync a balance first; the inbound path does not, because a
+     * customer with no balance still receives calls, and it fell over on the
+     * first customer who had never dialled out.
+     */
     fun activeCalls(accountId: String): Int =
-        accounts.getValue(accountId).activeCalls.get().toInt()
+        accounts[accountId]?.activeCalls?.get()?.toInt() ?: 0
 
     /**
      * Hold [amount] against the account.

@@ -35,6 +35,18 @@ class CallService(
 
     private val authorizer = Authorizer(ledger, ceilingSeconds)
 
+    /**
+     * Where the reason an inbound call was refused goes.
+     *
+     * A refusal the operator cannot see is a support call they cannot answer:
+     * "my provider says they're sending calls and nothing arrives" has half a
+     * dozen causes and they are told apart here or nowhere. Kept as a sink
+     * rather than a logger call so a test can read what was written.
+     */
+    private val refusalLog: (String, String) -> Unit = { reason, detail ->
+        System.err.println("inbound refused [$reason] $detail")
+    }
+
     private data class CachedTable(val version: String?, val table: RateTable)
 
     private val tables = ConcurrentHashMap<String, CachedTable>()
@@ -47,6 +59,24 @@ class CallService(
         val planId: String,
         /** When we authorized it — the fallback clock. See endSession. */
         val authorizedAtMillis: Long,
+        /**
+         * THE RATE THIS CALL WAS QUOTED, captured at authorize time.
+         *
+         * Settlement used to look the rate up again when the BYE arrived,
+         * which prices the call at whatever the plan says at hang-up rather
+         * than what it said when the customer was told how long they could
+         * talk. A reprice mid-call then billed against a reservation taken at
+         * the old price — the two disagree, and the customer's is the one that
+         * was quoted.
+         *
+         * Null means the call is free and nothing was reserved: an inbound
+         * call to a plan with no rate for the DID. Free is a state, not a
+         * zero, so settlement can tell "costs nothing" from "costs nothing per
+         * minute".
+         */
+        val rate: Rate?,
+        /** "outbound" or "inbound". Ends up on the CDR. */
+        val direction: String = "outbound",
     )
 
     private val inFlight = ConcurrentHashMap<String, InFlight>()
@@ -116,6 +146,7 @@ class CallService(
                     destination = request.destination,
                     planId = customer.planId,
                     authorizedAtMillis = System.currentTimeMillis(),
+                    rate = table.lookup(request.destination),
                 )
                 AuthorizeResponse(
                     decision = "allow",
@@ -135,14 +166,184 @@ class CallService(
         }
     }
 
+    /**
+     * A call arriving from a carrier for one of our DIDs.
+     *
+     * This is the half of the business the operator sells when he tells a
+     * provider to point their traffic at this address. It is NOT the outbound
+     * path with the arrows reversed, and the differences are all security:
+     *
+     * - **There is no authenticated account.** The caller is a stranger; the
+     *   carrier is identified by source address alone. So the allowlist is
+     *   checked FIRST and a non-match is refused before anything else is even
+     *   looked up — an inbound path that accepts from anywhere carries other
+     *   people's traffic at the operator's expense, and it is the single most
+     *   common way a switch is abused.
+     * - **The account is looked up, not asserted.** From the number dialled.
+     *   An unknown DID reaches nobody.
+     * - **A customer with no balance still receives calls.** They bought the
+     *   number; refusing their inbound because their outbound credit ran out
+     *   is a surprise that costs the operator the customer. So the balance
+     *   only gates inbound that the plan actually prices.
+     */
+    fun authorizeInbound(request: InboundAuthorizeRequest): InboundAuthorizeResponse {
+        // THE ALLOWLIST IS THE CREDENTIAL, so it is the first question asked.
+        val trunk = inboundTrunkFor(request.sourceIp)
+            ?: return rejectInbound(
+                "SOURCE_NOT_A_TRUNK",
+                "${request.sourceIp} is not a configured inbound trunk",
+                // 403 and not 404: this is a refusal to talk to the sender, and
+                // it says nothing about whether the number they dialled exists.
+                403,
+            )
+
+        val customer = store.customerForDid(request.did)
+            ?: return rejectInbound(
+                "NO_SUCH_DID",
+                "no customer receives calls on '${request.did}'",
+                404,
+            )
+
+        if (customer.status != CustomerStatus.ACTIVE) {
+            return rejectInbound(
+                Refusal.ACCOUNT_SUSPENDED.name,
+                "account ${customer.handle} is suspended",
+                403,
+            )
+        }
+
+        // The same cap as outbound, and it matters more here: a DID under a
+        // flood is an inbound call per packet, and the customer's phone is on
+        // the other end of every one of them.
+        if (ledger.activeCalls(customer.id) >= customer.maxConcurrentCalls) {
+            return rejectInbound(
+                Refusal.CONCURRENT_CALL_LIMIT.name,
+                "account ${customer.handle} already has ${customer.maxConcurrentCalls} calls up",
+                486,
+            )
+        }
+
+        val table = rateTableFor(customer.planId)
+        val rate = table?.lookup(request.did)
+
+        // NO RATE MEANS FREE, NOT REFUSED — the opposite of the outbound rule.
+        //
+        // Outbound, an unrated destination is carried at unknown cost to the
+        // operator, so it is refused. Inbound costs the operator nothing per
+        // minute they have not already agreed with the carrier, and a plan
+        // with no inbound pricing is the normal case: most operators charge
+        // rent for the DID and nothing per minute. Refusing here would mean
+        // every DID stops working the moment inbound pricing is not set up,
+        // which is a switch that does not deliver calls by default.
+        if (rate == null) {
+            inFlight[request.callId] = InFlight(
+                accountId = customer.id,
+                accountHandle = customer.handle,
+                destination = request.did,
+                planId = customer.planId,
+                authorizedAtMillis = System.currentTimeMillis(),
+                rate = null,
+                direction = "inbound",
+            )
+            // Still capped. A free call is not an unbounded one: a stuck
+            // inbound leg with no timer holds a concurrency slot forever, and
+            // the customer's own phone is what stops ringing.
+            return InboundAuthorizeResponse(
+                decision = "allow",
+                account = customer.handle,
+                maxSeconds = ceilingSeconds,
+                charged = false,
+            )
+        }
+
+        // Priced inbound: the customer is paying to receive, so it goes
+        // through the same reserve-then-debit path as an outgoing call and the
+        // balance gates it exactly the same way.
+        ledger.syncBalance(customer.id, Micros(customer.balanceMicros))
+        val account = Account(
+            id = customer.id,
+            balance = Micros(customer.balanceMicros),
+            mode = BillingMode.PREPAID,
+            maxConcurrentCalls = customer.maxConcurrentCalls,
+            suspended = false,
+        )
+        return when (val decision = authorizer.authorize(account, request.did, table, request.callId)) {
+            is Decision.Allow -> {
+                inFlight[request.callId] = InFlight(
+                    accountId = customer.id,
+                    accountHandle = customer.handle,
+                    destination = request.did,
+                    planId = customer.planId,
+                    authorizedAtMillis = System.currentTimeMillis(),
+                    rate = rate,
+                    direction = "inbound",
+                )
+                InboundAuthorizeResponse(
+                    decision = "allow",
+                    account = customer.handle,
+                    maxSeconds = decision.maxSeconds,
+                    ratePerMinute = decision.ratePerMinute.value,
+                    reservedMicros = decision.reserved.value,
+                    charged = true,
+                )
+            }
+
+            is Decision.Reject -> rejectInbound(
+                decision.reason.name,
+                "${decision.detail} (via trunk ${trunk.name})",
+                sipCodeFor(decision.reason),
+            )
+        }
+    }
+
+    /**
+     * [detail] is deliberately NOT returned.
+     *
+     * The switch logs `reason` and answers `sip_code`, and neither of those
+     * distinguishes a DID that exists from one that does not. Handing the
+     * sentence back would put it one careless `xlog`-to-`send_reply` change
+     * away from the wire, and "no customer receives calls on that number" told
+     * to a caller is a DID enumeration oracle for anyone dialling a range —
+     * the same mistake the REGISTER path exists to avoid.
+     */
+    private fun rejectInbound(reason: String, detail: String, sipCode: Int): InboundAuthorizeResponse {
+        refusalLog(reason, detail)
+        return InboundAuthorizeResponse(
+            decision = "reject",
+            reason = reason.lowercase(),
+            sipCode = sipCode,
+        )
+    }
+
+    /**
+     * The enabled inbound trunk whose allowlist contains [sourceIp], or null.
+     *
+     * Read fresh on every call, like the outbound selection: a trunk disabled
+     * because a carrier is misbehaving has to stop being accepted now, not at
+     * the next restart.
+     */
+    private fun inboundTrunkFor(sourceIp: String): net.megatron.provisioning.Trunk? =
+        store.listTrunks().firstOrNull { trunk ->
+            trunk.enabled &&
+                trunk.direction != net.megatron.provisioning.TrunkDirection.OUTBOUND &&
+                net.megatron.provisioning.IpAllowlist.allows(trunk.remoteIps, sourceIp)
+        }
+
     fun endSession(request: EndSessionRequest): EndSessionResponse {
         val call = inFlight.remove(request.callId)
             ?: throw IllegalStateException("unknown call '${request.callId}'")
 
-        val table = rateTableFor(call.planId)
-            ?: throw IllegalStateException("plan '${call.planId}' lost its rates mid-call")
-        val rate = table.lookup(call.destination)
-            ?: throw IllegalStateException("rate vanished for '${call.destination}'")
+        // THE RATE THE CALL WAS QUOTED, not whatever the plan says now.
+        //
+        // This used to re-read the plan at hang-up, so a reprice while a call
+        // was up billed it at the new price against a reservation taken at the
+        // old one — the two disagree, and it is the customer's quote that was
+        // honest. It also meant a plan edited mid-call could throw "rate
+        // vanished" and fail the settlement of a call that really happened.
+        //
+        // Null is a free call (inbound to a plan with no price for the DID):
+        // nothing was reserved, so there is nothing to settle.
+        val rate = call.rate
 
         // BILLED DURATION MUST NOT DEPEND ON THE SIP SIDE GETTING IT RIGHT.
         //
@@ -165,8 +366,14 @@ class CallService(
         val billedDuration = if (trustSip) request.durationSeconds else serverSeconds
         val durationSource = if (trustSip) "sip" else "server-clock"
 
-        val charge = RatingEngine.rate(billedDuration, rate)
-        val settlement = ledger.settle(request.callId, charge.total)
+        // A free call reserved nothing, so there is nothing to release and
+        // nothing to charge. Handled as a branch rather than as a zero rate:
+        // ledger.settle() on a reservation that was never taken has no honest
+        // answer, and inventing one would report a balance the store never saw.
+        val charge = rate?.let { RatingEngine.rate(billedDuration, it) }
+        val settlement = charge?.let { ledger.settle(request.callId, it.total) }
+        val billedSeconds = charge?.billedSeconds ?: billedDuration
+        val chargedMicros = charge?.total?.value ?: 0L
 
         // Answered, billed, and no audio ever flowed. Flagged rather than
         // silently charged: billing for silence is how a switch loses a
@@ -183,18 +390,24 @@ class CallService(
         // Keep the store's balance in step with the ledger, so the bot and the
         // switch agree about what a customer has left. In production the
         // ledger IS the balance; here the two are reconciled explicitly.
-        store.findByHandle(call.accountHandle)?.let { customer ->
-            val delta = settlement.balanceAfter.value - customer.balanceMicros
-            if (delta != 0L) {
-                store.adjustBalance(
-                    customer.id,
-                    net.megatron.provisioning.BalanceAdjustment(
-                        amountMicros = delta,
-                        reason = "call ${request.callId} to ${call.destination}",
-                        reference = request.callId,
-                    ),
-                    "switch",
-                )
+        //
+        // A free call skips this entirely: writing a zero-delta adjustment
+        // would put a row in the audit trail saying money moved when none did.
+        val customer = store.findByHandle(call.accountHandle)
+        if (settlement != null) {
+            customer?.let {
+                val delta = settlement.balanceAfter.value - it.balanceMicros
+                if (delta != 0L) {
+                    store.adjustBalance(
+                        it.id,
+                        net.megatron.provisioning.BalanceAdjustment(
+                            amountMicros = delta,
+                            reason = "call ${request.callId} to ${call.destination}",
+                            reference = request.callId,
+                        ),
+                        "switch",
+                    )
+                }
             }
         }
 
@@ -203,28 +416,34 @@ class CallService(
                 callId = request.callId,
                 account = call.accountHandle,
                 destination = call.destination,
-                prefix = rate.prefix,
+                prefix = rate?.prefix,
                 durationSeconds = billedDuration,
                 durationSource = durationSource,
-                billedSeconds = charge.billedSeconds,
-                chargedMicros = charge.total.value,
-                ratePerMinute = rate.sellPerMinute.value,
+                billedSeconds = billedSeconds,
+                chargedMicros = chargedMicros,
+                // Zero, and the CDR says `charged_micros: 0` beside it, so a
+                // free call is legible as free rather than as a pricing bug.
+                ratePerMinute = rate?.sellPerMinute?.value ?: 0L,
                 mediaBytes = mediaBytes,
                 mediaStats = request.mediaStats,
                 noMedia = noMedia,
-                overran = settlement.overran,
+                overran = settlement?.overran ?: false,
                 hangupCause = request.hangupCause,
+                direction = call.direction,
                 endedAt = Instant.now().toString(),
             )
         )
 
         return EndSessionResponse(
             callId = request.callId,
-            chargedMicros = settlement.charged.value,
-            returnedMicros = settlement.returned.value,
-            balanceAfterMicros = settlement.balanceAfter.value,
-            billedSeconds = charge.billedSeconds,
-            overran = settlement.overran,
+            chargedMicros = chargedMicros,
+            returnedMicros = settlement?.returned?.value ?: 0L,
+            // A free call moves no money, so the balance after it is the
+            // balance before it — read from the store rather than invented.
+            balanceAfterMicros = settlement?.balanceAfter?.value
+                ?: customer?.balanceMicros ?: 0L,
+            billedSeconds = billedSeconds,
+            overran = settlement?.overran ?: false,
             noMedia = noMedia,
         )
     }
@@ -333,7 +552,8 @@ class CallService(
             decision = "reject",
             reason = reason.name.lowercase(),
             sipCode = sipCode,
-        ).also { if (detail.isNotEmpty()) Unit }
+            detail = detail,
+        )
 
     /**
      * SIP response per refusal, decided here rather than in OpenSIPS config.

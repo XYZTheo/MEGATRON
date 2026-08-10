@@ -133,6 +133,9 @@ class SqlStore(
                 backfill = "UPDATE trunks SET from_user = auth_username " +
                     "WHERE auth_username IS NOT NULL",
             ),
+            // No backfill: the DEFAULT is already right for every existing row,
+            // because until inbound existed every call was outbound.
+            Addition("cdrs", "direction", "TEXT NOT NULL DEFAULT 'outbound'", null),
         )
 
         for (addition in additions) {
@@ -988,12 +991,12 @@ class SqlStore(
             "INSERT OR IGNORE INTO cdrs (call_id, account, destination, prefix, " +
                 "duration_seconds, duration_source, billed_seconds, charged_micros, " +
                 "rate_micros_per_minute, media_bytes, media_stats, no_media, overran, " +
-                "hangup_cause, ended_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "hangup_cause, direction, ended_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             record.callId, record.account, record.destination, record.prefix,
             record.durationSeconds, record.durationSource, record.billedSeconds,
             record.chargedMicros, record.ratePerMinute, record.mediaBytes,
             record.mediaStats, if (record.noMedia) 1 else 0, if (record.overran) 1 else 0,
-            record.hangupCause, record.endedAt,
+            record.hangupCause, record.direction, record.endedAt,
         )
     }
 
@@ -1038,6 +1041,7 @@ class SqlStore(
                     noMedia = getInt("no_media") == 1,
                     overran = getInt("overran") == 1,
                     hangupCause = getString("hangup_cause"),
+                    direction = getString("direction") ?: "outbound",
                     endedAt = getString("ended_at"),
                 )
             )
