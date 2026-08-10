@@ -49,6 +49,27 @@ data class Account(
     val creditLimit: Micros = Micros.ZERO,
     val maxConcurrentCalls: Int = 2,
     val suspended: Boolean = false,
+    /**
+     * What to call this account in a message a human reads. NOT an identifier.
+     *
+     * Everything in here keys on [id], because a handle can be reassigned and a
+     * ledger that keyed on one would move money between customers. But an
+     * operator reading "cust-1786398571251-4c73 hit destinations-per-minute" has
+     * to go and look up which customer that is before they can do anything —
+     * which is what the first live run of the fraud guard printed, and it made
+     * an otherwise useful alert useless at the moment it mattered.
+     *
+     * Null falls back to the id: a label is a courtesy, and no message should
+     * become unprintable for want of one.
+     *
+     * LAST IN THE LIST, and that is not cosmetic. Adding it after `mode`
+     * silently re-bound every positional `Account(...)` in the test suite —
+     * creditLimit became a String, maxConcurrentCalls became a Micros — and the
+     * compiler caught it only because the types happened to differ. A new
+     * parameter in the middle of a value type with defaults is a change to
+     * every caller that did not name its arguments.
+     */
+    val label: String? = null,
 ) {
     init {
         require(maxConcurrentCalls >= 1) { "maxConcurrentCalls must be >= 1" }

@@ -20,6 +20,16 @@ enum class Refusal {
     INSUFFICIENT_BALANCE,
     CONCURRENT_CALL_LIMIT,
     INVALID_DESTINATION,
+
+    /**
+     * The account is placing calls faster than any legitimate use of it does.
+     *
+     * Distinct from CONCURRENT_CALL_LIMIT, which is about how many calls are up
+     * at once. This is about rate, and it is the one that catches a stolen
+     * login: ten calls at a time, each lasting four seconds, breaks no other
+     * limit here and empties an account overnight.
+     */
+    FRAUD_VELOCITY,
 }
 
 sealed interface Decision {
@@ -51,6 +61,19 @@ sealed interface Decision {
 class Authorizer(
     private val ledger: Ledger,
     private val ceilingSeconds: Int = 4 * 60 * 60,
+    private val fraud: FraudGuard = FraudGuard(),
+    /**
+     * Where a tripped velocity limit is reported.
+     *
+     * A control that silently refuses calls is indistinguishable from a broken
+     * switch: the customer says "I cannot call out", the operator sees nothing,
+     * and the first explanation anyone finds is the wrong one. The trip carries
+     * the account, the rule and the numbers precisely so that conversation is
+     * one sentence long.
+     */
+    private val onTrip: (FraudGuard.Trip) -> Unit = {
+        System.err.println("FRAUD GUARD: ${it.detail}")
+    },
 ) {
 
     fun authorize(
@@ -106,11 +129,36 @@ class Authorizer(
         // Reserve exactly what the granted duration will bill, so the
         // settlement can only ever return money, never discover a shortfall.
         val toReserve = RatingEngine.rate(seconds, rate).total
+
+        // VELOCITY, CHECKED LAST AND BEFORE THE RESERVATION.
+        //
+        // Last, because it is the only check that needs to know what the call
+        // would cost, and cost is not known until the rate and the affordable
+        // duration are. Before the reservation, because a refused call must not
+        // hold money — and because a call that is about to be refused should
+        // not appear in the account's own velocity history.
+        fraud.check(account.id, digits, toReserve.value, account.label ?: account.id)?.let { trip ->
+            onTrip(trip)
+            return Decision.Reject(
+                Refusal.FRAUD_VELOCITY,
+                // The numbers are for the operator. The customer's phone shows
+                // a SIP code and nothing else -- an attacker who can read the
+                // exact limit knows exactly what rate to stay under.
+                trip.detail,
+            )
+        }
+
         val reservation = ledger.reserve(account, toReserve, seconds, reservationId)
             ?: return Decision.Reject(
                 Refusal.INSUFFICIENT_BALANCE,
                 "lost a race for the remaining balance on ${account.id}"
             )
+
+        // Recorded only now, when the call is genuinely going ahead. Counting
+        // attempts instead would mean a tripped account stays tripped for a
+        // whole window on the strength of its own refusals, even if whatever
+        // was hammering it has stopped.
+        fraud.record(account.id, digits, toReserve.value)
 
         return Decision.Allow(
             reservationId = reservation.id,

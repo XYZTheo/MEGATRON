@@ -48,7 +48,36 @@ fun main() {
         SqlStore(dbUrl)
     }
 
-    val service = CallService(store, cdrSink = { cdr ->
+    // VELOCITY LIMITS, tunable but never off.
+    //
+    // The two rate limits fall back to the generous defaults in FraudGuard
+    // rather than to "unlimited": a control an operator has not yet thought
+    // about must still be protecting them, and these are set where no human
+    // dialling by hand can reach them. The hourly spend cap is the one that
+    // cannot have a sensible default -- the right number depends on what this
+    // operator's customers pay for -- so it stays off until chosen, and the
+    // absence is announced rather than assumed.
+    val fraudDefaults = net.megatron.authorizer.FraudGuard.Limits()
+    val spendCap = System.getenv("MEGATRON_FRAUD_MAX_SPEND_PER_HOUR_MICROS")?.toLongOrNull() ?: 0
+    if (spendCap <= 0) {
+        System.err.println(
+            "NOTE: MEGATRON_FRAUD_MAX_SPEND_PER_HOUR_MICROS is not set, so no hourly " +
+                "spend cap is enforced. Call-rate and destination-spread limits are " +
+                "active. Set it to the most a single customer should ever be able to " +
+                "spend in an hour."
+        )
+    }
+    val fraud = net.megatron.authorizer.FraudGuard(
+        net.megatron.authorizer.FraudGuard.Limits(
+            maxCallsPerMinute = System.getenv("MEGATRON_FRAUD_MAX_CALLS_PER_MINUTE")
+                ?.toIntOrNull() ?: fraudDefaults.maxCallsPerMinute,
+            maxDestinationsPerMinute = System.getenv("MEGATRON_FRAUD_MAX_DESTINATIONS_PER_MINUTE")
+                ?.toIntOrNull() ?: fraudDefaults.maxDestinationsPerMinute,
+            maxSpendPerHourMicros = spendCap.coerceAtLeast(0),
+        )
+    )
+
+    val service = CallService(store, fraud = fraud, cdrSink = { cdr ->
         // STORED, NOT JUST PRINTED. Every charge on the ledger came from a
         // call, and this is the row that says which one, how long it ran, at
         // what rate, and whether audio flowed. Without it "why is my bill this

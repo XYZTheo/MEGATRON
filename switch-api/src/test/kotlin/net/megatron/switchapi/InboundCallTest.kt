@@ -248,6 +248,96 @@ class InboundCallTest {
         assertEquals("source_not_a_trunk", inbound(service).reason)
     }
 
+    // -- velocity ------------------------------------------------------------
+
+    @Test
+    fun `a stolen login dialling flat out is refused, and looks like a suspension`() {
+        // THE ATTACK THE CONCURRENCY CAP DOES NOT CATCH. Each call ends before
+        // the next begins, so nothing is ever concurrent; the account simply
+        // dials without stopping. Every call here is individually legitimate.
+        val store = InMemoryStore()
+        store.createTrunk(
+            CreateTrunk(
+                name = "carrier", direction = TrunkDirection.OUTBOUND,
+                host = "203.0.113.10", remoteIps = listOf("203.0.113.10"),
+            )
+        )
+        val plan = store.createPlan(CreatePlan("Retail", "USD"))
+        store.replaceRates(
+            plan.id,
+            ReplaceRates(rates = listOf(RateRow(prefix = "1", sellMicrosPerMinute = 6_000,
+                                                incrementSeconds = 1))),
+        )
+        store.createCustomer(
+            CreateCustomer(handle = "bigcorp", planId = plan.id,
+                           openingBalanceMicros = 500_000_000, maxConcurrentCalls = 50),
+            "test",
+        )
+        val service = CallService(
+            store,
+            fraud = net.megatron.authorizer.FraudGuard(
+                net.megatron.authorizer.FraudGuard.Limits(
+                    maxCallsPerMinute = 5, maxDestinationsPerMinute = 100,
+                )
+            ),
+        )
+
+        repeat(5) { i ->
+            val allowed = service.authorize(AuthorizeRequest("bigcorp", "121255500$i", "burst-$i"))
+            assertEquals("allow", allowed.decision, "call $i was refused before the limit")
+            service.endSession(EndSessionRequest(callId = "burst-$i", durationSeconds = 3))
+        }
+
+        val refused = service.authorize(AuthorizeRequest("bigcorp", "12125550099", "burst-6"))
+        assertEquals("reject", refused.decision)
+        assertEquals("fraud_velocity", refused.reason)
+        // THE SAME CODE A SUSPENDED ACCOUNT GETS, on purpose: a distinct
+        // response would tell whoever holds the stolen credential to slow down
+        // until it stops, which is the one thing this control cannot survive.
+        assertEquals(403, refused.sipCode)
+        // The operator gets the numbers; the caller gets a bare 403.
+        assertNotNull(refused.detail)
+        assertTrue(refused.detail.contains("calls-per-minute"))
+    }
+
+    @Test
+    fun `a refused call holds no money`() {
+        // A velocity refusal must not leave a reservation behind: an account
+        // under attack would end the minute with its balance held by calls that
+        // never happened, and the customer could not call even after it stopped.
+        val store = InMemoryStore()
+        store.createTrunk(
+            CreateTrunk(
+                name = "carrier", direction = TrunkDirection.OUTBOUND,
+                host = "203.0.113.10", remoteIps = listOf("203.0.113.10"),
+            )
+        )
+        val plan = store.createPlan(CreatePlan("Retail", "USD"))
+        store.replaceRates(
+            plan.id,
+            ReplaceRates(rates = listOf(RateRow(prefix = "1", sellMicrosPerMinute = 6_000,
+                                                incrementSeconds = 1))),
+        )
+        store.createCustomer(
+            CreateCustomer(handle = "bigcorp", planId = plan.id,
+                           openingBalanceMicros = 10_000_000, maxConcurrentCalls = 50),
+            "test",
+        )
+        val service = CallService(
+            store,
+            fraud = net.megatron.authorizer.FraudGuard(
+                net.megatron.authorizer.FraudGuard.Limits(maxCallsPerMinute = 1)
+            ),
+        )
+
+        service.authorize(AuthorizeRequest("bigcorp", "12125550001", "held-1"))
+        repeat(20) { service.authorize(AuthorizeRequest("bigcorp", "12125550002", "refused-$it")) }
+        service.endSession(EndSessionRequest(callId = "held-1", durationSeconds = 10))
+
+        // Only the one call that was allowed was ever charged: 10s at 6000/min.
+        assertEquals(10_000_000 - 1_000, store.findByHandle("bigcorp")!!.balanceMicros)
+    }
+
     // -- the rate a call was quoted ------------------------------------------
 
     @Test

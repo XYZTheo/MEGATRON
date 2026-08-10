@@ -4,6 +4,7 @@ import net.megatron.authorizer.Account
 import net.megatron.authorizer.Authorizer
 import net.megatron.authorizer.BillingMode
 import net.megatron.authorizer.Decision
+import net.megatron.authorizer.FraudGuard
 import net.megatron.authorizer.Ledger
 import net.megatron.authorizer.Refusal
 import net.megatron.provisioning.CustomerStatus
@@ -31,9 +32,16 @@ class CallService(
     private val ledger: Ledger = Ledger(),
     private val ceilingSeconds: Int = 4 * 60 * 60,
     private val cdrSink: (Cdr) -> Unit = {},
+    /**
+     * Velocity limits. Shared with the inbound path deliberately: a stolen
+     * login placing calls and a carrier hammering a DID are the same problem
+     * from opposite directions, and an account with two separate budgets has
+     * neither.
+     */
+    fraud: FraudGuard = FraudGuard(),
 ) {
 
-    private val authorizer = Authorizer(ledger, ceilingSeconds)
+    private val authorizer = Authorizer(ledger, ceilingSeconds, fraud)
 
     /**
      * Where the reason an inbound call was refused goes.
@@ -104,6 +112,9 @@ class CallService(
             id = customer.id,
             balance = Micros(customer.balanceMicros),
             mode = BillingMode.PREPAID,
+            // The name the operator knows them by, for anything a human reads.
+            // Money still keys on the id.
+            label = customer.handle,
             maxConcurrentCalls = customer.maxConcurrentCalls,
             suspended = customer.status != CustomerStatus.ACTIVE,
         )
@@ -264,6 +275,7 @@ class CallService(
             id = customer.id,
             balance = Micros(customer.balanceMicros),
             mode = BillingMode.PREPAID,
+            label = customer.handle,
             maxConcurrentCalls = customer.maxConcurrentCalls,
             suspended = false,
         )
@@ -570,5 +582,14 @@ class CallService(
         Refusal.NO_RATE_FOR_DESTINATION -> 404 // Not Found
         Refusal.CONCURRENT_CALL_LIMIT -> 486  // Busy Here
         Refusal.INVALID_DESTINATION -> 484    // Address Incomplete
+        // 403, and deliberately the SAME code a suspended account gets.
+        //
+        // Anything more specific is a signal to the attacker: a distinct
+        // response for "you are going too fast" tells whoever holds the stolen
+        // credential to slow down until it stops, which is the one thing this
+        // control cannot survive. The operator learns the difference from the
+        // log, where an attacker cannot read it — the same trick the REGISTER
+        // path uses against account enumeration.
+        Refusal.FRAUD_VELOCITY -> 403
     }
 }
