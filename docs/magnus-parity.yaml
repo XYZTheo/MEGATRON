@@ -1,0 +1,496 @@
+# =============================================================================
+# MEGATRON — MagnusBilling feature parity inventory
+# =============================================================================
+#
+# Seth, 2026-08-07: "it should have every single feature magnus has so we
+# arent missing anything."
+#
+# This is the machine-readable answer to that. Every module MagnusBilling
+# documents gets a row, a status, and an owner. ci/check_parity.py fails the
+# build if a row disappears, if a status is invented, or if a `planned` row
+# has no issue behind it — so "we aren't missing anything" is a checkable
+# statement rather than a belief.
+#
+# -----------------------------------------------------------------------------
+# WHERE THIS LIST CAME FROM, AND WHY THAT MATTERS
+# -----------------------------------------------------------------------------
+# The inventory is the directory listing of MagnusBilling's own DOCUMENTATION
+# tree (magnussolution/magnusbilling7, wiki/en/modules), read 2026-08-07.
+# Documentation only. No MagnusBilling source code has been read, and none may
+# be — MEGATRON is proprietary and Magnus is AGPL-adjacent GPL work.
+# CONTRIBUTING.md and ARCHITECTURE.md §3 make Magnus a *feature checklist and
+# threat model* and nothing else. A directory listing of docs pages is exactly
+# the permitted use; opening a PHP file to see how a feature works is not.
+#
+# The single documented exception elsewhere in the project is Magnus's DB
+# schema, needed for the importer, confined to that module.
+#
+# -----------------------------------------------------------------------------
+# PARITY IS NOT THE GOAL. PARITY MINUS THE DEFECTS IS.
+# -----------------------------------------------------------------------------
+# Some rows are `superseded` on purpose. Copying a feature that only exists
+# because of an Asterisk implementation detail, or one whose Magnus
+# implementation is the vulnerability, would be replicating the thing we are
+# replacing. Each of those rows says what MEGATRON does instead, so a sales
+# conversation can answer "do you have X?" with "yes, and here is why ours
+# works differently" rather than "no".
+#
+# `gap` is the number that must reach zero before anyone claims parity in
+# writing. It is deliberately visible.
+# =============================================================================
+
+meta:
+  source: "magnussolution/magnusbilling7 — wiki/en/modules (documentation tree)"
+  read_on: "2026-08-07"
+  clean_room: "documentation only; no MagnusBilling source code has been read"
+
+# status vocabulary:
+#   shipped     — exists in this repo and is verified by something that runs
+#   specified   — a contract or design artifact exists here; no implementation
+#   planned     — has an owning GitHub issue; nothing written yet
+#   gap         — nobody owns this yet. Drive to zero.
+#   superseded  — deliberately not replicated; `instead` says what we do
+groups:
+
+  - name: Customers, resellers and access control
+    modules:
+      - id: user
+        magnus: "Customer/account records, balance, credit limit"
+        v1: true
+        status: planned
+        issue: 9
+        note: "Multi-tenant from v1 rather than bolted on: PostgreSQL row-level security, not application-layer filtering."
+      - id: userHistory
+        magnus: "Audit of changes to a customer"
+        v1: true
+        status: planned
+        issue: 9
+        note: "Append-only. Magnus's is mutable by an admin, which makes it evidence of nothing."
+      - id: userRate
+        magnus: "Per-customer rate overrides"
+        v1: true
+        status: planned
+        issue: 7
+      - id: logUsers
+        magnus: "Login/activity log"
+        v1: true
+        status: planned
+        issue: 9
+      - id: groupUser
+        magnus: "User groups"
+        v1: true
+        status: planned
+        issue: 9
+      - id: groupUserGroup
+        magnus: "Group membership"
+        v1: true
+        status: planned
+        issue: 9
+      - id: groupModule
+        magnus: "Per-group module permissions"
+        v1: true
+        status: planned
+        issue: 9
+        note: "Deny-by-default. Enumerating every endpoint's authorization is already a CI gate requirement (issue #13)."
+      - id: module
+        magnus: "Registry of admin modules for permissioning"
+        v1: false
+        status: superseded
+        instead: "Permissions attach to API scopes, not to UI screens. A permission model that describes menus cannot protect an API, which is how admin panels grow endpoints nobody authorised."
+      - id: gAuthenticator
+        magnus: "Google Authenticator 2FA"
+        v1: true
+        status: planned
+        issue: 9
+        note: "TOTP plus WebAuthn. Magnus's default root/magnus is the reason MFA is not optional here."
+
+  - name: SIP endpoints and registration
+    modules:
+      - id: sip
+        magnus: "SIP account definitions (username/password or IP auth)"
+        v1: true
+        status: specified
+        note: "Class-5 registrar. See contracts/softphone-profiles.yaml for the per-client behaviour this has to get right."
+      - id: iax
+        magnus: "IAX2 accounts"
+        v1: false
+        status: superseded
+        instead: "Not implemented. IAX2 is effectively dead outside legacy Asterisk estates, it is a second attack surface, and no softphone on the target list speaks it. Revisit only if a paying customer needs it."
+      - id: sipuras
+        magnus: "Sipura/Linksys ATA auto-provisioning"
+        v1: false
+        status: superseded
+        instead: "A generic provisioning API keyed by MAC and model, rather than one vendor's XML. Sipura-specific provisioning is a 2006 artifact."
+      - id: sipTrace
+        magnus: "SIP packet trace per call"
+        v1: true
+        status: planned
+        issue: 3
+        note: "Homer/HEP, which is a real capture pipeline rather than a text field."
+      - id: servers
+        magnus: "Multi-server / node registry"
+        v1: true
+        status: specified
+        note: "Edge and core tiers exist as separate configs already; the node agent is issue #4."
+
+  - name: Rating, plans and offers
+    modules:
+      - id: Plan
+        magnus: "Rate plans grouping rates"
+        v1: true
+        status: planned
+        issue: 7
+      - id: rate
+        magnus: "Selling rates, prefix-based"
+        v1: true
+        status: planned
+        issue: 7
+        note: "Integer micro-units end to end. MONEY-NOT-FLOAT is already enforced by ci/policy_check.py before the code exists."
+      - id: rateProvider
+        magnus: "Buying rates per provider"
+        v1: true
+        status: planned
+        issue: 7
+      - id: prefix
+        magnus: "Destination prefix catalogue"
+        v1: true
+        status: planned
+        issue: 7
+      - id: offer
+        magnus: "Bundles/packages (included minutes)"
+        v1: false
+        status: planned
+        issue: 7
+      - id: offerCdr
+        magnus: "Calls consumed against an offer"
+        v1: false
+        status: planned
+        issue: 7
+      - id: offerUse
+        magnus: "Offer consumption counters"
+        v1: false
+        status: planned
+        issue: 7
+
+  - name: Routing, providers and trunks
+    modules:
+      - id: provider
+        magnus: "Upstream carrier records"
+        v1: true
+        status: planned
+        issue: 7
+      - id: providerCNL
+        magnus: "Provider code/national list"
+        v1: false
+        status: planned
+        issue: 7
+      - id: trunk
+        magnus: "Outbound trunk definitions"
+        v1: true
+        status: planned
+        issue: 3
+      - id: trunkGroup
+        magnus: "Trunk groups for failover/LCR"
+        v1: true
+        status: planned
+        issue: 7
+        note: "LCR lives in the authorizer, not in a GPL routing module — rating and routing are the same decision and splitting them creates two sources of truth for 'which gateway, at what cost'."
+      - id: trunkSipCodes
+        magnus: "Per-trunk SIP response code handling"
+        v1: true
+        status: planned
+        issue: 3
+        note: "Failover on response code is where most 'why did that call fail' tickets come from."
+
+  - name: DIDs
+    modules:
+      - id: did
+        magnus: "DID inventory, setup and monthly cost"
+        v1: false
+        status: planned
+        issue: 9
+      - id: didHistory
+        magnus: "DID assignment history"
+        v1: false
+        status: planned
+        issue: 9
+      - id: didUse
+        magnus: "DID usage/billing records"
+        v1: false
+        status: planned
+        issue: 8
+      - id: diddestination
+        magnus: "Where an inbound DID call goes"
+        v1: false
+        status: planned
+        issue: 3
+
+  - name: Payments, credit and vouchers
+    modules:
+      - id: refill
+        magnus: "Manual/automatic customer top-up"
+        v1: true
+        status: planned
+        issue: 9
+      - id: refillprovider
+        magnus: "Provider-side credit records"
+        v1: false
+        status: planned
+        issue: 9
+      - id: voucher
+        magnus: "Prepaid voucher codes"
+        v1: true
+        status: planned
+        issue: 9
+      - id: methodPay
+        magnus: "Payment gateways (PayPal, PagSeguro, Moip, GerenciaNet...)"
+        v1: false
+        status: planned
+        issue: 9
+        note: "Gateway integrations are per-market and go behind one internal interface, so adding a country is not a code change in the ledger."
+      - id: services
+        magnus: "Recurring non-call services"
+        v1: false
+        status: planned
+        issue: 9
+      - id: servicesUse
+        magnus: "Recurring service consumption"
+        v1: false
+        status: planned
+        issue: 9
+      - id: sendCreditProducts
+        magnus: "Mobile top-up / airtime products"
+        v1: false
+        status: planned
+        issue: 19
+        note: "No owner yet. Real revenue line for some Magnus operators; needs a decision on whether v1 carries it."
+      - id: sendCreditRates
+        magnus: "Airtime product pricing"
+        v1: false
+        status: planned
+        issue: 19
+      - id: sendCreditSummary
+        magnus: "Airtime sales reporting"
+        v1: false
+        status: planned
+        issue: 19
+
+  - name: CDR and reporting
+    modules:
+      - id: call
+        magnus: "CDR browser"
+        v1: true
+        status: planned
+        issue: 8
+        note: "ClickHouse. The immutable raw-event table is also the rerating replay log, which is why Kafka is deliberately deferred."
+      - id: callArchive
+        magnus: "Archived CDR"
+        v1: false
+        status: planned
+        issue: 8
+      - id: callOnLine
+        magnus: "Live calls in progress"
+        v1: true
+        status: planned
+        issue: 8
+      - id: callSummaryPerDay
+        magnus: "Daily summary"
+        v1: true
+        status: planned
+        issue: 8
+      - id: callSummaryPerMonth
+        magnus: "Monthly summary"
+        v1: true
+        status: planned
+        issue: 8
+      - id: callSummaryPerTrunk
+        magnus: "Per-trunk summary"
+        v1: true
+        status: planned
+        issue: 8
+      - id: callSummaryPerUser
+        magnus: "Per-customer summary"
+        v1: true
+        status: planned
+        issue: 8
+      - id: callSummaryDayAgent
+        magnus: "Daily per-agent summary"
+        v1: false
+        status: planned
+        issue: 8
+      - id: callSummaryDayTrunk
+        magnus: "Daily per-trunk summary"
+        v1: false
+        status: planned
+        issue: 8
+      - id: callSummaryDayUser
+        magnus: "Daily per-customer summary"
+        v1: false
+        status: planned
+        issue: 8
+      - id: callSummaryMonthDid
+        magnus: "Monthly per-DID summary"
+        v1: false
+        status: planned
+        issue: 8
+      - id: callSummaryMonthTrunk
+        magnus: "Monthly per-trunk summary"
+        v1: false
+        status: planned
+        issue: 8
+      - id: callSummaryMonthUser
+        magnus: "Monthly per-customer summary"
+        v1: false
+        status: planned
+        issue: 8
+        note: "Magnus ships these as fourteen separate screens. MEGATRON does one report surface with dimensions, because fourteen screens is a symptom of not having a query model."
+
+  - name: Telephony features
+    modules:
+      - id: ivr
+        magnus: "IVR menus"
+        v1: false
+        status: planned
+        issue: 3
+        note: "FreeSWITCH behind the proxy, class-5 only."
+      - id: queue
+        magnus: "Call queues"
+        v1: false
+        status: planned
+        issue: 3
+      - id: queueMember
+        magnus: "Queue agents"
+        v1: false
+        status: planned
+        issue: 3
+      - id: callBack
+        magnus: "Callback / CID callback"
+        v1: false
+        status: planned
+        issue: 3
+        note: "A real revenue feature in several Magnus markets, not a curiosity."
+      - id: holidays
+        magnus: "Holiday routing calendars"
+        v1: false
+        status: planned
+        issue: 3
+      - id: sms
+        magnus: "SMS send/receive and billing"
+        v1: false
+        status: planned
+        issue: 16
+        note: "No owner. Needs a decision: SMS is a different billing model and a different compliance surface."
+      - id: phoneBook
+        magnus: "Per-customer phonebook"
+        v1: false
+        status: planned
+        issue: 10
+      - id: callerid
+        magnus: "Caller ID management per customer"
+        v1: true
+        status: planned
+        issue: 9
+        note: "Also the STIR/SHAKEN attestation boundary — you cannot attest a CLI you never verified the customer owns."
+      - id: phoneNumber
+        magnus: "Number catalogue"
+        v1: true
+        status: planned
+        issue: 9
+
+  - name: Outbound campaigns / dialer
+    modules:
+      - id: campaign
+        magnus: "Voice broadcast campaigns"
+        v1: false
+        status: planned
+        issue: 17
+        note: "No owner. Also the highest regulatory-risk feature in the product — a dialer is how a platform ends up carrying someone else's robocalls."
+      - id: campaignDashboard
+        magnus: "Campaign monitoring"
+        v1: false
+        status: planned
+        issue: 17
+      - id: campaignLog
+        magnus: "Campaign call log"
+        v1: false
+        status: planned
+        issue: 17
+      - id: campaignPoll
+        magnus: "Poll/survey campaigns"
+        v1: false
+        status: planned
+        issue: 17
+      - id: campaignPollInfo
+        magnus: "Poll results"
+        v1: false
+        status: planned
+        issue: 17
+      - id: campaignReport
+        magnus: "Campaign reporting"
+        v1: false
+        status: planned
+        issue: 17
+      - id: campaignRestrictPhone
+        magnus: "Do-not-call list for campaigns"
+        v1: false
+        status: planned
+        issue: 17
+        note: "If campaigns ship, this ships first, not later. A dialer without a DNC list is a liability."
+
+  - name: Call shop
+    modules:
+      - id: callShopCdr
+        magnus: "Call shop booth CDR"
+        v1: false
+        status: planned
+        issue: 18
+        note: "No owner. Regional feature — real in some markets, dead weight in others."
+      - id: callSummaryCallShop
+        magnus: "Call shop reporting"
+        v1: false
+        status: planned
+        issue: 18
+      - id: rateCallshop
+        magnus: "Call shop specific rates"
+        v1: false
+        status: planned
+        issue: 18
+
+  - name: Security, operations and integration
+    modules:
+      - id: firewall
+        magnus: "IP blocking / fail2ban-style controls"
+        v1: true
+        status: shipped
+        note: "The shield tier already exceeds this: nftables baseline, pike/ratelimit, scanner fingerprinting, plus the operator dashboard and telemetry contract. This is the wedge product."
+      - id: alarm
+        magnus: "Threshold alarms and notifications"
+        v1: true
+        status: planned
+        issue: 4
+      - id: restrictedPhonenumber
+        magnus: "Blocked destination numbers"
+        v1: true
+        status: planned
+        issue: 7
+        note: "Fraud control. Belongs in the authorizer so it is enforced on the money path, not in a UI list somebody forgets to apply."
+      - id: configuration
+        magnus: "Global settings"
+        v1: true
+        status: specified
+        note: "contracts/wizard-answers.schema.json — and settings that can produce an insecure system are not expressible there at all."
+      - id: smtps
+        magnus: "Outbound mail server settings"
+        v1: false
+        status: planned
+        issue: 9
+      - id: templateMail
+        magnus: "Email templates"
+        v1: false
+        status: planned
+        issue: 9
+      - id: api
+        magnus: "REST API"
+        v1: true
+        status: specified
+        note: "API-first, not API-as-afterthought. CVE-2025-2609/2610 were Magnus APIs served as text/html; MEGATRON is JSON-only with nosniff, and that is already a policy-gate rule."

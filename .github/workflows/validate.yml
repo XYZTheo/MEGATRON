@@ -1,0 +1,412 @@
+name: validate
+
+# WHY THIS WORKFLOW EXISTS
+#
+# Until now nothing in this repository had ever been executed. The OpenSIPS
+# configs and nftables rulesets were written against documentation, on a
+# Windows box, with no Linux host available — issue #2 is still open and the
+# lab VPS is still unprovisioned.
+#
+# GitHub's runners are Linux. That means the two things most likely to be
+# wrong — a module that does not exist in OpenSIPS 3.6, and an nftables rule
+# that does not parse — can be checked today, on every push, without waiting
+# for the VPS. The project's own notes record that the Kamailio/OpenSIPS module
+# trap already cost real time once; this is the gate that makes it cost
+# nothing the second time.
+#
+# Read ci/render_for_check.py for an honest statement of what a green run here
+# does and does not prove. Briefly: it proves the configs are valid, not that
+# the switch works.
+#
+# ⚠️ AS OF 2026-08-06 THIS WORKFLOW HAS NEVER EXECUTED. GitHub Actions does not
+# currently run in this repository — see issue #15. That is an account-level
+# condition and was proven not to be a fault in this file (a minimal
+# hello-world workflow on a clean branch also produced no run). The workflow is
+# believed correct and should start working unchanged once Actions is enabled,
+# but until a run appears, treat every check below as UNVERIFIED rather than
+# passing. Do not cite it as evidence that the configs are valid.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  # --------------------------------------------------------------------
+  # Structural rules from CONTRIBUTING.md. Dependency-free and fast, so it
+  # runs first and gives the clearest failure message.
+  # --------------------------------------------------------------------
+  policy:
+    name: policy gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prove the gate can fail
+        # Runs the gate's own tests before trusting its verdict. A gate that
+        # has only ever been seen passing is indistinguishable from a broken
+        # one, and this project does not ship security controls on faith.
+        run: python3 ci/test_policy_check.py
+
+      - name: Check the repository
+        run: python3 ci/policy_check.py
+
+      - name: Prove the markup check can fail
+        run: python3 ci/test_check_ui_markup.py
+
+      - name: Check the shipped UI markup
+        # There is no browser and no Node runtime anywhere in this project's
+        # toolchain, so the dashboard's JavaScript has never been executed. A
+        # typo'd element id is a TypeError on the first line that touches it
+        # and a blank page for the operator, and nothing else in the pipeline
+        # would notice. This is the cheapest available substitute for running
+        # it — and it is what makes ui/README.md's "verified" list honest.
+        run: python3 ci/check_ui_markup.py
+
+  # --------------------------------------------------------------------
+  # Colour is a correctness property here, not a preference. The operator
+  # dashboard's job is to be readable by a tired human at 3am during an
+  # attack — quite possibly one of the ~8% of men with a colour-vision
+  # deficiency — so the contrast and CVD floors are measured on every push.
+  #
+  # This job has already earned its place: writing these checks found
+  # --mg-ink-faint shipping at 2.70:1 against --mg-ground while carrying
+  # the 10px axis labels.
+  # --------------------------------------------------------------------
+  palette:
+    name: design tokens
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prove the colour checks can fail
+        run: python3 ui/test_validate_palette.py
+
+      - name: Validate the shipped chart series in both modes
+        # Redundant with the PALETTE rule in the policy gate, and deliberately
+        # so: this prints the actual dE and contrast numbers into the log, so a
+        # palette change shows its working in the PR rather than just going
+        # green. The gate decides; this step explains.
+        #
+        # The hexes are READ OUT OF tokens.css rather than repeated here. A
+        # workflow carrying its own copy of the palette is the same drift bug
+        # the THEME-SYNC rule exists to prevent, one file further out, and it
+        # would fail in the most misleading way available: validating colours
+        # nobody ships while the real ones go unchecked.
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess, sys
+          sys.path[:0] = ["ci", "ui"]
+          from policy_check import parse_css_tokens, SERIES_RE
+          blocks = parse_css_tokens(open("ui/tokens.css", encoding="utf-8").read())
+          for mode, selector in (("light", ":root"), ("dark", ':root[data-theme="dark"]')):
+              t = blocks[selector]
+              series = [t[n] for n in sorted((n for n in t if SERIES_RE.match(n)),
+                                             key=lambda n: int(SERIES_RE.match(n).group(1)))]
+              subprocess.run([sys.executable, "ui/validate_palette.py", ",".join(series),
+                              "--mode", mode, "--surface", t["--mg-ground"]], check=True)
+          PY
+
+  # --------------------------------------------------------------------
+  # The rating engine. This is the code that decides what a customer is
+  # charged, so its tests are the ones that must never be allowed to rot.
+  #
+  # Pure logic with no I/O and no clock, deliberately, so it can be tested
+  # to the cent without standing up a database — and so it runs here, on a
+  # runner, years before there is a switch to run it on.
+  # --------------------------------------------------------------------
+  rating:
+    name: jvm services
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Run the JVM test suite
+        run: ./gradlew test --console=plain
+
+      - name: Publish the report when it fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jvm-test-reports
+          path: "*/build/reports/tests/test"
+
+  # --------------------------------------------------------------------
+  # The one that matters most: real OpenSIPS 3.6, real module binaries.
+  # --------------------------------------------------------------------
+  sip-config:
+    name: opensips -C
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add the OpenSIPS 3.6 apt repository
+        # Pinned to the 3.6-releases component deliberately. 3.6 is the LTS
+        # line (support to 2028-05) that ARCHITECTURE.md section 4.2 commits
+        # to; 4.0 is not LTS and carries the largest core rewrite in the
+        # project's history. Validating against 4.0 would tell us nothing
+        # about what we intend to run.
+        run: |
+          set -euo pipefail
+          sudo install -d -m 0755 /usr/share/keyrings
+          curl -fsSL https://apt.opensips.org/opensips-org.gpg \
+            -o /tmp/opensips-org.gpg
+          # The published key has been distributed both armoured and binary at
+          # different times. Normalise rather than assume.
+          if grep -q "BEGIN PGP PUBLIC KEY BLOCK" /tmp/opensips-org.gpg; then
+            sudo gpg --dearmor -o /usr/share/keyrings/opensips-org.gpg /tmp/opensips-org.gpg
+          else
+            sudo cp /tmp/opensips-org.gpg /usr/share/keyrings/opensips-org.gpg
+          fi
+          echo "deb [signed-by=/usr/share/keyrings/opensips-org.gpg] https://apt.opensips.org noble 3.6-releases" \
+            | sudo tee /etc/apt/sources.list.d/opensips.list
+          sudo apt-get update
+
+      - name: Install OpenSIPS and the modules the configs load
+        # Module-to-package mapping verified against the OpenSIPS Debian
+        # packaging, not guessed. Two that catch people out:
+        #   * rest_client is in opensips-restclient-module, NOT in
+        #     opensips-http-modules (that one is the HTTP transport and MI).
+        #   * proto_tls and tls_mgm are different packages. Loading proto_tls
+        #     without tlsmgm gets you a config that fails at startup.
+        # Everything else the configs use (tm, rr, dialog, dispatcher, pike,
+        # ratelimit, cachedb_local, permissions, auth, auth_db, usrloc,
+        # registrar, rtpengine, sipmsgops, textops, uac, mi_fifo, proto_udp,
+        # proto_tcp, topology_hiding) ships in the main opensips package.
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends \
+            opensips \
+            opensips-postgres-module \
+            opensips-json-module \
+            opensips-restclient-module \
+            opensips-tls-module \
+            opensips-tlsmgm-module \
+            opensips-auth-modules
+          opensips -V
+
+      - name: Fail if we did not actually get 3.6
+        # Ubuntu ships its own much older opensips package. If the apt repo
+        # step silently did not take effect, apt would install that instead
+        # and this whole job would validate the configs against the wrong
+        # major version while reporting success.
+        run: |
+          set -euo pipefail
+          version="$(opensips -V | grep -oE 'opensips [0-9]+\.[0-9]+' | head -1 | awk '{print $2}')"
+          echo "detected OpenSIPS ${version}"
+          if [ "${version}" != "3.6" ]; then
+            echo "::error::expected OpenSIPS 3.6 from apt.opensips.org, got ${version}."
+            echo "The apt repository step did not take effect, so this check would"
+            echo "have validated against the wrong major version."
+            exit 1
+          fi
+
+      - name: Report any module the configs load but the runner lacks
+        # opensips -C will fail on a missing module, but its message names one
+        # module and stops. This lists every missing one at once and, more
+        # usefully, tells you it is a packaging problem rather than a config
+        # error — those get diagnosed very differently.
+        run: |
+          set -euo pipefail
+          mpath="$(ls -d /usr/lib/*/opensips/modules 2>/dev/null | head -1)"
+          echo "module path: ${mpath}"
+          # proto_udp and proto_tcp are SKIPPED, and that is not laziness.
+          #
+          # No such .so exists in the module directory and no package ships
+          # one -- UDP and TCP are compiled into the OpenSIPS core. But the
+          # `loadmodule "proto_udp.so"` line is still REQUIRED: it enables the
+          # built-in transport, and without it OpenSIPS refuses to start with
+          # "no transport protocol loaded".
+          #
+          # So a file-existence check reports them missing on a CORRECT
+          # config. That false failure cost real time on the lab box: acting
+          # on it deletes the lines, and the resulting error points somewhere
+          # else entirely. Verified against 3.6.7, 2026-08-07.
+          core_transports="proto_udp proto_tcp"
+          missing=""
+          for m in $(grep -h '^loadmodule' */opensips/*.cfg \
+                     | sed 's/loadmodule *"//; s/\.so".*//' | sort -u); do
+            case " ${core_transports} " in *" ${m} "*) continue;; esac
+            if [ ! -f "${mpath}/${m}.so" ]; then
+              missing="${missing} ${m}"
+            fi
+          done
+          if [ -n "${missing}" ]; then
+            echo "::error::modules loaded by the configs but not installed:${missing}"
+            echo "This is a packaging gap in this workflow, not a config error."
+            echo "Find the providing package with: apt-file search <module>.so"
+            exit 1
+          fi
+          echo "all loaded modules are present"
+
+      - name: Check every OpenSIPS config in the tree
+        # Discovered rather than listed. A tier added later (a second edge
+        # profile, a class-5 core) is checked the day it lands instead of the
+        # day somebody remembers to add it here — and the job fails if it finds
+        # nothing, so an empty glob can never be mistaken for success.
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/fifo /tmp/rendered
+          shopt -s nullglob
+          configs=(*/opensips/*.cfg)
+          if [ ${#configs[@]} -eq 0 ]; then
+            echo "::error::no OpenSIPS configs found — this job would have passed vacuously"
+            exit 1
+          fi
+          echo "found ${#configs[@]} config(s): ${configs[*]}"
+          rc=0
+          for cfg in "${configs[@]}"; do
+            tier="$(echo "${cfg}" | cut -d/ -f1)"
+            echo "::group::opensips -C ${cfg}"
+            python3 ci/render_for_check.py "${cfg}" "/tmp/rendered/${tier}.cfg" /tmp/fifo
+            if opensips -C -f "/tmp/rendered/${tier}.cfg"; then
+              echo "${cfg}: OK"
+            else
+              echo "::error file=${cfg}::opensips -C rejected this config"
+              rc=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $rc
+
+  # --------------------------------------------------------------------
+  # nftables rulesets. `nft -c` parses and validates without loading.
+  # --------------------------------------------------------------------
+  firewall:
+    name: nft -c
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nftables
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nftables
+
+      - name: Check every nftables ruleset in the tree
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          rulesets=(*/nftables/*.nft)
+          if [ ${#rulesets[@]} -eq 0 ]; then
+            echo "::error::no nftables rulesets found — this job would have passed vacuously"
+            exit 1
+          fi
+          rc=0
+          for rs in "${rulesets[@]}"; do
+            echo "::group::nft -c ${rs}"
+            if sudo nft -c -f "${rs}"; then
+              echo "${rs}: OK"
+            else
+              echo "::error file=${rs}::nft -c rejected this ruleset"
+              rc=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $rc
+
+      - name: Assert the core ruleset is default-deny in every direction
+        # The core's security claim is that it has no route from the internet.
+        # That claim rests entirely on the input, forward AND output chains
+        # defaulting to drop. A future edit that relaxed any one of them would
+        # silently dissolve the guarantee while every other check still
+        # passed, so it is asserted explicitly rather than left to review.
+        run: |
+          set -euo pipefail
+          core=core/nftables/megatron-core.nft
+          if [ ! -f "${core}" ]; then
+            echo "core ruleset not present on this branch — nothing to assert"
+            exit 0
+          fi
+          for chain in input forward output; do
+            if ! grep -qE "hook ${chain}[^;]*;[[:space:]]*policy drop;" "${core}"; then
+              echo "::error file=${core}::core ${chain} chain is not 'policy drop'."
+              echo "ARCHITECTURE.md 4.5b depends on the core being default-deny."
+              exit 1
+            fi
+            echo "core ${chain}: policy drop — ok"
+          done
+
+  # --------------------------------------------------------------------
+  # The contracts are the interfaces everything else is generated from. If
+  # one stops being a valid OpenAPI document, every downstream client breaks.
+  # --------------------------------------------------------------------
+  contract:
+    name: contracts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the validator
+        run: pip install --quiet openapi-spec-validator==0.7.1 jsonschema==4.26.0 pyyaml==6.0.3
+
+      - name: Validate every contract in the tree
+        # Discovered rather than listed, for the same reason the OpenSIPS job
+        # is: a contract added later gets checked the day it lands instead of
+        # the day somebody remembers to add it here. Fails on an empty glob so
+        # a rename can never be mistaken for success.
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          specs=(contracts/*.openapi.yaml)
+          if [ ${#specs[@]} -eq 0 ]; then
+            echo "::error::no contracts found — this job would have passed vacuously"
+            exit 1
+          fi
+          echo "found ${#specs[@]} contract(s): ${specs[*]}"
+          rc=0
+          for spec in "${specs[@]}"; do
+            if python3 -m openapi_spec_validator "${spec}"; then
+              echo "${spec}: OK"
+            else
+              echo "::error file=${spec}::not a valid OpenAPI document"
+              rc=1
+            fi
+          done
+          exit $rc
+
+      - name: Keep the softphone interop profiles honest
+        # The profiles are the concrete meaning of "optimised for MicroSIP,
+        # Zoiper and PortSIP", and the interop test matrix for the first day
+        # with a real host. Their value rests entirely on a reader being able
+        # to tell which claims were verified and which were reasoned -- so a
+        # profile claiming lab-verified while #2 is still open fails the build.
+        run: python3 ci/check_softphone_profiles.py
+
+      - name: Hold the MagnusBilling parity inventory to its claims
+        # "Every single feature Magnus has, so we aren't missing anything" is a
+        # requirement, and a requirement that lives only in a markdown table is
+        # one that quietly erodes. Every migration project's feature matrix has
+        # been edited down to what was convenient by month four, and nobody
+        # noticed because nothing was watching the list. This watches it: the
+        # inventory is pinned to Magnus's own documented module set, so a row
+        # cannot be dropped, invented, or left owner-less.
+        run: python3 ci/check_parity.py
+
+      - name: Prove an insecure install is not expressible
+        # ARCHITECTURE.md 6.2b promises there is no path through the wizard
+        # that produces an insecure install. This attempts eighteen of them --
+        # a password field, a pasted private key, an admin console on
+        # 0.0.0.0, open 5060, prepaid failing open -- and fails if the schema
+        # accepts any. The promise is worth exactly as much as this step.
+        run: python3 ci/check_wizard_answers.py
+
+      - name: Check the dashboard fixture against the contract
+        # The dashboard exists before the Go node agent in order to pin down
+        # what that agent must serve. A fixture that has drifted from the
+        # contract pins down nothing while looking like it does, and the drift
+        # would only surface the day the real agent is finally wired in.
+        run: python3 ci/check_fixtures.py

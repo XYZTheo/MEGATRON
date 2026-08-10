@@ -1,0 +1,29 @@
+﻿[Unit]
+Description=MEGATRON Telegram bot (the operating interface)
+After=network-online.target megatron-provisioning.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=megatron
+Group=megatron
+EnvironmentFile=/etc/megatron/megatron.env
+EnvironmentFile=/etc/megatron/secrets.env
+ExecStart=/opt/megatron/bot/bin/bot
+Restart=always
+RestartSec=5
+
+# The database and the credential file are the only things this may write.
+ReadWritePaths=/var/lib/megatron
+# Hardening. These are cheap and they bound what a compromise of this service
+# reaches -- which is the point of the whole project.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

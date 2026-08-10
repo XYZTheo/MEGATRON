@@ -1,0 +1,202 @@
+#!/usr/sbin/nft -f
+#
+# MEGATRON — EDGE / SHIELD NODE FIREWALL BASELINE
+#
+# ============================================================================
+# WHERE THIS SITS IN THE DEFENCE STACK
+# ============================================================================
+# Layer 1  XDP / eBPF at the NIC driver .... drops known-bad before the kernel
+#                                            allocates an sk_buff. Millions of
+#                                            pps. Managed by the Go node agent.
+# Layer 2  nftables (THIS FILE) ............ trunk allowlists, connection and
+#                                            rate limits, geo policy.
+# Layer 3  OpenSIPS pre-transaction ........ ../opensips/opensips.cfg
+#
+# Each layer exists so hostile packets die as early and as cheaply as
+# possible. A packet that reaches OpenSIPS has already survived two cheaper
+# filters. See docs/ARCHITECTURE.md section 5.2.
+#
+# ============================================================================
+# THE SETS ARE THE INTERFACE
+# ============================================================================
+# The named sets below are the contract between this file and the Go node
+# agent. The agent adds and removes elements at runtime; it never rewrites
+# this file. That matters because it means the blocklist updates in
+# microseconds without a ruleset reload, and because a bug in the agent
+# cannot corrupt the static policy.
+#
+#   megatron_blocklist_v4/v6  populated by: honeypot sensor, OpenSIPS pike,
+#                             scanner fingerprinting, opt-in shared feed
+#   megatron_trunks_v4/v6     carrier trunks — IP-authenticated peers
+#   megatron_mgmt_v4          management/SSH sources
+#   megatron_core_v4          core-tier nodes (for the return path only)
+#
+# ============================================================================
+# STATUS: NOT YET VALIDATED ON A LIVE HOST. Syntax-check before deploying:
+#   nft -c -f megatron-edge.nft
+# ============================================================================
+
+flush ruleset
+
+table inet megatron_edge {
+
+    # ------------------------------------------------------------------
+    # Dynamic sets, owned by the Go node agent.
+    #
+    # `flags dynamic` + `timeout` means entries expire on their own. A
+    # transient false positive self-heals without operator intervention —
+    # which is what keeps operators from disabling automated blocking
+    # altogether, the failure mode that makes most blocklists useless.
+    # ------------------------------------------------------------------
+
+    set megatron_blocklist_v4 {
+        type ipv4_addr
+        flags dynamic, timeout
+        timeout 1h
+        size 262144
+        comment "Hostile sources. Populated at runtime by the node agent."
+    }
+
+    set megatron_blocklist_v6 {
+        type ipv6_addr
+        flags dynamic, timeout
+        timeout 1h
+        size 65536
+    }
+
+    # Carrier trunks. IP-authenticated peers that legitimately burst far
+    # above any per-endpoint rate threshold. Static — changed only by
+    # provisioning, never by attack response.
+    set megatron_trunks_v4 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        comment "Carrier trunk peers. Provisioning-managed, not attack-managed."
+    }
+
+    set megatron_trunks_v6 {
+        type ipv6_addr
+        flags interval
+        auto-merge
+    }
+
+    # Management access. Deliberately narrow.
+    set megatron_mgmt_v4 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        comment "SSH / management sources. Must never be 0.0.0.0/0."
+    }
+
+    # Core-tier nodes. The edge initiates to these; this set exists so the
+    # return path is explicit rather than relying solely on conntrack.
+    set megatron_core_v4 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        comment "Private core nodes. Never public addresses."
+    }
+
+    # ------------------------------------------------------------------
+    # INPUT
+    # ------------------------------------------------------------------
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        # --- Cheapest checks first, exactly as in the OpenSIPS config ---
+
+        # Blocklist before anything else. This is the hot path under attack
+        # and it must be the first thing a hostile packet meets in nftables.
+        ip  saddr @megatron_blocklist_v4 counter drop
+        ip6 saddr @megatron_blocklist_v6 counter drop
+
+        # Invalid conntrack state is never legitimate.
+        ct state invalid counter drop
+
+        # Established/related traffic short-circuits everything below.
+        ct state established,related accept
+
+        # Loopback.
+        iif lo accept
+
+        # --- ICMP: allow, but never let it become a vector ---
+        ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded } limit rate 10/second accept
+        ip6 nexthdr icmpv6 icmpv6 type { echo-request, destination-unreachable, packet-too-big, time-exceeded, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } limit rate 20/second accept
+
+        # --- Management ---
+        # SSH is restricted by source. An edge node is cattle; if you cannot
+        # reach it you reprovision it rather than widening this rule.
+        ip saddr @megatron_mgmt_v4 tcp dport 22 ct state new limit rate 6/minute counter accept
+
+        # --- Carrier trunks: privileged path ---
+        # Trunks bypass the per-source rate limits below because they are
+        # IP-authenticated peers that legitimately burst. They have already
+        # cleared a stronger check than any rate heuristic could apply.
+        ip  saddr @megatron_trunks_v4 udp dport { 5060 } counter accept
+        ip  saddr @megatron_trunks_v4 tcp dport { 5060, 5061 } counter accept
+        ip6 saddr @megatron_trunks_v6 udp dport { 5060 } counter accept
+        ip6 saddr @megatron_trunks_v6 tcp dport { 5060, 5061 } counter accept
+
+        # --- Core tier return path ---
+        ip saddr @megatron_core_v4 counter accept
+
+        # --- Public SIP: TLS/TCP preferred ---
+        #
+        # TLS and TCP are rate-limited far more generously than UDP, and this
+        # asymmetry is deliberate policy rather than tuning.
+        #
+        # A spoofed-source flood CANNOT complete a TCP or TLS handshake — the
+        # attacker never receives the SYN-ACK. So connection-oriented SIP is
+        # structurally immune to the entire spoofed-source attack class, and
+        # we price it accordingly to push customers onto it.
+        #
+        # See docs/ARCHITECTURE.md section 5.2.
+
+        tcp dport 5061 ct state new limit rate 200/second burst 400 packets counter accept
+        tcp dport 5060 ct state new limit rate 100/second burst 200 packets counter accept
+
+        # UDP SIP: the flood surface. Tightest limits.
+        #
+        # Note this is a global limit, not per-source — per-source limiting
+        # lives in OpenSIPS pike, which understands SIP semantics and can
+        # tell a REGISTER refresh from an INVITE flood. nftables only sees
+        # packets, so it enforces the ceiling; OpenSIPS enforces fairness.
+        udp dport 5060 limit rate 2000/second burst 4000 packets counter accept
+
+        # --- RTP media range ---
+        # Wide by necessity. rtpengine latches on first packet and drops
+        # anything not matching an active call, so an unsolicited packet here
+        # costs almost nothing. The range must match rtpengine's config.
+        udp dport 10000-20000 counter accept
+
+        # --- Everything else ---
+        # Dropped silently by policy. We do not send ICMP port-unreachable:
+        # replying confirms the host exists and turns us into a reflector.
+        # An attacker scanning us should get the same result as scanning an
+        # unused address — nothing at all.
+        counter comment "unmatched input, dropped silently by policy"
+    }
+
+    # ------------------------------------------------------------------
+    # FORWARD — an edge node is not a router.
+    # ------------------------------------------------------------------
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        counter comment "edge node does not forward"
+    }
+
+    # ------------------------------------------------------------------
+    # OUTPUT
+    #
+    # Permissive, but counted. An edge node that suddenly starts talking to
+    # unexpected destinations is a compromise signal, and the counters are
+    # how the agent notices.
+    #
+    # The edge holds no credentials and no customer data, so egress
+    # filtering here buys detection rather than prevention.
+    # ------------------------------------------------------------------
+    chain output {
+        type filter hook output priority filter; policy accept;
+        counter
+    }
+}

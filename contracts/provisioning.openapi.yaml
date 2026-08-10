@@ -1,0 +1,872 @@
+openapi: 3.1.0
+
+# =============================================================================
+# MEGATRON — PROVISIONING API
+# =============================================================================
+#
+# The API the business is run through. Read docs/PRODUCT.md first.
+#
+# This is the whole of the owner's workflow expressed as endpoints:
+#
+#     trunk in  ->  rate  ->  authenticate  ->  trunk out  ->  bill
+#
+#   1. connect a carrier trunk (IP exchange, no registration)
+#   2. make a plan, set a price
+#   3. generate a login
+#   4. customer registers a softphone and dials
+#   5. prepaid balance; calls stop at zero
+#   6. customer tops up and sets their own caller ID
+#
+# -----------------------------------------------------------------------------
+# THE TELEGRAM BOT IS THE FIRST CLIENT, NOT AN INTEGRATION
+# -----------------------------------------------------------------------------
+# There is no web panel in the owner's workflow (PRODUCT.md). The bot generates
+# logins, moves balance, and lets customers top up and set their caller ID.
+#
+# So this API is designed for it: every operation is one call, the responses
+# carry text a bot can render without a second lookup, and nothing requires a
+# session or a page. The admin console, when it exists, is the SECOND client of
+# exactly these endpoints. A bot that scrapes a panel, or a panel that owns
+# business logic the bot has to reimplement, is how the two drift until they
+# disagree about somebody's balance.
+#
+# -----------------------------------------------------------------------------
+# THE MOST IMPORTANT THING IN THIS FILE: IDEMPOTENCY ON MONEY
+# -----------------------------------------------------------------------------
+# A Telegram bot runs on a phone network. It WILL time out after the server has
+# already committed, and it WILL retry. Without an idempotency key that is a
+# double credit, every time, and the operator finds out from the balance sheet.
+#
+# Every endpoint that moves money therefore REQUIRES an Idempotency-Key. A
+# repeat with the same key returns the ORIGINAL result and does not move money
+# again. This is not an optimisation and it is not optional.
+#
+# -----------------------------------------------------------------------------
+# MONEY IS INTEGER MICRO-UNITS. NEVER A FLOAT.
+# -----------------------------------------------------------------------------
+# Every amount here is an integer of 1/1,000,000 of the account currency.
+# $1.00 is 1000000. ci/policy_check.py (MONEY-NOT-FLOAT) already fails the
+# build on a float in a billing path, before that code exists.
+#
+# Rounding a rate is a business decision that belongs in the rating engine
+# where it can be audited, not an accident of IEEE-754 in a JSON parser.
+#
+# -----------------------------------------------------------------------------
+# TWO AUDIENCES, ONE API, AND A HARD LINE BETWEEN THEM
+# -----------------------------------------------------------------------------
+# `operator` scope runs the business. `customer` scope is self-service and can
+# only ever act on itself. A customer reaching an operator verb is the single
+# worst failure this API can have -- it is unlimited free credit -- so the
+# split is by scope on every endpoint rather than by checking an id inside a
+# handler somebody may forget to write.
+#
+# -----------------------------------------------------------------------------
+# STATUS: contract design. No implementation exists (#9, #20), and no MEGATRON
+# component has run on Linux (#2). Checked by openapi-spec-validator 0.7.1.
+# =============================================================================
+
+info:
+  title: MEGATRON Provisioning API
+  version: 0.1.0
+  summary: Customers, logins, balance, caller ID, plans and trunks.
+  description: |
+    The operational surface of MEGATRON. See
+    [`docs/PRODUCT.md`](../docs/PRODUCT.md) for the business this serves.
+
+    **Clients:** the Telegram bot (first), the admin console (second).
+    Both use these endpoints. Neither owns business logic the other lacks.
+
+    **Reachability:** private core network only. Never internet-exposed. The
+    bot reaches it from the same host or over an authenticated tunnel — a
+    provisioning API on a public interface is a wire transfer endpoint on a
+    public interface.
+  license:
+    name: Proprietary
+    identifier: LicenseRef-MEGATRON-Proprietary
+
+servers:
+  - url: http://provisioning.megatron.internal:8081
+    description: Private core network only.
+
+security:
+  - operatorToken: []
+
+tags:
+  - name: customers
+    description: Accounts, logins and balance.
+  - name: self-service
+    description: What a customer may do for themselves, via the bot.
+  - name: plans
+    description: Rate plans and pricing.
+  - name: trunks
+    description: Carrier trunks in and out.
+
+paths:
+
+  /v1/customers:
+    post:
+      tags: [customers]
+      operationId: createCustomer
+      summary: Create a customer and issue their first SIP login.
+      description: |
+        Step 3 of the workflow — "give out a login". One call, because in the
+        bot this is one command.
+
+        **The SIP password is generated here and returned exactly once.** It is
+        not accepted as input and cannot be read back later; a password the API
+        will re-display is a password sitting in a Telegram scrollback forever.
+        If it is lost, rotate it.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCustomer"
+      responses:
+        "201":
+          description: Customer created. Credentials returned once.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CustomerCreated"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: A customer with this handle already exists.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+    get:
+      tags: [customers]
+      operationId: listCustomers
+      summary: List customers.
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: "#/components/schemas/CustomerStatus" }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: A page of customers.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CustomerPage" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/customers/{customerId}:
+    parameters:
+      - $ref: "#/components/parameters/CustomerId"
+    get:
+      tags: [customers]
+      operationId: getCustomer
+      summary: One customer, with balance and registration state.
+      description: |
+        Everything the bot shows in a "status" reply, in one call: balance,
+        whether they are registered right now, and how many calls are up.
+      responses:
+        "200":
+          description: The customer.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Customer" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/customers/{customerId}/status:
+    parameters:
+      - $ref: "#/components/parameters/CustomerId"
+    put:
+      tags: [customers]
+      operationId: setCustomerStatus
+      summary: Suspend or re-enable a customer.
+      description: |
+        Suspension takes effect on the NEXT call, and also drops calls in
+        progress when `drop_active` is set. A suspension that lets existing
+        calls run is not a suspension when the reason for it is fraud.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status, reason]
+              additionalProperties: false
+              properties:
+                status: { $ref: "#/components/schemas/CustomerStatus" }
+                reason:
+                  type: string
+                  minLength: 3
+                  maxLength: 200
+                  description: |
+                    Required. A suspension nobody can explain later is one
+                    that gets reversed by the next person on shift.
+                drop_active: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Customer" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/customers/{customerId}/credentials:
+    parameters:
+      - $ref: "#/components/parameters/CustomerId"
+    post:
+      tags: [customers]
+      operationId: rotateCredentials
+      summary: Issue a new SIP password.
+      description: |
+        The only way to recover a lost password: replace it. Returned once,
+        exactly like creation. Existing registrations are invalidated, which
+        is the point — a rotation that leaves the old password working has
+        not rotated anything.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: New credentials, returned once.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SipCredentials" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/customers/{customerId}/balance:
+    parameters:
+      - $ref: "#/components/parameters/CustomerId"
+    post:
+      tags: [customers]
+      operationId: adjustBalance
+      summary: Credit or debit a customer.
+      description: |
+        Step 6 — "manage balances".
+
+        **Requires an Idempotency-Key.** The bot will time out and retry; a
+        repeat with the same key returns the original transaction and does not
+        move money twice.
+
+        A negative `amount_micros` is a debit. Debits may take a balance
+        negative — refusing would make it impossible to correct an
+        over-credit, and a ledger you cannot correct is a ledger people work
+        around in a spreadsheet.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BalanceAdjustment" }
+      responses:
+        "200":
+          description: Applied. Repeat calls with the same key return this unchanged.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Transaction" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: |
+            The idempotency key was reused with a DIFFERENT body. Refused
+            rather than guessed — the two plausible guesses are "apply it
+            again" and "ignore it", and both are wrong when real money is
+            involved.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+  /v1/customers/{customerId}/caller-id:
+    parameters:
+      - $ref: "#/components/parameters/CustomerId"
+    put:
+      tags: [customers]
+      operationId: setCallerId
+      summary: Set the caller ID a customer presents.
+      description: |
+        Step 7 — "load caller id". Customers do this themselves through the
+        bot, which is why it also exists under `/v1/me`.
+
+        **This is an attestation boundary, not a display preference.** You
+        cannot attest a caller ID whose ownership was never verified, and
+        presenting an unverified number is how a platform ends up carrying
+        somebody else's spoofing. Every change is recorded with who made it
+        and when, and `verified` reflects whether ownership was actually
+        established rather than merely claimed.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [caller_id]
+              additionalProperties: false
+              properties:
+                caller_id:
+                  type: string
+                  pattern: "^\\+[1-9][0-9]{6,14}$"
+                  description: E.164.
+      responses:
+        "200":
+          description: Set.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CallerId" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: |
+            Refused by policy — for example a number this customer has not
+            demonstrated ownership of, on a tenant that requires verification.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/me:
+    get:
+      tags: [self-service]
+      operationId: getSelf
+      summary: The calling customer's own balance, login and caller ID.
+      description: |
+        The customer-scope view. Everything the bot needs for "what's my
+        balance" in one call.
+
+        Scoped so that a customer token cannot name another customer — there
+        is no id in the path to tamper with. That is deliberate: the worst
+        failure this API can have is a customer reaching an operator verb, so
+        the boundary is structural rather than a check inside a handler.
+      security:
+        - customerToken: []
+      responses:
+        "200":
+          description: Own account.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SelfView" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/me/caller-id:
+    put:
+      tags: [self-service]
+      operationId: setOwnCallerId
+      summary: Customer sets their own caller ID.
+      security:
+        - customerToken: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [caller_id]
+              additionalProperties: false
+              properties:
+                caller_id:
+                  type: string
+                  pattern: "^\\+[1-9][0-9]{6,14}$"
+      responses:
+        "200":
+          description: Set.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CallerId" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: Refused by policy.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+  /v1/plans:
+    get:
+      tags: [plans]
+      operationId: listPlans
+      summary: Rate plans.
+      responses:
+        "200":
+          description: Plans.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Plan" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [plans]
+      operationId: createPlan
+      summary: Create a rate plan.
+      description: |
+        Step 2 — "make a plan, set a price". Rates are uploaded separately
+        because a real rate table is thousands of prefixes and does not belong
+        in a JSON body typed into a chat window.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, currency]
+              additionalProperties: false
+              properties:
+                name: { type: string, minLength: 1, maxLength: 80 }
+                currency: { type: string, pattern: "^[A-Z]{3}$" }
+                description: { type: string, maxLength: 500 }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Plan" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/plans/{planId}/rates:
+    parameters:
+      - name: planId
+        in: path
+        required: true
+        schema: { type: string }
+    put:
+      tags: [plans]
+      operationId: replaceRates
+      summary: Replace a plan's rate table.
+      description: |
+        Whole-table replacement, not row-by-row editing.
+
+        Rate tables arrive from carriers as complete files and change as
+        complete files. Partial edits are how a plan ends up with a prefix
+        nobody meant to keep, selling below cost, discovered at the end of the
+        month. Replacement also gives an obvious atomic unit to version and
+        roll back.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rates]
+              additionalProperties: false
+              properties:
+                effective_from:
+                  type: string
+                  format: date-time
+                  description: Defaults to immediately.
+                rates:
+                  type: array
+                  minItems: 1
+                  items: { $ref: "#/components/schemas/Rate" }
+      responses:
+        "200":
+          description: Replaced.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [plan_id, rate_count, effective_from]
+                properties:
+                  plan_id: { type: string }
+                  rate_count: { type: integer }
+                  effective_from: { type: string, format: date-time }
+                additionalProperties: false
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/trunks:
+    get:
+      tags: [trunks]
+      operationId: listTrunks
+      summary: Carrier trunks.
+      responses:
+        "200":
+          description: Trunks.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Trunk" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [trunks]
+      operationId: createTrunk
+      summary: Connect a carrier trunk.
+      description: |
+        Steps 1 and 2 — "i give them my ip, they give me theirs, i connect
+        it".
+
+        IP-authenticated in both directions. There is no password field: for
+        wholesale interconnect the allowlist IS the authentication, and adding
+        a credential that is never used would be a credential to leak.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateTrunk" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Trunk" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+components:
+
+  securitySchemes:
+    operatorToken:
+      type: http
+      scheme: bearer
+      description: |
+        Runs the business. Held by the Telegram bot process and the console.
+        Never issued to a customer.
+    customerToken:
+      type: http
+      scheme: bearer
+      description: |
+        Self-service only, scoped to one customer. Reaches `/v1/me*` and
+        nothing else.
+
+  parameters:
+    CustomerId:
+      name: customerId
+      in: path
+      required: true
+      schema: { type: string }
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Caller-generated unique key, stable across retries of the SAME logical
+        operation. The bot should derive it from the message that triggered
+        the command, so a user tapping twice is one operation and a retry
+        after a timeout is the same one.
+
+        Required on every mutating call, not only the ones that move money:
+        the alternative is remembering which is which under pressure.
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+
+  responses:
+    BadRequest:
+      description: Validation failed.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Unauthorized:
+      description: Missing, invalid, or wrong-scope token.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    NotFound:
+      description: No such customer.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+
+  schemas:
+
+    Problem:
+      type: object
+      description: RFC 9457 problem details.
+      required: [title, status]
+      additionalProperties: false
+      properties:
+        type: { type: string, default: "about:blank" }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+
+    CustomerStatus:
+      type: string
+      enum: [active, suspended, closed]
+
+    CreateCustomer:
+      type: object
+      required: [handle, plan_id]
+      additionalProperties: false
+      description: |
+        Note the absence of a password field. Credentials are generated, never
+        supplied — the same rule the setup wizard applies, for the same reason.
+      properties:
+        handle:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9._-]{2,31}$"
+          description: The SIP username, and how the operator refers to them.
+        plan_id: { type: string }
+        display_name: { type: string, maxLength: 120 }
+        telegram_user_id:
+          type: integer
+          format: int64
+          description: |
+            Links this customer to their Telegram account for self-service.
+            Without it they cannot use the bot and every top-up is manual.
+        opening_balance_micros:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+        max_concurrent_calls:
+          type: integer
+          minimum: 1
+          default: 2
+          description: |
+            A cap from the first minute, not after the first incident. An
+            uncapped account is the blast radius when a customer's own device
+            is compromised — which is how most VoIP fraud actually starts.
+
+    SipCredentials:
+      type: object
+      required: [sip_username, sip_password, sip_domain, transport_hint]
+      additionalProperties: false
+      properties:
+        sip_username: { type: string }
+        sip_password:
+          type: string
+          description: |
+            Generated. Returned exactly once, here, and never readable again.
+            Lost means rotate.
+        sip_domain: { type: string }
+        transport_hint:
+          type: string
+          enum: [udp, tcp, tls]
+          description: |
+            What to put in the softphone. See
+            contracts/softphone-profiles.yaml — Zoiper's free tier cannot do
+            TLS at all, so handing a free-tier customer a TLS-only setting
+            produces a phone that will never register.
+
+    CustomerCreated:
+      type: object
+      required: [customer, credentials]
+      additionalProperties: false
+      properties:
+        customer: { $ref: "#/components/schemas/Customer" }
+        credentials: { $ref: "#/components/schemas/SipCredentials" }
+
+    Customer:
+      type: object
+      required: [id, handle, status, plan_id, balance_micros, currency]
+      additionalProperties: false
+      properties:
+        id: { type: string }
+        handle: { type: string }
+        display_name: { type: string }
+        status: { $ref: "#/components/schemas/CustomerStatus" }
+        plan_id: { type: string }
+        balance_micros:
+          type: integer
+          format: int64
+          description: Integer micro-units. May be negative after a correction.
+        currency: { type: string, pattern: "^[A-Z]{3}$" }
+        caller_id: { $ref: "#/components/schemas/CallerId" }
+        registered:
+          type: boolean
+          description: Registered right now. The first thing asked when a customer says it is not working.
+        active_calls: { type: integer, minimum: 0 }
+        max_concurrent_calls: { type: integer, minimum: 1 }
+        telegram_user_id: { type: integer, format: int64 }
+        created_at: { type: string, format: date-time }
+
+    CustomerPage:
+      type: object
+      required: [items]
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Customer" }
+        next_cursor: { type: string }
+
+    SelfView:
+      type: object
+      required: [handle, status, balance_micros, currency]
+      additionalProperties: false
+      description: The customer-scope view. Deliberately narrower than Customer.
+      properties:
+        handle: { type: string }
+        status: { $ref: "#/components/schemas/CustomerStatus" }
+        balance_micros: { type: integer, format: int64 }
+        currency: { type: string, pattern: "^[A-Z]{3}$" }
+        caller_id: { $ref: "#/components/schemas/CallerId" }
+        sip_username: { type: string }
+        sip_domain: { type: string }
+        registered: { type: boolean }
+        active_calls: { type: integer, minimum: 0 }
+
+    CallerId:
+      type: object
+      required: [number, verified]
+      additionalProperties: false
+      properties:
+        number: { type: string }
+        verified:
+          type: boolean
+          description: |
+            Whether ownership was actually established, not whether the
+            customer asserted it. Drives STIR/SHAKEN attestation level.
+        set_at: { type: string, format: date-time }
+        set_by:
+          type: string
+          description: Operator id, or the customer's own handle for a self-service change.
+
+    BalanceAdjustment:
+      type: object
+      required: [amount_micros, reason]
+      additionalProperties: false
+      properties:
+        amount_micros:
+          type: integer
+          format: int64
+          description: Positive credits, negative debits. Integer micro-units.
+        reason:
+          type: string
+          minLength: 3
+          maxLength: 200
+          description: |
+            Required, including on credits. "Who changed this and why" is the
+            first question asked about any balance, and the answer has to
+            exist before it is asked.
+        reference:
+          type: string
+          maxLength: 120
+          description: Payment reference, invoice number, or the Telegram message id.
+
+    Transaction:
+      type: object
+      required: [id, customer_id, amount_micros, balance_after_micros, reason, created_at, actor]
+      additionalProperties: false
+      properties:
+        id: { type: string }
+        customer_id: { type: string }
+        amount_micros: { type: integer, format: int64 }
+        balance_after_micros: { type: integer, format: int64 }
+        reason: { type: string }
+        reference: { type: string }
+        created_at: { type: string, format: date-time }
+        actor:
+          type: string
+          description: |
+            Who did it — operator id, or `telegram:<user_id>` when it came
+            through the bot. Append-only, and never rewritten. Magnus's audit
+            trail is editable by an admin, which makes it evidence of nothing.
+
+    Plan:
+      type: object
+      required: [id, name, currency]
+      additionalProperties: false
+      properties:
+        id: { type: string }
+        name: { type: string }
+        currency: { type: string, pattern: "^[A-Z]{3}$" }
+        description: { type: string }
+        rate_count: { type: integer, minimum: 0 }
+        updated_at: { type: string, format: date-time }
+
+    Rate:
+      type: object
+      required: [prefix, sell_micros_per_minute]
+      additionalProperties: false
+      properties:
+        prefix:
+          type: string
+          pattern: "^[0-9]{1,15}$"
+          description: Longest match wins.
+        description: { type: string, maxLength: 120 }
+        sell_micros_per_minute: { type: integer, format: int64, minimum: 0 }
+        buy_micros_per_minute:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Carrier cost. Optional, and worth supplying: without it there is
+            no margin figure, and no way for the platform to warn that a
+            prefix is selling below cost.
+        connect_fee_micros: { type: integer, format: int64, minimum: 0, default: 0 }
+        increment_seconds:
+          type: integer
+          minimum: 1
+          default: 60
+          description: Billing increment. 1 is per-second, 60 is per-minute.
+        minimum_seconds: { type: integer, minimum: 0, default: 0 }
+
+    CreateTrunk:
+      type: object
+      required: [name, direction, host, remote_ips]
+      additionalProperties: false
+      description: |
+        No password field. Wholesale interconnect is IP-authenticated in both
+        directions — the allowlist is the authentication, and a credential
+        that is never used is only a credential to leak.
+      properties:
+        name: { type: string, minLength: 1, maxLength: 80 }
+        direction:
+          type: string
+          enum: [outbound, inbound, both]
+        host:
+          type: string
+          description: The carrier's SIP host — where we send.
+        port: { type: integer, minimum: 1, maximum: 65535, default: 5060 }
+        remote_ips:
+          type: array
+          minItems: 1
+          description: |
+            The carrier's source addresses — what we accept from. Required
+            and non-empty: an inbound trunk that accepts from anywhere is an
+            open relay, which is the classic way a switch ends up carrying
+            somebody else's traffic at its own expense.
+          items:
+            type: string
+            pattern: "^((25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])(/(3[0-2]|[12]?[0-9]))?$"
+        transport:
+          type: string
+          enum: [udp, tcp, tls]
+          default: udp
+        max_concurrent_calls: { type: integer, minimum: 1 }
+        codecs:
+          type: array
+          items: { type: string }
+          description: Offered in order. G.711 should be present.
+
+    Trunk:
+      type: object
+      required: [id, name, direction, host, remote_ips, enabled]
+      additionalProperties: false
+      properties:
+        id: { type: string }
+        name: { type: string }
+        direction: { type: string, enum: [outbound, inbound, both] }
+        host: { type: string }
+        port: { type: integer }
+        remote_ips:
+          type: array
+          items: { type: string }
+        transport: { type: string, enum: [udp, tcp, tls] }
+        enabled: { type: boolean }
+        max_concurrent_calls: { type: integer }
+        active_calls: { type: integer, minimum: 0 }

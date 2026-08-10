@@ -1,0 +1,267 @@
+package net.megatron.switchapi
+
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+
+/**
+ * Wire types for contracts/authorizer.openapi.yaml.
+ *
+ * Kept small on purpose. OpenSIPS builds this JSON in config script via
+ * `rest_client`, and every field is one more thing to get wrong in a language
+ * with no types — so the request carries what the switch already knows and
+ * nothing it would have to look up.
+ */
+
+@Serializable
+data class AuthorizeRequest(
+    /** SIP username of the calling account. */
+    val account: String,
+    /** Dialled number, as it arrived. Normalised on our side, not the switch's. */
+    val destination: String,
+    /** Call-ID, used as the reservation id so a retransmitted INVITE is idempotent. */
+    @SerialName("call_id") val callId: String,
+    @SerialName("source_ip") val sourceIp: String? = null,
+)
+
+@Serializable
+data class AuthorizeResponse(
+    val decision: String,
+    /**
+     * Seconds. Becomes the session timer on the call.
+     *
+     * Present on an allow and absent on a reject. Without it a prepaid call
+     * runs until the balance is already negative and the money is gone — one
+     * of the three money-losing failure modes the architecture exists to
+     * design out.
+     */
+    @SerialName("max_seconds") val maxSeconds: Int? = null,
+    @SerialName("rate_micros_per_minute") val ratePerMinute: Long? = null,
+    val prefix: String? = null,
+    @SerialName("reserved_micros") val reservedMicros: Long? = null,
+    /**
+     * Where to send the call — a SIP URI like `sip:1.2.3.4:5060`.
+     *
+     * ROUTING IS DECIDED HERE, NOT IN THE SWITCH CONFIG, and that is
+     * deliberate on two counts. Choosing a carrier and pricing a call are the
+     * same decision: the cheapest route and the rate charged for it come from
+     * one table, and splitting them across a GPL module's database and our
+     * rating engine would make "which gateway, at what cost" have two answers.
+     * It is also what keeps our business logic on the far side of a network
+     * boundary from GPL code — see docs/ARCHITECTURE.md §3.
+     *
+     * Absent on a refusal. Present on every allow: a call authorized with
+     * nowhere to go would be reserved against, connected to nothing, and
+     * settled — so the authorizer refuses instead.
+     */
+    val route: String? = null,
+    /**
+     * Credentials for a carrier that challenges instead of allowlisting.
+     *
+     * Absent for IP-authenticated trunks, which is the other half of them.
+     *
+     * THIS CARRIES A PASSWORD, and it is the only response in the system that
+     * does. It is defensible only because of where it goes: switch-api binds
+     * loopback and refuses to start on a public interface, and the recipient
+     * is the switch on the same box, which is about to send that password to
+     * the carrier anyway. It is an operator secret — it buys calls at the
+     * operator's own expense — not a customer's.
+     *
+     * It is NOT logged: the switch's own log line prints the route and the
+     * account, never this.
+     */
+    @SerialName("route_auth") val routeAuth: RouteAuth? = null,
+    /**
+     * The user part to put in From on the leg to the carrier, or null to send
+     * the caller's own through untouched.
+     *
+     * SEPARATE FROM [routeAuth] ON PURPOSE. It is presentation, not a secret:
+     * it is logged, it is returned by the trunks API, and an IP-authenticated
+     * trunk with no credentials at all can still need it. Folding it into the
+     * credential object would make a non-secret inherit a secret's handling
+     * and tie it to trunks that happen to have a password.
+     */
+    @SerialName("route_from_user") val routeFromUser: String? = null,
+    /** Machine-readable refusal, for the switch to map onto a SIP response. */
+    val reason: String? = null,
+    /**
+     * The sentence an operator needs, for the switch's log — never for the
+     * wire.
+     *
+     * "Plan has no rates" and "no carrier is configured" were both reported as
+     * `no_rate_for_destination` with a 503, which is one message for two
+     * problems that are fixed in completely different places. The operator was
+     * left to guess, and so was I: it cost a full test cycle to work out which
+     * of the two a run of 503s actually was.
+     *
+     * Safe to return here, unlike on the inbound path: this call is already
+     * authenticated, so nothing in the sentence tells the caller something
+     * they could not learn by having the credential they just used.
+     */
+    val detail: String? = null,
+    /**
+     * The SIP response the edge should send. Chosen here rather than in
+     * config: "no balance" and "no rate for that destination" are different
+     * facts and a customer's softphone should not show the same message for
+     * both.
+     */
+    @SerialName("sip_code") val sipCode: Int? = null,
+)
+
+/**
+ * A call ARRIVING from a carrier, addressed to one of our DIDs.
+ *
+ * A separate request from [AuthorizeRequest] because nothing about it is the
+ * same. There is no authenticated account — the caller is a stranger on the
+ * internet and the carrier is identified by its source address. The account is
+ * something we look UP, from the number dialled, rather than something the
+ * request asserts.
+ */
+@Serializable
+data class InboundAuthorizeRequest(
+    /**
+     * Where the INVITE came from, as the switch saw it.
+     *
+     * THIS IS THE ONLY AUTHENTICATION AN INBOUND TRUNK HAS. A carrier sending
+     * us traffic does not log in; the allowlist is the credential. Which is
+     * also why it is checked here and not in switch config: an open inbound
+     * path is how a switch ends up carrying somebody else's calls at the
+     * operator's expense.
+     */
+    @SerialName("source_ip") val sourceIp: String,
+    /** The number dialled — one of our DIDs, or the call goes nowhere. */
+    val did: String,
+    /** The caller's number, for the CDR. Untrusted: the far end sets it. */
+    @SerialName("caller_id") val callerId: String? = null,
+    @SerialName("call_id") val callId: String,
+)
+
+@Serializable
+data class InboundAuthorizeResponse(
+    val decision: String,
+    /**
+     * The handle whose registration the switch should look up. Present only on
+     * an allow — an operator's inbound routing is "find who owns this number,
+     * then find where their phone currently is".
+     */
+    val account: String? = null,
+    @SerialName("max_seconds") val maxSeconds: Int? = null,
+    @SerialName("rate_micros_per_minute") val ratePerMinute: Long? = null,
+    @SerialName("reserved_micros") val reservedMicros: Long? = null,
+    /**
+     * Whether this call costs the customer anything.
+     *
+     * Said explicitly rather than inferred from a zero rate, because "this
+     * plan prices inbound at zero" and "this plan does not price inbound at
+     * all" are different operator intentions and only one of them is a
+     * mistake worth noticing.
+     */
+    val charged: Boolean = false,
+    val reason: String? = null,
+    @SerialName("sip_code") val sipCode: Int? = null,
+)
+
+@Serializable
+data class EndSessionRequest(
+    @SerialName("call_id") val callId: String,
+    /** Answered-to-hangup seconds. 0 for a call that never answered. */
+    @SerialName("duration_seconds") val durationSeconds: Int,
+    /**
+     * Bytes rtpengine actually forwarded.
+     *
+     * Optional but load-bearing: a call that set up and carried no audio is
+     * one of the three money-losing failure modes. Signalling says the call
+     * happened; only the media stats say it was worth anything.
+     */
+    @SerialName("media_bytes") val mediaBytes: Long? = null,
+    /**
+     * rtpengine's raw totals string, exactly as the switch read it.
+     *
+     * Parsed HERE rather than in OpenSIPS config. Picking numbers out of a
+     * string in a language with no types, on the money path, is how a format
+     * change in a dependency becomes a silent billing error — and the config
+     * has no way to report that it failed. The raw string is also kept on the
+     * CDR, so a disputed call can be re-examined against what rtpengine
+     * actually said rather than against our interpretation of it.
+     */
+    @SerialName("media_stats") val mediaStats: String? = null,
+    @SerialName("hangup_cause") val hangupCause: String? = null,
+)
+
+@Serializable
+data class EndSessionResponse(
+    @SerialName("call_id") val callId: String,
+    @SerialName("charged_micros") val chargedMicros: Long,
+    @SerialName("returned_micros") val returnedMicros: Long,
+    @SerialName("balance_after_micros") val balanceAfterMicros: Long,
+    @SerialName("billed_seconds") val billedSeconds: Int,
+    /** True when the call outran its reservation — a sign of a broken timer. */
+    val overran: Boolean = false,
+    /**
+     * True when the call was answered and billed but carried no media.
+     *
+     * Not an error, and not automatically a refund: it is a FLAG, because the
+     * honest response depends on why. What it must never be is invisible —
+     * billing a customer for silence is how a switch loses a customer, and
+     * being unable to tell is how it loses several.
+     */
+    @SerialName("no_media") val noMedia: Boolean = false,
+)
+
+/**
+ * What the switch needs to answer a carrier's 407.
+ *
+ * The realm is included rather than derived from the host: carriers challenge
+ * with their own SIP domain, which is not reliably what you were told to
+ * connect to, and a wrong realm produces a digest the carrier reads as a bad
+ * password — a failure that looks like wrong credentials and is not.
+ */
+@Serializable
+data class RouteAuth(
+    val username: String,
+    val password: String,
+    val realm: String,
+)
+
+/** A completed call, ready for the CDR pipeline. */
+@Serializable
+data class Cdr(
+    @SerialName("call_id") val callId: String,
+    val account: String,
+    val destination: String,
+    val prefix: String?,
+    @SerialName("duration_seconds") val durationSeconds: Int,
+    /**
+     * "sip" when the switch reported a duration, "server-clock" when it did
+     * not and we measured it ourselves. Never absent: a bill nobody can trace
+     * to a source is a bill nobody can defend.
+     */
+    @SerialName("duration_source") val durationSource: String,
+    @SerialName("billed_seconds") val billedSeconds: Int,
+    @SerialName("charged_micros") val chargedMicros: Long,
+    @SerialName("rate_micros_per_minute") val ratePerMinute: Long,
+    @SerialName("media_bytes") val mediaBytes: Long?,
+    /** rtpengine's raw totals, kept so a disputed call can be re-examined. */
+    @SerialName("media_stats") val mediaStats: String? = null,
+    @SerialName("no_media") val noMedia: Boolean,
+    val overran: Boolean,
+    @SerialName("hangup_cause") val hangupCause: String?,
+    /**
+     * "outbound" or "inbound".
+     *
+     * On the record because a customer reading their own call list must be
+     * able to tell a call they made from a call they received. Without it an
+     * inbound DID call and an outbound call to the same number are one row
+     * shape, and the first question in any billing dispute — "I never dialled
+     * that" — has no answer here.
+     */
+    val direction: String = "outbound",
+    @SerialName("ended_at") val endedAt: String,
+)
+
+@Serializable
+data class Problem(
+    val type: String = "about:blank",
+    val title: String,
+    val status: Int,
+    val detail: String? = null,
+)

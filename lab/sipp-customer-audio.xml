@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- A customer's softphone placing one call.
+
+     The built-in `uac` scenario sends From: sipp@..., which is not an account
+     MEGATRON knows, so the switch correctly refuses it as no_such_account.
+     This scenario presents From: bigcorp, which is the whole point: the
+     authorizer identifies the CALLER from the From user. -->
+
+<scenario name="MEGATRON customer call">
+
+  <send retrans="500">
+    <![CDATA[
+      INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "bigcorp" <sip:bigcorp@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[service]@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:bigcorp@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=bigcorp 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+      s=-
+      c=IN IP[local_ip_type] [local_ip]
+      t=0 0
+      m=audio [media_port] RTP/AVP 0
+      a=rtpmap:0 PCMU/8000
+    ]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="180" optional="true" />
+  <recv response="183" optional="true" />
+  <recv response="200" rtd="true" />
+
+  <send>
+    <![CDATA[
+      ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "bigcorp" <sip:bigcorp@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Contact: <sip:bigcorp@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      Content-Length: 0
+    ]]>
+  </send>
+
+  <!-- Send five seconds of real G.711 audio, so rtpengine has something to
+       count. Without media the no-audio check cannot be exercised at all --
+       and that check is one of the three money-losing failure modes. -->
+  <nop>
+    <action>
+      <exec play_pcap_audio="/usr/share/sip-tester/g711a.pcap"/>
+    </action>
+  </nop>
+
+  <pause milliseconds="5000"/>
+
+  <send retrans="500">
+    <![CDATA[
+      BYE [next_url] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "bigcorp" <sip:bigcorp@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 2 BYE
+      Max-Forwards: 70
+      [routes]
+      Content-Length: 0
+    ]]>
+  </send>
+
+  <recv response="200" crlf="true" />
+
+</scenario>

@@ -1,0 +1,35 @@
+[Unit]
+Description=MEGATRON rtpengine (media anchor)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+# --daemon IS NOT A FLAG. rtpengine daemonises by default and --foreground is
+# the opposite one; passing --daemon makes it exit immediately, which with
+# stderr discarded is indistinguishable from a clean start.
+#
+# Kernel forwarding is not enabled here: the module is a separate DKMS build
+# and fails on some cloud kernels. Userspace forwarding is correct, just
+# slower -- a throughput concern, not a correctness one.
+# --interface=LOCAL!ADVERTISED, and BOTH HALVES MATTER.
+#
+# 0.0.0.0 is rejected outright ("Invalid interface specification"), so this
+# needs the real address. The half after the "!" is what rtpengine puts in
+# SDP, and on a NAT'd host -- every EC2, GCE and most VPS instances -- it must
+# be the PUBLIC address while the bind stays private. Get that wrong and every
+# call connects and carries silence, because the far end is sending RTP to an
+# address the internet cannot route.
+#
+# The installer substitutes both. When the machine has a real public IP on its
+# interface the two are equal, and the form is still correct.
+ExecStart=/usr/bin/rtpengine --interface=@BIND_IP@!@PUBLIC_IP@ \
+    --listen-ng=127.0.0.1:22222 \
+    --port-min=30000 --port-max=31000 --log-level=5 \
+    --pidfile=/run/megatron-rtpengine.pid
+PIDFile=/run/megatron-rtpengine.pid
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

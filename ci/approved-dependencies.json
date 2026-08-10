@@ -1,0 +1,137 @@
+{
+  "_comment": [
+    "Every third-party dependency MEGATRON links, with the licence it was",
+    "approved under. ci/policy_check.py (LICENCE) fails the build on any",
+    "dependency in a build file that is not listed here.",
+    "",
+    "WHY AN ALLOWLIST AND NOT A LICENCE-SCANNING SERVICE:",
+    "the policy gate is stdlib-only and offline by design, so that it runs",
+    "identically on a laptop and a runner and can never itself become a",
+    "supply-chain concern in a project whose entire pitch is not being",
+    "MagnusBilling. A network call to resolve a licence is a network call that",
+    "can be wrong, slow, or absent -- and a gate that silently degrades when",
+    "offline is not a gate.",
+    "",
+    "The cost is that adding a dependency requires a human to write a line",
+    "here. That is the intended cost. MEGATRON is proprietary and",
+    "distributed to licensees, so a GPL/AGPL/LGPL dependency is not a licence",
+    "problem to be discovered later -- it is a product that cannot ship.",
+    "",
+    "Adding an entry means asserting you checked the licence of THAT VERSION.",
+    "Projects do relicense."
+  ],
+
+  "allowed_licences": [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "EPL-2.0",
+    "CC0-1.0",
+    "Unlicense"
+  ],
+
+  "forbidden_licences": [
+    "GPL-2.0", "GPL-3.0",
+    "AGPL-3.0",
+    "LGPL-2.1", "LGPL-3.0",
+    "SSPL-1.0",
+    "BUSL-1.1"
+  ],
+
+  "dependencies": {
+    "org.jetbrains.kotlin:kotlin-stdlib": {
+      "licence": "Apache-2.0",
+      "why": "The language runtime. Unavoidable, and Apache-2.0 throughout."
+    },
+    "org.jetbrains.kotlin:kotlin-test": {
+      "licence": "Apache-2.0",
+      "why": "Test only. Never linked into a shipped binary."
+    },
+    "org.jetbrains.kotlin:kotlin-test-junit5": {
+      "licence": "Apache-2.0",
+      "why": "Test only."
+    },
+    "org.junit.platform:junit-platform-launcher": {
+      "licence": "EPL-2.0",
+      "why": "Test only, never distributed. EPL-2.0 is a weak copyleft that reaches only the EPL'd files themselves, and this is a test-runtime dependency that is not linked into any shipped artifact."
+    },
+
+    "org.jetbrains.kotlinx:kotlinx-serialization-json": {
+      "licence": "Apache-2.0",
+      "why": "JSON on the provisioning API. Compile-time code generation rather than runtime reflection, which matters on a service the authorizer sits next to."
+    },
+
+    "io.ktor:ktor-server-core": {
+      "licence": "Apache-2.0",
+      "why": "HTTP server for the provisioning API. Chosen over Spring Boot for this service because it starts in milliseconds and carries no reflective classpath scanning -- the smaller the running surface on a box that also terminates SIP, the better."
+    },
+    "io.ktor:ktor-server-netty": {
+      "licence": "Apache-2.0",
+      "why": "Ktor's Netty engine. Netty itself is Apache-2.0."
+    },
+    "io.ktor:ktor-server-content-negotiation": {
+      "licence": "Apache-2.0",
+      "why": "Binds JSON to the routes. Also how the API is kept JSON-only: MagnusBilling's CVE-2025-2609/2610 were APIs served as text/html."
+    },
+    "io.ktor:ktor-serialization-kotlinx-json": {
+      "licence": "Apache-2.0",
+      "why": "Bridges kotlinx-serialization into Ktor."
+    },
+    "io.ktor:ktor-server-status-pages": {
+      "licence": "Apache-2.0",
+      "why": "Turns exceptions into RFC 9457 problem documents instead of leaking a stack trace to a caller."
+    },
+    "io.ktor:ktor-server-auth": {
+      "licence": "Apache-2.0",
+      "why": "Bearer authentication, and the operator/customer scope split the contract requires."
+    },
+    "io.ktor:ktor-server-call-logging": {
+      "licence": "Apache-2.0",
+      "why": "Request logging. Needed to answer 'who moved this balance' at all."
+    },
+    "io.ktor:ktor-server-test-host": {
+      "licence": "Apache-2.0",
+      "why": "Test only. Runs the real routes in-process so the API is tested as an API rather than as a pile of functions."
+    },
+    "io.ktor:ktor-client-content-negotiation": {
+      "licence": "Apache-2.0",
+      "why": "Test only. The test client's JSON support."
+    },
+
+    "org.slf4j:slf4j-simple": {
+      "licence": "MIT",
+      "why": "SLF4J binding, required because Ktor logs through SLF4J. Chosen over Logback deliberately -- see the note below."
+    },
+    "org.slf4j:slf4j-api": {
+      "licence": "MIT",
+      "why": "The logging facade Ktor is written against."
+    },
+
+    "org.xerial:sqlite-jdbc": {
+      "licence": "Apache-2.0",
+      "why": "Durable storage for a single node, and the only database that can be TESTED on the machine this is being written on. The SQL is deliberately portable so the PostgreSQL store is a schema file and a JDBC URL rather than a rewrite -- see docs/STORAGE.md."
+    }
+  },
+
+  "_logback_note": [
+    "LOGBACK WAS CONSIDERED AND REJECTED, and the reasoning is recorded so it",
+    "does not get quietly reversed by the next person who reaches for the",
+    "familiar default.",
+    "",
+    "Logback is dual-licensed EPL-1.0 OR LGPL-2.1. Dual licensing means the",
+    "user elects, and electing EPL-1.0 would make it usable here -- EPL is a",
+    "weak, file-scoped copyleft. But it is an election MEGATRON would then be",
+    "carrying, documenting, and defending in every licensing conversation with",
+    "an operator we sell to, for a logging backend.",
+    "",
+    "slf4j-simple is MIT and adequate. The cost of avoiding the question",
+    "entirely was one line of configuration, which is a better trade than a",
+    "paragraph in a licence review.",
+    "",
+    "If structured logging or async appenders are needed later, evaluate",
+    "permissively-licensed options FIRST. Do not add Logback without",
+    "revisiting this note."
+  ]
+}

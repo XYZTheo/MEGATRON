@@ -1,0 +1,577 @@
+openapi: 3.1.0
+
+# =============================================================================
+# MEGATRON — SHIELD TELEMETRY CONTRACT
+# =============================================================================
+#
+# The API behind the operator dashboard: what the shield blocked, why, and from
+# where. Served by the Go node agent on each edge node.
+#
+# This is the visible surface of the wedge product (issue #4). An operator
+# evaluating MEGATRON in front of their existing MagnusBilling install will
+# judge it almost entirely through this data, so the contract is written before
+# the UI rather than reverse-engineered from it.
+#
+# -----------------------------------------------------------------------------
+# WHY THIS IS A SEPARATE SERVICE FROM THE AUTHORIZER
+# -----------------------------------------------------------------------------
+# contracts/authorizer.openapi.yaml is the money plane and lives in the core,
+# on the private network, holding credentials and customer data. This one runs
+# on the EDGE, which by design holds none of those (edge/README.md, the trust
+# boundary table). Keeping them separate is what lets the edge stay disposable:
+# a compromised edge node yields an attacker a list of IP addresses that already
+# attacked us, which is not a secret worth having.
+#
+# The two contracts must never merge, and the shield agent must never grow a
+# database credential. ci/policy_check.py enforces the config half of that rule
+# (EDGE-CREDENTIALS); this comment is the design half.
+#
+# -----------------------------------------------------------------------------
+# WHAT THIS DELIBERATELY DOES NOT EXPOSE
+# -----------------------------------------------------------------------------
+# No customer identifiers, no called or calling numbers, no Call-IDs, no SIP
+# bodies. The shield's telemetry is about ATTACKERS, not about traffic. That is
+# a privacy position taken now, while it is still free, because this same data
+# model feeds the opt-in fleet-wide reputation feed later — and a feed that was
+# built on customer data cannot be un-built.
+#
+# The one deliberate exception is `sample_user_agent` on a block entry: an
+# attacker's self-declared User-Agent (`friendly-scanner`, `sipcli`) is the
+# evidence for a fingerprint block, and an operator who cannot see WHY an
+# address was blocked will eventually turn blocking off. That is the failure
+# mode that makes most blocklists useless in practice.
+#
+# -----------------------------------------------------------------------------
+# POLLING, NOT STREAMING — FOR NOW
+# -----------------------------------------------------------------------------
+# v1 is request/response with an explicit `poll_after_seconds` hint. No
+# websockets, no SSE.
+#
+# The reason is the failure mode this product exists to answer: during a flood
+# the node is the thing under load. A push channel per open dashboard adds
+# per-connection state and per-event fan-out work to a process whose entire
+# design rule is "cost to reject must be far below cost to send". A dashboard
+# that degrades the node it is monitoring, exactly when the operator opens it,
+# would be an embarrassing way to lose a customer.
+#
+# Polling also keeps the whole surface cacheable, replayable and trivially
+# testable, and it means a dashboard tab left open overnight costs one cheap
+# request every few seconds instead of an idle connection to babysit.
+#
+# -----------------------------------------------------------------------------
+# REACHABILITY AND AUTH
+# -----------------------------------------------------------------------------
+# The agent binds this API to LOCALHOST ONLY. Operators reach it through an SSH
+# tunnel or the core's authenticated reverse proxy — never by exposing a port.
+# This is the same rule the setup wizard applies to the admin console (issue #5:
+# "binds admin to localhost"), and no path through the wizard may relax it.
+#
+# Binding to localhost is the control. The bearer token is defence in depth
+# against other local processes, not the primary boundary.
+#
+# -----------------------------------------------------------------------------
+# STATUS: contract design. NO IMPLEMENTATION EXISTS. The Go node agent is not
+# written (issue #4), and no MEGATRON component has ever run on a Linux host
+# (issue #2). This document has been checked by openapi-spec-validator 0.7.1 and
+# is a valid OpenAPI 3.1 document; that is the only claim made for it.
+# =============================================================================
+
+info:
+  title: MEGATRON Shield Telemetry API
+  version: 0.1.0
+  summary: What the edge blocked, why, and from where.
+  description: |
+    Read-mostly telemetry served by the Go node agent on a MEGATRON edge node,
+    consumed by the operator dashboard (`ui/shield/`).
+
+    **The dashboard's job is to answer four questions during an attack:**
+
+    1. Am I still up, and is legitimate traffic still getting through?
+    2. How much am I absorbing?
+    3. Where is it coming from?
+    4. Why did *that* address get blocked — and how do I undo it if you are wrong?
+
+    Question 4 is not a courtesy. Automated blocking that an operator cannot
+    inspect and reverse is automated blocking that operators switch off.
+
+    **Two write operations exist, and only two:** unblock an address, and
+    block one. Everything else is read-only. The verb set is closed by design
+    — CVE-2023-30258 was MagnusBilling shipping an endpoint that reached a
+    shell, and the answer is an API that has no general-purpose verb to reach
+    for.
+  license:
+    name: Proprietary
+    identifier: LicenseRef-MEGATRON-Proprietary
+
+servers:
+  - url: http://127.0.0.1:8089
+    description: |
+      Loopback only. The node agent must not bind a routable address for this
+      API. Reach it through an SSH tunnel or the core's authenticated proxy.
+
+security:
+  - operatorToken: []
+
+tags:
+  - name: overview
+    description: The headline numbers a dashboard opens with.
+  - name: blocks
+    description: Who is blocked, why, and for how long.
+  - name: operations
+    description: Health and node identity.
+
+paths:
+
+  /v1/overview:
+    get:
+      tags: [overview]
+      operationId: getOverview
+      summary: Headline counters and the accepted/absorbed time series.
+      description: |
+        One request populates the whole dashboard above the fold. This is
+        deliberate: during an attack the operator refreshes repeatedly, and a
+        dashboard that fans out into six requests per refresh multiplies its
+        own load on the node it is monitoring at the worst possible moment.
+      parameters:
+        - name: window
+          in: query
+          required: false
+          description: How much history the series covers.
+          schema:
+            type: string
+            enum: [15m, 1h, 6h, 24h, 7d]
+            default: 1h
+      responses:
+        "200":
+          description: Current state of this node.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Overview"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ShedLoad"
+
+  /v1/blocks:
+    get:
+      tags: [blocks]
+      operationId: listBlocks
+      summary: Currently blocked sources, newest first.
+      parameters:
+        - name: reason
+          in: query
+          required: false
+          description: Filter to one classification source.
+          schema:
+            $ref: "#/components/schemas/BlockReason"
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 100
+        - name: cursor
+          in: query
+          required: false
+          description: |
+            Opaque continuation token from `next_cursor`. Cursor-based rather
+            than offset-based because the underlying set changes constantly
+            under attack, and offset paging silently skips and repeats rows
+            when it does.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: A page of block entries.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BlockPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ShedLoad"
+
+    post:
+      tags: [blocks]
+      operationId: createBlock
+      summary: Block a source manually.
+      description: |
+        The operator's manual override. A manual block still carries a TTL —
+        there is no permanent block in this API, because a blocklist nobody
+        can age out becomes a support burden that ends with the operator
+        flushing the whole thing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BlockRequest"
+      responses:
+        "201":
+          description: The address is now blocked.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Block"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: |
+            The address is already blocked. Returns the existing entry rather
+            than extending it, so a retried request cannot silently lengthen
+            a block.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Block"
+
+  /v1/blocks/{address}:
+    parameters:
+      - name: address
+        in: path
+        required: true
+        description: IPv4 or IPv6 address, or a CIDR prefix.
+        schema:
+          type: string
+        example: "203.0.113.44"
+
+    delete:
+      tags: [blocks]
+      operationId: deleteBlock
+      summary: Unblock a source (the false-positive escape hatch).
+      description: |
+        The most important write operation in the product. Every automated
+        classifier produces false positives eventually; an operator whose only
+        remedy is to disable automated blocking will disable automated
+        blocking, and then the shield is off.
+
+        Removal is propagated to the nftables set and the in-process
+        `cachedb_local` collection. It does NOT retroactively unreport the
+        address to the shared reputation feed — that feed is append-only and
+        carries its own expiry.
+      responses:
+        "204":
+          description: No longer blocked.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: That address was not blocked.
+
+  /v1/health:
+    get:
+      tags: [operations]
+      operationId: getHealth
+      summary: Liveness, node identity, and shield mode.
+      security: []
+      description: |
+        Unauthenticated ON PURPOSE, and correspondingly thin: it returns no
+        counters, no addresses and no customer-adjacent data. It exists so a
+        load balancer or the setup wizard's preflight can confirm the agent is
+        alive without being handed a token.
+      responses:
+        "200":
+          description: The agent is alive.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+
+components:
+
+  securitySchemes:
+    operatorToken:
+      type: http
+      scheme: bearer
+      description: |
+        Token generated by the setup wizard. Defence in depth behind the
+        loopback bind, not a substitute for it.
+
+  responses:
+
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+    BadRequest:
+      description: The request body failed validation.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+    ShedLoad:
+      description: |
+        The node is shedding load. Telemetry is the FIRST thing dropped when
+        the node is saturated — serving a dashboard must never cost a customer
+        their call. The dashboard is expected to show its last good data with
+        a visible staleness marker rather than an error page, because "the
+        dashboard broke" and "the switch is down" must never look the same to
+        an operator at 3am.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds to wait before retrying.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+  schemas:
+
+    Problem:
+      type: object
+      description: RFC 9457 problem details.
+      required: [title, status]
+      properties:
+        type:
+          type: string
+          default: "about:blank"
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+      additionalProperties: false
+
+    Health:
+      type: object
+      required: [status, node_id, mode, version]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        node_id:
+          type: string
+          description: Stable identifier for this edge node.
+        mode:
+          $ref: "#/components/schemas/ShieldMode"
+        version:
+          type: string
+      additionalProperties: false
+
+    ShieldMode:
+      type: string
+      description: |
+        `transparent` is the wedge deployment: MEGATRON sits in front of an
+        operator's existing MagnusBilling switch and relays clean traffic to
+        it, with no migration and no change to their switch.
+
+        `monitor` classifies and reports but blocks nothing. It is how a
+        cautious operator starts, and how the shield proves its false-positive
+        rate on their real traffic before it is trusted to drop anything.
+      enum: [transparent, monitor, integrated]
+
+    Overview:
+      type: object
+      required:
+        [node_id, mode, generated_at, window, poll_after_seconds,
+         accepted, absorbed, blocked_sources, series, top_sources]
+      properties:
+        node_id:
+          type: string
+        mode:
+          $ref: "#/components/schemas/ShieldMode"
+        generated_at:
+          type: string
+          format: date-time
+          description: |
+            When the node produced these numbers. The dashboard renders age
+            from this rather than from its own clock, so a stalled agent
+            reads as stale data instead of as a quiet switch.
+        window:
+          type: string
+          enum: [15m, 1h, 6h, 24h, 7d]
+        poll_after_seconds:
+          type: integer
+          description: |
+            How long the client should wait before asking again. Server-driven
+            so a node under pressure can push every open dashboard to back off
+            without the dashboards needing to detect anything.
+          minimum: 1
+        accepted:
+          $ref: "#/components/schemas/Counter"
+        absorbed:
+          $ref: "#/components/schemas/Counter"
+        blocked_sources:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            How many sources are in the blocklist right now — the whole
+            blocklist, not a page of it.
+
+            This exists because the alternative is a lie. A dashboard that
+            counts the rows it happened to receive from `/v1/blocks` reports
+            "100 blocked" during an attack that blocked forty thousand, and
+            it does so on the one panel whose entire job is to be trustworthy
+            at 3am. The node already knows the true figure; it says so here,
+            and the table below is free to be an honest, explicitly truncated
+            sample of it.
+        series:
+          type: array
+          description: |
+            Time-bucketed accepted vs absorbed, oldest first. Buckets are of
+            uniform width and are never omitted: a bucket with no traffic is
+            present with zeroes, so a gap in the chart means the AGENT was
+            down, which is a different fact and must look different.
+          items:
+            $ref: "#/components/schemas/SeriesPoint"
+        top_sources:
+          type: array
+          description: Heaviest hostile sources in the window, worst first.
+          items:
+            $ref: "#/components/schemas/SourceRollup"
+      additionalProperties: false
+
+    Counter:
+      type: object
+      required: [packets, requests]
+      description: |
+        Counts for the window. Packets AND requests, because the gap between
+        them is the story: a volumetric flood moves packets without ever
+        forming a valid SIP request, and conflating the two hides which kind
+        of attack is underway.
+      properties:
+        packets:
+          type: integer
+          format: int64
+          minimum: 0
+        requests:
+          type: integer
+          format: int64
+          minimum: 0
+      additionalProperties: false
+
+    SeriesPoint:
+      type: object
+      required: [t, accepted, absorbed]
+      properties:
+        t:
+          type: string
+          format: date-time
+          description: Start of the bucket.
+        accepted:
+          type: integer
+          format: int64
+          minimum: 0
+        absorbed:
+          type: integer
+          format: int64
+          minimum: 0
+      additionalProperties: false
+
+    SourceRollup:
+      type: object
+      required: [address, country, requests, reason]
+      properties:
+        address:
+          type: string
+        country:
+          type: string
+          description: |
+            ISO 3166-1 alpha-2, or `??` when unknown. Geolocation is
+            advisory — it is useful for an operator recognising a pattern,
+            and it is never an input to a blocking decision. Blocking by
+            country is a customer-losing control that attackers route around
+            in minutes.
+        requests:
+          type: integer
+          format: int64
+          minimum: 0
+        reason:
+          $ref: "#/components/schemas/BlockReason"
+      additionalProperties: false
+
+    BlockReason:
+      type: string
+      description: |
+        Why the source was classified hostile. These are exactly the four
+        sources listed in edge/README.md, plus the manual override — the
+        dashboard must be able to show the operator which one fired, and the
+        set is closed so a new classifier cannot appear in the UI as a blank.
+
+        `honeypot` is the highest-confidence entry: the source touched a decoy
+        address that no legitimate traffic has any reason to touch.
+      enum: [flood, fingerprint, honeypot, reputation, manual]
+
+    Block:
+      type: object
+      required: [address, reason, blocked_at, expires_at, hits]
+      properties:
+        address:
+          type: string
+        reason:
+          $ref: "#/components/schemas/BlockReason"
+        blocked_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          description: |
+            Always present. Blocks expire on their own, so a transient false
+            positive self-heals without the operator doing anything.
+        hits:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Requests from this source since it was blocked.
+        country:
+          type: string
+        sample_user_agent:
+          type: string
+          description: |
+            The attacker's self-declared User-Agent, when that is what
+            classified it. The evidence for the block, shown so the operator
+            can judge it rather than trust it.
+        note:
+          type: string
+          description: Operator's own note, for manual blocks.
+      additionalProperties: false
+
+    BlockPage:
+      type: object
+      required: [items, generated_at]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Block"
+        generated_at:
+          type: string
+          format: date-time
+        next_cursor:
+          type: string
+          description: Absent on the last page.
+      additionalProperties: false
+
+    BlockRequest:
+      type: object
+      required: [address, ttl_seconds]
+      properties:
+        address:
+          type: string
+          description: IPv4/IPv6 address or CIDR prefix.
+        ttl_seconds:
+          type: integer
+          minimum: 60
+          maximum: 2592000
+          description: |
+            Bounded at both ends on purpose. The floor stops a block so short
+            it is indistinguishable from nothing; the ceiling (30 days) means
+            there is no permanent block to accumulate.
+        note:
+          type: string
+          maxLength: 200
+      additionalProperties: false

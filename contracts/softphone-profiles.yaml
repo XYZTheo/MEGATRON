@@ -1,0 +1,209 @@
+# =============================================================================
+# MEGATRON — SOFTPHONE INTEROPERABILITY PROFILES
+# =============================================================================
+#
+# Seth, 2026-08-07: "it should be optimized for major softphones like portsip
+# microsip and zopier."
+#
+# This is what "optimised for" has to mean concretely, because a registrar
+# either works with a client or it does not, and the difference is a dozen
+# specific behaviours. Each profile records what a client actually does, so
+# the class-5 registrar can be built to accommodate it rather than discovering
+# it from a support ticket.
+#
+# It is also the interop test matrix. Nothing here has been tested — there is
+# no Linux host yet (issue #2) — so every entry carries a `confidence`, and the
+# first lab day's job is to turn `vendor-documented` and `assumed` into
+# `lab-verified`. A profile that cannot say which of its claims were checked is
+# a profile that will be believed and then be wrong.
+#
+# -----------------------------------------------------------------------------
+# TWO FINDINGS THAT ARE PRODUCT DECISIONS, NOT CONFIGURATION DETAILS
+# -----------------------------------------------------------------------------
+#
+# 1. ZOIPER'S FREE TIER CANNOT DO TLS OR SRTP AT ALL. Encryption is a paid
+#    (Pro/Biz) feature, and the free tier is G.711 only.
+#
+#    contracts/wizard-answers.schema.json currently makes TLS mandatory and
+#    treats plain UDP as the constrained exception for carrier trunks. That is
+#    right for the trunk side. Applied unchanged to RETAIL REGISTRATIONS it
+#    locks out most of the installed base a Magnus operator is migrating —
+#    their customers are overwhelmingly on free Zoiper.
+#
+#    This needs an explicit decision (see `open_decisions` below). It must not
+#    be resolved by quietly relaxing TLS everywhere, which would throw away the
+#    property that a spoofed-source flood cannot complete a TLS handshake.
+#
+# 2. STUN IS NOT A DEFAULT, IT IS A CONDITIONAL. MicroSIP's own guidance is
+#    that STUN should be enabled only behind non-symmetric NAT — behind
+#    symmetric NAT it actively causes audio-delivery failures. So the server
+#    must not assume the client will solve NAT. It has to work when the client
+#    gets it wrong, which means rport/comedia and media anchoring on our side
+#    rather than trusting the SDP.
+# =============================================================================
+
+version: "0.1.0"
+
+meta:
+  status: "specification and interop test matrix; nothing here has been tested"
+  blocked_by: 2
+  confidence_levels:
+    lab-verified: "observed against a real MEGATRON node"
+    vendor-documented: "stated by the vendor's own documentation or release notes"
+    assumed: "reasoned from the underlying SIP stack; MUST be confirmed in lab"
+
+# -----------------------------------------------------------------------------
+# Server-side behaviour required to serve ALL profiles below.
+# These are the invariants; the profiles are the evidence for them.
+# -----------------------------------------------------------------------------
+registrar_requirements:
+
+  - id: honour-rport-always
+    requirement: "Always reply and route to the source IP/port observed on the wire (rport / received), never to the Contact the client advertised."
+    why: "Every client below can be behind NAT, and at least one is documented to break when the client tries to solve NAT itself. Trusting Contact is the single most common cause of one-way audio and unreachable registrations."
+    confidence: vendor-documented
+
+  - id: anchor-media-always
+    requirement: "Anchor RTP through rtpengine for every retail registration. Never allow direct media between two registered endpoints."
+    why: "The clients disagree about ICE, STUN and symmetric RTP, and two clients that each get NAT half-right still fail together. Anchoring makes the server the one thing that is always reachable. It is also what makes media-vs-signalling CDR reconciliation possible at all, which is one of the three money-losing failure modes being designed out."
+    confidence: assumed
+
+  - id: offer-narrow-codecs
+    requirement: "Offer G.711 a-law and u-law to every retail endpoint, always, in addition to whatever else is negotiated."
+    why: "It is the only codec every client on this list supports in its free tier. A codec list that omits it will work in testing on a paid client and fail for the operator's actual customers."
+    confidence: vendor-documented
+
+  - id: accept-both-dtmf
+    requirement: "Accept RFC 2833/4733 telephone-event AND SIP INFO DTMF; normalise to RFC 4733 upstream."
+    why: "Clients differ, and IVR and calling-card flows are where DTMF failure is discovered — by a customer who cannot enter their PIN."
+    confidence: assumed
+
+  - id: clamp-register-expiry
+    requirement: "Clamp REGISTER expiry into a server-chosen band and answer out-of-band requests with 423 Interval Too Brief rather than accepting them."
+    why: "Short client-chosen expiries multiply registration traffic by the size of the fleet, and registration traffic is what a shield tier has to survive during an attack. Clamping is a load control, not a preference."
+    confidence: assumed
+
+  - id: tolerate-keepalive-noise
+    requirement: "Treat double-CRLF keepalives and periodic OPTIONS as free: they must not allocate transaction state, must not be rate-limited into a block, and must not appear as traffic in the shield's hostile counters."
+    why: "A NAT keepalive from a legitimate registered client looks like a flood if you count it like one. Getting this wrong means the shield blocks the operator's own customers, which is the worst possible false positive."
+    confidence: assumed
+
+  - id: no-udp-fragmentation
+    requirement: "Keep responses under the path MTU: minimal Via/Record-Route, no unnecessary headers, and switch to TCP when a response would exceed 1300 bytes."
+    why: "A fragmented UDP SIP response is dropped by a great many consumer routers, and presents as 'registers fine, calls never connect'."
+    confidence: assumed
+
+# -----------------------------------------------------------------------------
+# Client profiles
+# -----------------------------------------------------------------------------
+profiles:
+
+  - id: microsip
+    name: "MicroSIP"
+    platforms: [windows]
+    stack: pjsip
+    why_it_matters: "The default recommendation for Windows desktop users in most Magnus-shaped deployments: free, open source, under 2.5 MB, and full-featured. If one client has to work perfectly, it is this one."
+    transports:
+      udp: supported
+      tcp: supported
+      tls: supported
+    media_encryption:
+      srtp: supported
+      dtls_srtp: supported
+      default: disabled
+      note: "Encryption is per-account and defaults to OFF. The server must not require it for retail without the provisioning template turning it on, or every new user fails at first call."
+    codecs: [opus, g711a, g711u, g722, g729, gsm, ilbc, speex, silk, amr, amr-wb]
+    nat:
+      stun: conditional
+      note: "Vendor guidance: enable STUN only behind non-symmetric NAT. Behind symmetric NAT, STUN actively causes audio-delivery problems. The server therefore cannot depend on the client resolving its own NAT."
+    confidence: vendor-documented
+    provisioning: "INI-style config file; supports command-line and portable-mode deployment, so an operator can ship a preconfigured build."
+    lab_checklist:
+      - "register over UDP, TCP and TLS in turn"
+      - "call with SRTP off (the default) and on"
+      - "behind symmetric NAT with STUN wrongly enabled — must still get two-way audio via anchoring"
+      - "Opus and G.729 negotiation, and fallback to G.711 when both are refused"
+
+  - id: zoiper
+    name: "Zoiper 5 (Classic / Free / Pro / Biz)"
+    platforms: [windows, macos, linux, ios, android]
+    stack: proprietary
+    why_it_matters: "The most widely installed client across the retail VoIP market and the one an operator's existing customers will already have. Its FREE tier is the constraint that matters, because that is what they are running."
+    transports:
+      udp: supported
+      tcp: supported
+      tls: paid-only
+    media_encryption:
+      srtp: paid-only
+      zrtp: paid-only
+      default: disabled
+      note: "TLS and SRTP are Pro/Biz features. A free-tier user CANNOT connect to a TLS-only registrar at all — not degraded, not insecure, simply unable to register."
+    codecs_free: [g711a, g711u]
+    codecs_paid: [g729, ilbc, opus, speex, gsm]
+    codec_note: "The free tier is G.711 only; G.729 and the rest are paid, and on iOS G.729 has been sold as a separate in-app purchase. Any codec policy that assumes G.729 availability will fail for most retail users and quietly increase bandwidth cost per call."
+    nat:
+      stun: supported
+      note: "Widely deployed behind consumer NAT. Assume the client is wrong about its own address."
+    confidence: vendor-documented
+    provisioning: "Provisioning URL / config push; supports operator-branded builds on paid tiers."
+    lab_checklist:
+      - "FREE tier against the retail registrar — this is the acceptance test that decides the TLS policy"
+      - "confirm G.711 a-law and u-law both negotiate"
+      - "Pro tier with TLS and SRTP"
+      - "mobile client surviving network handover (wifi to cellular) and re-registering"
+
+  - id: portsip
+    name: "PortSIP Softphone / PortSIP UC"
+    platforms: [windows, macos, ios, android, web]
+    stack: portsip
+    why_it_matters: "The enterprise/UC end of the range, and a common choice where video and desk-phone-replacement matter. Also an SDK, so an operator may have embedded it in their own branded client."
+    transports:
+      udp: assumed
+      tcp: assumed
+      tls: assumed
+    media_encryption:
+      srtp: assumed
+      dtls_srtp: assumed
+      default: unknown
+    codecs: [opus, g711a, g711u, g722, g729, ilbc]
+    video: assumed
+    nat:
+      ice: assumed
+      note: "WebRTC-adjacent clients tend to bring full ICE, which interacts with media anchoring differently from a plain client. Needs deliberate testing, not assumption."
+    confidence: assumed
+    provisioning: "unknown — determine in lab"
+    lab_checklist:
+      - "FIRST: establish actual transport, codec and encryption support from a real client. Everything above is reasoned from the product category, not verified."
+      - "ICE negotiation against rtpengine anchoring — the most likely place this client behaves differently from the other two"
+      - "video call setup and teardown, and whether the CDR reconciliation handles a video stream"
+
+  - id: generic
+    name: "Any other SIP client"
+    why_it_matters: "The profile the registrar must fall back to. An operator's customer base always contains hardware phones, an old ATA, and something nobody has heard of."
+    transports:
+      udp: supported
+      tcp: supported
+      tls: supported
+    codecs: [g711a, g711u]
+    confidence: assumed
+    note: "G.711 both laws, RFC 4733 DTMF, rport, anchored media, no assumptions about ICE. Anything that speaks RFC 3261 must be able to register and place a call."
+
+# -----------------------------------------------------------------------------
+# Decisions this document forces, which cannot be made by writing config
+# -----------------------------------------------------------------------------
+open_decisions:
+
+  - id: retail-tls-policy
+    question: "Does the class-5 retail registrar require TLS?"
+    tension: "The wizard schema makes TLS mandatory, and a spoofed-source flood cannot complete a TLS handshake — that property is load-bearing for the shield. But Zoiper's free tier cannot do TLS at all, and it is what an operator's existing customers are running. Requiring TLS for retail means telling a migrating operator their customers must buy a licence."
+    options:
+      - "TLS required everywhere — cleanest security story, worst migration story"
+      - "TLS required for trunks, offered-but-not-required for retail, with plain UDP registrations rate-limited far more aggressively and excluded from any trust decision"
+      - "TLS required for retail, with a documented per-tenant exception the operator must consciously enable and which is visible in the admin console"
+    recommendation: "The second. It keeps the structural anti-spoofing property where the volume is (trunks), does not block migration, and makes the weaker path measurably weaker rather than silently equal."
+    owner_issue: 3
+
+  - id: g729-licensing
+    question: "Do we transcode to G.729, and who pays for it?"
+    tension: "Zoiper free cannot do G.729, MicroSIP can, and carriers often prefer it for bandwidth. Transcoding gets no benefit from rtpengine's kernel module and needs its own pool, so it is a real cost line rather than a checkbox."
+    owner_issue: 3

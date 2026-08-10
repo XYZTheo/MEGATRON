@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  A customer's softphone logging in and saying WHERE TO REACH IT.
+
+  Same exchange as sipp-register.xml, with one difference that matters: the
+  Contact names a port given as a parameter rather than this process's own.
+
+  WHY THAT IS NEEDED, because it looks like a workaround and is one.
+
+  A real phone registers and then answers calls on the same socket. SIPp cannot
+  do both in one scenario: it matches incoming messages to calls by Call-ID,
+  and an INVITE arriving for a registered account has nothing to do with the
+  Call-ID of the REGISTER that put it there. SIPp therefore treats it as a new
+  incoming call and starts the scenario from the top -- at a `send REGISTER` --
+  so the INVITE is never answered and the caller gets 408.
+
+  So the two halves of a phone are split across two processes here: this one
+  registers, and a plain `sipp -sn uas` on [field2] answers. The switch cannot
+  tell the difference, because a Contact is just an address.
+
+    -au / -ap    the account being authenticated as, and its password
+    -inf field0  realm / SIP domain
+    -inf field1  the account (From, To and Contact user)
+    -inf field2  the port the phone actually answers on
+-->
+<scenario name="MEGATRON register with contact port">
+
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[field0] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      From: <sip:[field1]@[field0]>;tag=[call_number]
+      To: <sip:[field1]@[field0]>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:[field1]@[local_ip]:[field2]>
+      Expires: 300
+      User-Agent: MEGATRON-phone
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="401" auth="true"/>
+
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[field0] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      From: <sip:[field1]@[field0]>;tag=[call_number]
+      To: <sip:[field1]@[field0]>
+      Call-ID: [call_id]
+      CSeq: 2 REGISTER
+      Contact: <sip:[field1]@[local_ip]:[field2]>
+      Expires: 300
+      [authentication]
+      User-Agent: MEGATRON-phone
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200"/>
+
+</scenario>

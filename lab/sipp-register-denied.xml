@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  sipp-register.xml, expecting a 403 instead of a 200.
+
+  Same exchange, opposite verdict. It covers the two ways a login should be
+  refused:
+
+    wrong password  - -ap is not the account's password
+    identity spoof  - -au authenticates correctly but field1 claims a
+                      different account in From, which if allowed would let a
+                      customer with a valid login receive somebody else's
+                      calls
+
+  Both are refusals the switch must make BEFORE anything reaches the
+  authorizer, because by the time an authorize request is built there is only
+  one account field left and the forgery is invisible.
+
+  Kept as a separate file rather than a flag on the other one because a
+  scenario that can only assert success cannot fail for the reason that
+  matters. Parameters are identical -- see sipp-register.xml, including why
+  the credentials are command-line options rather than injection fields.
+-->
+<scenario name="MEGATRON register denied">
+
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[field0] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      From: <sip:[field1]@[field0]>;tag=[call_number]
+      To: <sip:[field2]@[field0]>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:[field1]@[local_ip]:[local_port]>
+      Expires: 300
+      User-Agent: MEGATRON-lab
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="401" auth="true"/>
+
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[field0] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      From: <sip:[field1]@[field0]>;tag=[call_number]
+      To: <sip:[field2]@[field0]>
+      Call-ID: [call_id]
+      CSeq: 2 REGISTER
+      Contact: <sip:[field1]@[local_ip]:[local_port]>
+      Expires: 300
+      [authentication]
+      User-Agent: MEGATRON-lab
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="403"/>
+
+</scenario>

@@ -6,6 +6,17 @@ Proprietary. © 2026. All rights reserved. See [LICENSE](LICENSE).
 
 ---
 
+> **New here? Read [`docs/PRODUCT.md`](docs/PRODUCT.md) first.** It is short, and it
+> is the only document that describes the business this has to serve on day one.
+> Everything below is what the platform grows into; PRODUCT.md is what it must do
+> in v1 and who for. Where they disagree, PRODUCT.md wins.
+>
+> The whole v1 business in one line: **trunk in → rate → authenticate → trunk out
+> → bill**, operated through a **Telegram bot**, built this way because the owner's
+> MagnusBilling keeps getting attacked.
+
+---
+
 ## What this is
 
 MEGATRON is a VoIP softswitch and billing platform built to replace **MagnusBilling**

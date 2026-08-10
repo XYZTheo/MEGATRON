@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  A registered customer places a call.
+
+  Unlike the earlier call scenarios, this one authenticates: the switch
+  challenges the INVITE with 407, and the caller answers with a digest
+  response over the same credential it registered with. That is what lets the
+  switch bill $au -- who they proved they are -- instead of the From header,
+  which is only a claim.
+
+  Injection fields:
+    field0  realm / SIP domain
+    field1  the caller's account
+    field2  the number being dialled
+
+  Credentials come from -au / -ap, not from injection fields: SIPp substitutes
+  [fieldN] before it parses keywords, so they cannot nest inside
+  [authentication]. See sipp-register.xml.
+
+  THE IN-DIALOG REQUESTS CARRY [routes], AND MUST.
+
+  The switch record_route()s every call it authorizes, so the ACK and BYE of a
+  real softphone come back through it. [routes] is what makes SIPp honour the
+  Record-Route it was given, exactly as a phone does.
+
+  Without it the BYE arrives with no Route header, loose_route() does not
+  match, and the switch cannot tell it from a BYE forged for a call it never
+  handled -- so it refuses to settle. Everything up to that point looks
+  perfect: the call is authorized, anchored, answered and torn down, and only
+  the bill is missing.
+
+  They also target [next_url], the remote party's Contact, rather than the
+  address originally dialled. That is what a phone does, and what the switch
+  needs in order to forward the BYE on: the dialled number was never a
+  routable destination, it was a number to be rated.
+-->
+<scenario name="MEGATRON authenticated call">
+
+  <send retrans="500">
+    <![CDATA[
+
+      INVITE sip:[field2]@[field0] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      From: <sip:[field1]@[field0]>;tag=[call_number]
+      To: <sip:[field2]@[field0]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:[field1]@[local_ip]:[local_port]>
+      User-Agent: MEGATRON-lab
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+      s=-
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [media_port] RTP/AVP 0
+      a=rtpmap:0 PCMU/8000
+
+    ]]>
+  </send>
+
+  <!-- 407, not 401: this is a proxy challenging a call, not a registrar. -->
+  <recv response="407" auth="true"/>
+
+  <send>
+    <![CDATA[
+
+      ACK sip:[field2]@[field0] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      From: <sip:[field1]@[field0]>;tag=[call_number]
+      To: <sip:[field2]@[field0]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <send retrans="500">
+    <![CDATA[
+
+      INVITE sip:[field2]@[field0] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      From: <sip:[field1]@[field0]>;tag=[call_number]
+      To: <sip:[field2]@[field0]>
+      Call-ID: [call_id]
+      CSeq: 2 INVITE
+      Contact: <sip:[field1]@[local_ip]:[local_port]>
+      [authentication]
+      User-Agent: MEGATRON-lab
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+      s=-
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [media_port] RTP/AVP 0
+      a=rtpmap:0 PCMU/8000
+
+    ]]>
+  </send>
+
+  <recv response="100" optional="true"/>
+  <recv response="180" optional="true"/>
+  <!--
+    rrs="true" is what makes SIPp SAVE the Record-Route set from this
+    response. Without it [routes] below expands to nothing, the BYE carries no
+    Route header, and the switch cannot distinguish it from a BYE forged for a
+    call it never handled -- so the call completes and is never billed.
+  -->
+  <recv response="200" rtd="true" rrs="true"/>
+
+  <send>
+    <![CDATA[
+
+      ACK [next_url] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      From: <sip:[field1]@[field0]>;tag=[call_number]
+      To: <sip:[field2]@[field0]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 2 ACK
+      [routes]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!--
+    Five seconds of call. Long enough to be a real conversation as far as the
+    billing is concerned, and short enough that the whole suite stays quick.
+    The rate is 60-second increments, so this bills exactly one increment --
+    which is the arithmetic the calling script checks.
+  -->
+  <pause milliseconds="5000"/>
+
+  <send retrans="500">
+    <![CDATA[
+
+      BYE [next_url] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      From: <sip:[field1]@[field0]>;tag=[call_number]
+      To: <sip:[field2]@[field0]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 3 BYE
+      [routes]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200" crlf="true"/>
+
+</scenario>

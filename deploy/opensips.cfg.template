@@ -1,0 +1,777 @@
+# MEGATRON -- single-box production switch. Rendered by deploy/install.sh.
+#
+# THIS IS THE CONFIG THAT CARRIES REAL CALLS. It is the one the lab proved,
+# with the lab's fake carrier removed: where to send a call now comes from the
+# authorizer, per call, with the rate that will be charged for it.
+#
+# Every unusual line in this file is the result of a specific failure. Read
+# lab/README.md before changing any of it -- most of them were silent, and
+# several looked like something else entirely.
+#
+# @DOMAIN@ is substituted at install time. It is the digest realm, and it is
+# baked into every stored credential: changing it invalidates every customer's
+# password.
+#
+# The multi-node design is edge/ and core/. This is not that, and does not
+# pretend to be: one box, one realm, everything in one process group.
+
+# LOG LEVEL 2 WITH DELIBERATE EXCEPTIONS.
+#
+# The lab runs at 4 and logs its decisions at L_ERR, so they survive whatever
+# the level is while something is being debugged. In production that fills the
+# log with lines that are not errors, and an operator who learns to ignore
+# MEGATRON lines will ignore the one that matters.
+#
+# So: allow/REGISTERED/settled are L_NOTICE -- the audit trail of what the
+# switch DID. Refusals, spoof attempts and anything the switch could not do
+# stay at L_ERR. Per-call media detail is L_DBG.
+log_level=2
+stderror_enabled=no
+syslog_enabled=yes
+syslog_facility=LOG_LOCAL0
+
+udp_workers=2
+tcp_workers=2
+
+socket=udp:0.0.0.0:5060
+
+# TCP AS WELL AS UDP, ON THE SAME PORT.
+#
+# Not optional for a switch meant to replace an existing one. Plenty of
+# deployments hand their customers TCP — it is the default in several
+# softphones, and it is what survives a SIP message larger than a UDP
+# datagram, which REGISTERs with long Contact headers and INVITEs with fat SDP
+# both manage.
+#
+# A customer configured for TCP against a UDP-only switch does not get a
+# useful error. The softphone simply never connects, which reads as "your
+# server is down" rather than "your server does not speak the transport I was
+# told to use".
+socket=tcp:0.0.0.0:5060
+
+# WHAT THIS SWITCH TELLS THE WORLD ITS ADDRESS IS.
+#
+# Bound on every interface, but on a NAT'd host -- every EC2, GCE and most VPS
+# instances -- the address OpenSIPS would otherwise put in Via, Record-Route
+# and Contact is the private one. A softphone then sends its ACK and BYE to an
+# address the internet cannot route: the call sets up and never tears down,
+# which is a dialog that lives until the session timer kills it and a customer
+# billed for the difference.
+#
+# The installer substitutes the address customers actually reach. On a machine
+# with a real public IP on its interface this is the same value, and setting
+# it explicitly costs nothing.
+advertised_address="@PUBLIC_IP@"
+
+mpath="/usr/lib/x86_64-linux-gnu/opensips/modules/"
+
+loadmodule "proto_udp.so"
+# REQUIRED even though proto_tcp.so does not exist as a file — TCP is compiled
+# into the core and this line is what enables it. Without it, the tcp socket
+# above is refused at startup with "no transport protocol loaded". A check
+# that verifies every loadmodule has a matching .so on disk reports these two
+# as missing, which is a false failure that has already cost this project a
+# day once.
+loadmodule "proto_tcp.so"
+loadmodule "signaling.so"
+loadmodule "sl.so"
+loadmodule "tm.so"
+loadmodule "rr.so"
+loadmodule "maxfwd.so"
+loadmodule "sipmsgops.so"
+loadmodule "textops.so"
+loadmodule "dialog.so"
+loadmodule "rtpengine.so"
+loadmodule "rest_client.so"
+loadmodule "json.so"
+loadmodule "mi_fifo.so"
+
+# MI over HTTP, loopback only.
+#
+# The FIFO transport needs a reply FIFO negotiated per call, which makes
+# "is this account actually registered?" a fiddly enough question that the
+# tests stop asking it. Over HTTP it is one curl. Loopback only and never
+# exposed: MI can reload routing and drop registrations.
+loadmodule "httpd.so"
+loadmodule "mi_http.so"
+
+# -- the login ---------------------------------------------------------------
+# -- authenticating OUTWARD, to a carrier that challenges us -----------------
+#
+# Not every carrier authenticates by IP. Plenty issue a username and password
+# and challenge every INVITE with a 407, and a switch that cannot answer that
+# cannot connect to them at all — which rules out most of the small and
+# mid-size providers an operator actually buys from.
+#
+# Credentials come per call from the authorizer, in AVPs, rather than from
+# `modparam("uac_auth","credential",...)`. Static credentials would mean every
+# carrier password lives in this file in clear and every trunk change needs a
+# config reload. This way they stay in the database, and adding a carrier is
+# an API call.
+# BOTH modules, and the split is not obvious. uac_auth.so is a LIBRARY -- it
+# exports uac_auth_bind for other modules and no script function at all. The
+# callable uac_auth() lives in uac.so, which binds to it. Loading only the one
+# named after the feature gives "unknown command <uac_auth>, missing
+# loadmodule?", which points at the module you already loaded.
+loadmodule "uac_auth.so"
+loadmodule "uac.so"
+modparam("uac_auth", "auth_username_avp", "$avp(auth_user)")
+modparam("uac_auth", "auth_password_avp", "$avp(auth_pass)")
+modparam("uac_auth", "auth_realm_avp", "$avp(auth_realm)")
+
+# HOW A REWRITTEN From GETS PUT BACK.
+#
+# uac_replace_from() changes what the carrier sees. Everything coming back —
+# the 200, the BYE, the CANCEL — quotes the value we sent, so without a restore
+# the replies belong to a dialog this switch no longer recognises and the call
+# is dropped at the moment it is answered.
+#
+# "auto" encodes the original in the Record-Route it already adds, so nothing
+# is stored per call: a restart in the middle of a call does not lose the
+# mapping. It needs rr loaded, which it is, and record_route() called, which
+# every call here does.
+modparam("uac", "restore_mode", "auto")
+modparam("uac", "rr_from_store_param", "vsf")
+
+loadmodule "db_text.so"
+loadmodule "auth.so"
+loadmodule "auth_db.so"
+loadmodule "usrloc.so"
+loadmodule "registrar.so"
+
+modparam("mi_fifo", "fifo_name", "/tmp/lab_fifo/opensips_fifo")
+modparam("httpd", "ip", "127.0.0.1")
+modparam("httpd", "port", 8888)
+modparam("rtpengine", "rtpengine_sock", "udp:127.0.0.1:22222")
+
+modparam("rest_client", "connection_timeout", 2)
+modparam("rest_client", "curl_timeout", 2)
+
+modparam("dialog", "dlg_match_mode", 1)
+
+# Registrations live in shared memory only. They are soft state: a phone that
+# matters re-registers within a minute or two, and persisting them buys a
+# faster restart at the cost of a database on the call path. The production
+# design puts them in a store shared between edge nodes; that is a scaling
+# decision, not a correctness one.
+modparam("usrloc", "db_mode", 0)
+
+# The credentials file. It is rendered by provisioning and moved into place
+# atomically -- db_text refuses to load a malformed table, so a half-written
+# file does not lose a few customers, it stops ALL of them registering.
+modparam("auth_db", "db_url", "text:///etc/opensips/dbtext")
+
+# calculate_ha1 = 0: the table stores HA1, not the plaintext password.
+#
+# Setting this to 1 would make OpenSIPS compute HA1 from a plaintext
+# `password` column -- which would mean provisioning shipping every customer's
+# password in clear to the switch. It does not have them to ship: they are
+# generated, shown once, and stored only as SHA-256 plus this HA1.
+modparam("auth_db", "calculate_ha1", 0)
+modparam("auth_db", "password_column", "ha1")
+
+# use_domain = 0: one realm, matched on username alone. The exported table
+# carries a domain column anyway so that turning this on later is a config
+# change rather than a re-render of every credential.
+modparam("auth_db", "use_domain", 0)
+
+# Load NO extra credential columns.
+#
+# auth_db defaults this to "rpid" and then fails the whole lookup with
+# "column <rpid> not found" if the table has not got one -- which surfaces as
+# a 500 on every REGISTER, not as a missing optional field. MEGATRON has no
+# use for Remote-Party-ID: caller ID comes from the customer record, verified,
+# and letting a subscriber row carry its own would be a customer choosing the
+# number their calls present as.
+modparam("auth_db", "load_credentials", "")
+
+# A nonce this switch issued is good for 60 seconds.
+#
+# Shorter than the default, because it bounds how long a captured
+# Authorization header is worth replaying. Not shorter still, because a stale
+# nonce is answered with 403 like any other failed credential -- see
+# route[deny_or_challenge] for why it is not treated as a special case -- and
+# every expiry a real phone hits is therefore a delayed registration. 60s is
+# comfortably longer than any softphone takes to answer a challenge it just
+# received, and short enough that a captured header is stale before it is
+# useful.
+modparam("auth", "nonce_expire", 60)
+
+# ONE NONCE, ONE USE — pinned explicitly, though it is already the default.
+#
+# OpenSIPS 3.6 tracks issued nonces by index (reserve_nonce_index /
+# is_nonce_index_valid in the module) and rejects a reused one unless this is
+# turned OFF. So a captured Authorization header is not replayable, and
+# nonce_expire above bounds a narrower thing than "replay" — it bounds how
+# long an UNUSED challenge stays answerable.
+#
+# It is written down rather than left implicit because the value that matters
+# is 0 and the parameter is named for the dangerous direction: someone
+# debugging a registration problem finds "disable_nonce_check" in the docs and
+# sets it to 1, which makes the symptom go away by removing the protection.
+# The line exists to be argued with before that happens.
+modparam("auth", "disable_nonce_check", 0)
+
+#### Brute force — the attack the enumeration fix does NOT stop
+#
+# Removing the enumeration oracle stops an attacker LEARNING which handles are
+# real. It does nothing about guessing passwords at a handle they already
+# know, and handles are not secret: they are the customer's own SIP username,
+# printed by /newuser and typed into a softphone. Unlimited digest guesses
+# against port 5060 is the actual attack, and the oracle was the cheap half.
+#
+# pike counts requests per source IP and marks the excess. It is deliberately
+# generous — a NAT'd office is many phones behind one address, and a limiter
+# that blocks the operator's own customers is worse than the attack — so this
+# is a ceiling on automation, not a per-user policy.
+loadmodule "pike.so"
+modparam("pike", "sampling_time_unit", 10)
+modparam("pike", "reqs_density_per_unit", 60)
+modparam("pike", "remove_latency", 120)
+
+# THE REALM IS HARDCODED, NOT TAKEN FROM THE REQUEST.
+#
+# An empty realm argument makes OpenSIPS derive it from the To/From domain --
+# which is attacker-controlled input on the authentication path, and worse, it
+# breaks an ordinary customer. HA1 bakes in "@DOMAIN@". Somebody who
+# configures their softphone with the server's IP address instead of the
+# domain -- extremely common -- gets challenged for realm "1.2.3.4", computes
+# a digest that cannot possibly match, and the log says only
+# "AUTH DENIED ... rc=-2", which reads as "wrong password". The support call
+# that follows is unanswerable.
+#
+# This is a single-realm deployment by construction: SqlStore stores one
+# realm's HA1 and refuses lookups for any other. The config now says the same
+# thing out loud.
+
+route {
+    if (!mf_process_maxfwd_header(10)) {
+        send_reply(483, "Too Many Hops");
+        exit;
+    }
+
+    # Before anything expensive, and before anything that touches credentials.
+    # A source flooding this switch gets dropped without a reply: answering a
+    # flood is participating in it, and a 403 is as much traffic as the request
+    # that caused it.
+    if (!pike_check_req()) {
+        xlog("L_ERR", "MEGATRON: PIKE dropping flood from $si\n");
+        drop();
+    }
+
+    if (has_totag()) {
+        # loose_route() FIRST -- it is what matches the dialog, and without a
+        # matched dialog $DLG_lifetime is empty, which bills a real call as
+        # zero seconds.
+        $var(routed) = 0;
+        if (loose_route()) {
+            $var(routed) = 1;
+        }
+
+        if (is_method("BYE")) {
+            # SETTLE ONLY A CALL WE ACTUALLY ROUTED.
+            #
+            # Every call this switch authorizes is record_route()d, so a
+            # genuine BYE for one carries our Route header and loose_route()
+            # matches it. A BYE that does not match belongs to no call of
+            # ours, and settling it posts a CDR for a call that never
+            # happened -- which anyone who can reach port 5060 can do at will,
+            # simply by sending BYEs.
+            #
+            # This is deliberately NOT the same as "no dialog found". A
+            # matched call whose dialog is missing still needs settling, from
+            # the server clock, because that is a real call that would
+            # otherwise go unbilled. The distinction is between "I cannot
+            # measure this call" and "this is not a call".
+            if ($var(routed) == 1) {
+                # Read the media stats BEFORE tearing the session down: after
+                # rtpengine_delete() there is nothing left to ask.
+                $var(stats) = $rtpstat;
+                xlog("L_DBG", "MEGATRON: rtpstat for $ci = [$var(stats)]\n");
+                rtpengine_delete();
+                route(settle);
+            } else {
+                # Loud, because there are only two causes and both matter: a
+                # forged BYE, or record_route() not happening on a path that
+                # should have had it -- and the second one silently unbills
+                # every call that takes it.
+                xlog("L_ERR", "MEGATRON: UNROUTED BYE for $ci from $si -- not settling\n");
+                send_reply(481, "Call/Transaction Does Not Exist");
+                exit;
+            }
+        }
+
+        if ($var(routed) == 1) {
+            t_relay();
+        } else {
+            send_reply(200, "OK");
+        }
+        exit;
+    }
+
+    if (is_method("CANCEL")) {
+        t_relay();
+        exit;
+    }
+
+    if (is_method("REGISTER")) {
+        route(register);
+        exit;
+    }
+
+    if (!is_method("INVITE")) {
+        send_reply(405, "Method Not Allowed");
+        exit;
+    }
+
+    # A CALL FROM A CARRIER IS NOT A CALL FROM A CUSTOMER.
+    #
+    # Tried FIRST, because an inbound INVITE carries no credentials and the
+    # authenticate route would answer it with a 407 the carrier has no way to
+    # satisfy. That is exactly what happened before this existed: an operator
+    # points a provider at this address, the provider sees 407 on every call,
+    # and the switch looks like it is rejecting their traffic on purpose.
+    #
+    # The decision is NOT made here -- route[inbound] asks the same service
+    # that prices calls, because "is this address one of our carriers" and "who
+    # owns the number they dialled" are database questions, and answering them
+    # in config would put the allowlist in two places.
+    #
+    # ONLY WHEN THE REQUEST CARRIES NO CREDENTIALS, which keeps it off the hot
+    # path. A carrier never sends credentials; a customer's INVITE arrives
+    # without them exactly once and then carries them for the retry. So an
+    # authenticated call costs nothing here, and the one message that does pay
+    # for the lookup is the same message that would otherwise be answered with
+    # a 407 -- cheap either way. Doing it unconditionally would put a second
+    # HTTP round trip in front of every call on a 5 ms budget.
+    if ($hdr(Authorization) == NULL && $hdr(Proxy-Authorization) == NULL) {
+        route(inbound);
+    }
+
+    route(authenticate);
+    route(authorize);
+}
+
+# -- calls arriving from a carrier -------------------------------------------
+
+/**
+ * Returns without doing anything unless the source is a known inbound trunk,
+ * so a customer's INVITE falls straight through to the authenticated path.
+ *
+ * NOTHING HERE TRUSTS THE REQUEST. The source address is what the switch saw,
+ * not a header; the account is looked up from the dialled number rather than
+ * taken from From. A carrier can tell us who is calling, and it may well be
+ * false -- that value reaches the CDR and never a decision.
+ */
+route[inbound] {
+    $json(inb) := "{}";
+    $json(inb/source_ip) = $si;
+    $json(inb/did)       = $rU;
+    $json(inb/caller_id) = $fU;
+    $json(inb/call_id)   = $ci;
+
+    if (!rest_post("http://127.0.0.1:8082/v1/authorize-inbound", $json(inb),
+                   "application/json", $var(ibody), $var(ictype), $var(icode))) {
+        # FAILS CLOSED, like the outbound path, and for a plainer reason: with
+        # the service unreachable there is no way to know whose call this is,
+        # and delivering it to a guess is worse than not delivering it.
+        xlog("L_ERR", "MEGATRON: inbound authorizer unreachable for $ci from $si\n");
+        send_reply(503, "Service Unavailable");
+        exit;
+    }
+
+    $json(irsp) := $var(ibody);
+
+    # Not one of our carriers: this is an ordinary customer call. Say nothing
+    # and let route[authenticate] challenge it as usual.
+    if ($json(irsp/reason) == "source_not_a_trunk") {
+        return;
+    }
+
+    if ($json(irsp/decision) != "allow") {
+        $var(isip) = $json(irsp/sip_code);
+        # The REASON is logged and the CODE is sent. Never the detail: "no
+        # customer receives calls on that number" told to a caller lets anyone
+        # dial a range and map which of our DIDs are live.
+        xlog("L_NOTICE", "MEGATRON: inbound refused $fU -> $rU from $si "
+             "($json(irsp/reason)) -> $var(isip)\n");
+        send_reply($var(isip), "Refused");
+        exit;
+    }
+
+    $var(iaccount) = $json(irsp/account);
+    $var(imaxdur)  = $json(irsp/max_seconds);
+
+    # WHERE THE CALL IS DELIVERED IS THE CUSTOMER'S REGISTRATION.
+    #
+    # The request URI is rewritten from the DID to the account, because that is
+    # what the customer's phone registered as -- lookup() searches by the URI's
+    # user part and would find nothing under the dialled number.
+    $rU = $var(iaccount);
+
+    create_dialog();
+    $DLG_timeout = $var(imaxdur);
+
+    if (!rtpengine_offer()) {
+        xlog("L_ERR", "MEGATRON: rtpengine_offer FAILED for inbound $ci\n");
+    }
+
+    record_route();
+    t_on_reply("handle_reply");
+
+    if (!lookup("location")) {
+        # THE CUSTOMER IS NOT REGISTERED. 480, not 404: the number is real and
+        # the account is fine, they simply have no phone online right now, and
+        # a 404 would tell the caller the number does not exist.
+        xlog("L_NOTICE", "MEGATRON: inbound $rU has no registration -- 480\n");
+        send_reply(480, "Temporarily Unavailable");
+        exit;
+    }
+
+    xlog("L_NOTICE", "MEGATRON: inbound $fU -> $var(iaccount) via $si for $var(imaxdur)s\n");
+    t_relay();
+    exit;
+}
+
+# -- who are you? ------------------------------------------------------------
+
+# Shared by REGISTER and INVITE, because the two must answer identically.
+#
+# THE RESPONSE MUST NOT REVEAL WHETHER AN ACCOUNT EXISTS.
+#
+# The obvious implementation refuses a wrong password with 403 and challenges
+# an unknown user again, because auth_db reports them as different failures.
+# That difference is a username enumeration oracle: an attacker sends any
+# password at a guessed handle and reads the reply -- 403 means the account is
+# real, 401 means it is not. It costs one packet per guess, needs no valid
+# credential, and it is exactly what the SIP scanners hitting MagnusBilling
+# installs are looking for. Having enumerated the real handles, brute force
+# has somewhere to point.
+#
+# So the wire answer is decided by ONE question -- did this request carry
+# credentials? -- and never by whether those credentials named a real account.
+#
+#   no credentials supplied   -> 401/407, the normal first half of digest
+#   credentials supplied      -> 403, identical for every cause of failure
+#
+# The operator still needs the distinction, so it goes in the LOG, where an
+# attacker cannot read it. Logged, not sent: that is the whole trick.
+route[deny_or_challenge] {
+    # $au is set only on a successful digest; on failure it is empty, so the
+    # log uses the CLAIMED user from the header. It is untrusted and labelled
+    # as such -- it is a claim, and treating it as an identity here is how
+    # log-based blocking ends up banning whoever an attacker names.
+    # Captured before anything else can clobber it.
+    $var(why) = $rc;
+
+    if ($hdr(Authorization) == NULL && $hdr(Proxy-Authorization) == NULL) {
+        route(challenge);
+        exit;
+    }
+
+    # NO SECOND CHANCE, AND NO BRANCHING ON WHY.
+    #
+    # An earlier version re-challenged a stale nonce so a phone that sat on a
+    # challenge too long was not locked out. That reintroduces the oracle in
+    # the other direction the moment two causes share a return code -- and on
+    # this build they nearly do. Measured on 3.6.7:
+    #
+    #   wrong password    -> -2
+    #   unknown account   -> -1   (which is also the generic error code)
+    #
+    # A stale nonce's code is not distinguishable from those with confidence,
+    # and "the switch answers differently depending on which failure it hit"
+    # is precisely what must not happen. is_nonce_stale() would have settled
+    # it, but it exists only as a C symbol in 3.6 and is not callable from
+    # config -- the symbol table lists more than the config language exposes.
+    #
+    # So every request that carried credentials and did not authenticate gets
+    # the same 403, whatever the cause. A phone whose nonce expired recovers
+    # on its own next registration cycle, from a fresh challenge. The cost is
+    # one delayed registration in a rare case; the alternative is telling an
+    # attacker which handles are real.
+    #
+    # The code is still LOGGED, because the operator needs it and an attacker
+    # cannot read it.
+    xlog("L_ERR", "MEGATRON: AUTH DENIED method=$rm claimed=$fU src=$si:$sp rc=$var(why)\n");
+    send_reply(403, "Forbidden");
+    exit;
+}
+
+# A registrar challenges with 401 and a proxy with 407. Sending the wrong one
+# is not cosmetic: a phone answering a 401 to an INVITE puts its credentials
+# in Authorization rather than Proxy-Authorization, which proxy_authorize()
+# then does not read -- an endless challenge loop with a correct password.
+route[challenge] {
+    if (is_method("REGISTER")) {
+        www_challenge("@DOMAIN@", "auth");
+    } else {
+        proxy_challenge("@DOMAIN@", "auth");
+    }
+}
+
+route[register] {
+    if (!www_authorize("@DOMAIN@", "subscriber")) {
+        route(deny_or_challenge);
+        # route(deny_or_challenge) always exits. Reaching here would mean an
+        # unauthenticated REGISTER continuing into save().
+        exit;
+    }
+
+    # THE HEADER SAYS WHO YOU CLAIM TO BE. $au SAYS WHO YOU PROVED YOU ARE.
+    #
+    # Without this check, a customer with a valid login can register a
+    # binding for somebody else's handle and take their inbound calls. The
+    # digest is valid, so nothing upstream finds it suspicious.
+    #
+    # $tU IS THE ONE THAT MATTERS, AND AN EARLIER VERSION CHECKED ONLY $fU.
+    #
+    # OpenSIPS's registrar takes the address-of-record from the TO header
+    # (RFC 3261 s10.2), not From. Checking From alone let the whole attack
+    # through with a completely valid credential:
+    #
+    #   From: <sip:bigcorp@...>   <- matches $au, passes the check
+    #   To:   <sip:victim@...>    <- this is what save() actually registers
+    #   Contact: <sip:bigcorp@attacker.ip:5060>
+    #
+    # save() then wrote a binding for victim pointing at the attacker, and
+    # every inbound call for victim went to them. The comment above described
+    # this exact attack while the code checked the other header.
+    #
+    # Both are checked now. From is not what registers anything, but a
+    # mismatch there is still a client doing something it has no reason to do.
+    if ($au != $tU) {
+        xlog("L_ERR", "MEGATRON: REGISTER AOR MISMATCH auth=$au to=$tU from=$fU src=$si\n");
+        send_reply(403, "Forbidden");
+        exit;
+    }
+    if ($au != $fU) {
+        xlog("L_ERR", "MEGATRON: REGISTER IDENTITY MISMATCH auth=$au from=$fU src=$si\n");
+        send_reply(403, "Forbidden");
+        exit;
+    }
+
+    if (!save("location")) {
+        xlog("L_ERR", "MEGATRON: save() failed for $au\n");
+        send_reply(500, "Server Error");
+        exit;
+    }
+    xlog("L_NOTICE", "MEGATRON: REGISTERED $au from $si:$sp\n");
+}
+
+route[authenticate] {
+    if (!proxy_authorize("@DOMAIN@", "subscriber")) {
+        route(deny_or_challenge);
+        exit;
+    }
+
+    # THE ANTI-FRAUD CHECK, AND THE REASON THIS FILE EXISTS.
+    #
+    # A caller authenticates as themselves and then puts a different handle in
+    # From, so the bill lands on an account with a balance while the calls are
+    # theirs. Every credential is valid, so nothing about the SIP looks wrong.
+    #
+    # It is caught here rather than in the authorizer because by the time the
+    # HTTP request is built the two identities have already been collapsed
+    # into one field.
+    if ($au != $fU) {
+        xlog("L_ERR", "MEGATRON: FROM SPOOF auth=$au from=$fU to=$rU src=$si\n");
+        send_reply(403, "Forbidden");
+        exit;
+    }
+
+    # Strip the credentials before the INVITE leaves us. Relaying a customer's
+    # Proxy-Authorization upstream hands their digest response to whoever
+    # terminates the call.
+    consume_credentials();
+}
+
+# -- what may you do? --------------------------------------------------------
+
+route[authorize] {
+    $json(req) := "{}";
+    # $au, NOT $fU. The authenticated identity is the one that gets billed;
+    # the header is only a claim. route[authenticate] has already proved they
+    # are the same, and this stays as $au so that a change there cannot
+    # silently turn the bill back into a claim.
+    $json(req/account)     = $au;
+    $json(req/destination) = $rU;
+    $json(req/call_id)     = $ci;
+    $json(req/source_ip)   = $si;
+
+    if (!rest_post("http://127.0.0.1:8082/v1/authorize", $json(req),
+                   "application/json", $var(body), $var(ctype), $var(code))) {
+        # PREPAID FAILS CLOSED. Rejecting loses one call; allowing can lose
+        # unbounded money to a fraudster.
+        xlog("L_ERR", "MEGATRON: authorizer unreachable, failing closed\n");
+        send_reply(503, "Service Unavailable");
+        exit;
+    }
+
+    $json(rsp) := $var(body);
+
+    if ($json(rsp/decision) != "allow") {
+        $var(sip) = $json(rsp/sip_code);
+        # The DETAIL is logged, never sent. Two refusals can share a reason and
+        # a code -- "this plan has no rates" and "no carrier is configured" both
+        # come back as no_rate_for_destination/503 -- and they are fixed in
+        # completely different places.
+        xlog("L_INFO", "MEGATRON: reject $au -> $rU  $json(rsp/reason) -> $var(sip)"
+             "  [$json(rsp/detail)]\n");
+        send_reply($var(sip), "Refused");
+        exit;
+    }
+
+    $var(maxdur) = $json(rsp/max_seconds);
+    xlog("L_NOTICE", "MEGATRON: allow $au -> $rU for $var(maxdur)s\n");
+
+    create_dialog();
+    $DLG_timeout = $var(maxdur);
+
+    if (!rtpengine_offer()) {
+        xlog("L_ERR", "MEGATRON: rtpengine_offer FAILED for $ci\n");
+    } else {
+        xlog("L_DBG", "MEGATRON: rtpengine anchored $ci\n");
+    }
+
+    record_route();
+
+    # ARM THE REPLY ROUTE. Declaring onreply_route does NOT run it.
+    t_on_reply("handle_reply");
+
+    # WHERE THE CALL GOES COMES FROM THE AUTHORIZER, NOT FROM THIS FILE.
+    #
+    # The lab hardcoded a SIPp listener here. A real switch has carriers, and
+    # which carrier to use is the same decision as what to charge -- they come
+    # from one table, so they are answered in one place. It is also what keeps
+    # our routing logic on the far side of a network boundary from GPL code.
+    #
+    # A missing route is fatal, not a fallback. The authorizer only omits it
+    # when there is no enabled outbound trunk, and relaying such a call to
+    # whatever the request URI happens to name would send a customer's traffic
+    # to an address chosen by the caller -- an open relay, reachable by anyone
+    # who can dial us.
+    $var(route) = $json(rsp/route);
+    if ($var(route) == NULL || $var(route) == "") {
+        xlog("L_ERR", "MEGATRON: allowed $au -> $rU with NO ROUTE -- refusing\n");
+        send_reply(503, "No Route");
+        exit;
+    }
+    $du = $var(route);
+    xlog("L_INFO", "MEGATRON: routing $ci to $var(route)\n");
+
+    # CARRIER CREDENTIALS, KEPT FOR THE 407 THAT MAY FOLLOW.
+    #
+    # Stashed in AVPs rather than acted on now: we do not know yet whether this
+    # carrier will challenge. Sending credentials unprompted tells anyone who
+    # can see the INVITE that we have them, and answering a challenge we were
+    # not given is impossible anyway — the nonce is theirs.
+    #
+    # Deliberately NOT logged. The route and the account are; this is not.
+    $avp(auth_user)  = $json(rsp/route_auth/username);
+    $avp(auth_pass)  = $json(rsp/route_auth/password);
+    $avp(auth_realm) = $json(rsp/route_auth/realm);
+
+    # WHO WE ARE TO THE CARRIER, WHICH IS NOT WHO THE CALLER IS TO US.
+    #
+    # Until here From carries the customer's handle — that is who authenticated
+    # and who gets billed, and the spoof check above has already confirmed it.
+    # The carrier has never heard of that handle. An Asterisk-based provider
+    # looks up the peer by From user, finds nothing, and answers 403 Forbidden
+    # with our digest perfectly correct. This switch collected two of those
+    # before the cause was on the wire rather than in a guess.
+    #
+    # Safe to do here and not earlier: billing reads $au, the authenticated
+    # identity, and the anti-spoof check ran before this line. Rewriting From
+    # after both means the carrier sees an account it recognises while the bill
+    # still lands on the customer who placed the call.
+    #
+    # Null for IP-authenticated carriers, who want the caller's own number.
+    $var(from_user) = $json(rsp/route_from_user);
+    if ($var(from_user) != NULL && $var(from_user) != "") {
+        # Second argument only: the display name is left alone. uac_replace_from
+        # restores the original on the way back, so the customer's softphone
+        # still sees its own call.
+        # The DOMAIN stays ours ($fd). Only the user part is in question: an
+        # account-matching carrier looks up the peer by user and ignores the
+        # domain, while our own realm is a name we actually control and can be
+        # reached back at. Substituting the carrier's domain would mean claiming
+        # to be inside their system, which is both untrue and unnecessary.
+        uac_replace_from("", "sip:$var(from_user)@$fd");
+        xlog("L_INFO", "MEGATRON: presenting $var(from_user) to the carrier for $ci\n");
+    }
+
+    if ($avp(auth_user) != NULL) {
+        # Arm the failure route only when there is something to answer with.
+        # Without credentials a 407 is final and the customer should see it,
+        # rather than the switch silently retrying a challenge it cannot meet.
+        t_on_failure("carrier_auth");
+    }
+
+    t_relay();
+}
+
+/**
+ * The carrier challenged us. Answer it once.
+ *
+ * ONCE, and the counter is what makes that true. A carrier that keeps
+ * challenging — because the password is wrong, or the realm is — would
+ * otherwise produce an endless INVITE/407 loop between two machines that both
+ * think they are being helpful. That is a self-inflicted flood, on a trunk,
+ * billed by whoever is upstream.
+ *
+ * A second challenge means the credentials are wrong. Letting it through is
+ * the honest outcome: the customer gets the carrier's own refusal, and the
+ * operator gets a log line naming the trunk rather than a mystery.
+ */
+failure_route[carrier_auth] {
+    if (!t_check_status("40[17]")) exit;
+
+    if ($avp(auth_attempted) != NULL) {
+        xlog("L_ERR", "MEGATRON: carrier rejected our credentials for $ci "
+             "(realm $avp(auth_realm), user $avp(auth_user)) -- check the trunk\n");
+        exit;
+    }
+    $avp(auth_attempted) = 1;
+
+    if (uac_auth()) {
+        xlog("L_INFO", "MEGATRON: answered carrier challenge for $ci\n");
+        # The same failure route stays armed, so the guard above is what stops
+        # a loop rather than the absence of a retry.
+        t_on_failure("carrier_auth");
+        t_relay();
+    } else {
+        xlog("L_ERR", "MEGATRON: could not build a digest for $ci -- no usable "
+             "credentials for realm $avp(auth_realm)\n");
+    }
+}
+
+onreply_route[handle_reply] {
+    if ($rs =~ "^(18[0-9]|2[0-9][0-9])$") {
+        rtpengine_answer();
+    }
+}
+
+route[settle] {
+    $json(end) := "{}";
+    $json(end/call_id)      = $ci;
+    $json(end/hangup_cause) = "NORMAL_CLEARING";
+
+    $var(dur) = $DLG_lifetime;
+    if ($var(dur) == NULL) {
+        xlog("L_ERR", "MEGATRON: no dialog for $ci at BYE -- settling at 0s\n");
+        $var(dur) = 0;
+    }
+    $json(end/duration_seconds) = $var(dur);
+
+    if ($var(stats) != NULL) {
+        $json(end/media_stats) = $var(stats);
+    }
+
+    if (!rest_post("http://127.0.0.1:8082/v1/session/end", $json(end),
+                   "application/json", $var(body), $var(ctype), $var(code))) {
+        xlog("L_ERR", "MEGATRON: SETTLEMENT FAILED for $ci\n");
+    } else {
+        xlog("L_NOTICE", "MEGATRON: settled $ci -> $var(body)\n");
+    }
+}

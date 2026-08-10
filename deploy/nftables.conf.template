@@ -1,0 +1,91 @@
+#!/usr/sbin/nft -f
+#
+# MEGATRON — single-box firewall. Rendered by deploy/install.sh.
+#
+# The shape of this file IS the security argument: SIP and RTP are reachable
+# from the internet because they have to be, and NOTHING ELSE IS. The services
+# that issue credentials and move money bind loopback and are not represented
+# here at all, because there is no rule to write — there is no path.
+#
+# This is the volumetric floor, not the whole answer. A flood large enough to
+# fill the pipe is a problem for the provider's scrubbing, not for this box;
+# what these rules and OpenSIPS's own pike between them stop is the
+# application-layer flood that kills a MagnusBilling install on the same
+# hardware.
+
+flush ruleset
+
+table inet megatron {
+
+    # Sources that have already proved hostile. OpenSIPS's pike marks them at
+    # the application layer; this set is where an operator or a future agent
+    # puts an address to stop it reaching userspace at all. Timed out rather
+    # than permanent: a NAT'd office that misbehaved once is a customer, and a
+    # permanent block is a support call nobody connects to a firewall rule.
+    set blocked {
+        type ipv4_addr
+        flags timeout
+        timeout 1h
+    }
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        # Established first, and cheaply: it is the overwhelming majority of
+        # packets, and evaluating anything else before it wastes the flood's
+        # own budget on our behalf.
+        ct state established,related accept
+        ct state invalid drop
+
+        iif lo accept
+
+        ip saddr @blocked drop
+
+        # SSH. Rate-limited rather than open: this box holds the credentials
+        # for every customer's calls.
+        tcp dport 22 ct state new limit rate 10/minute accept
+
+        # SIP. The one genuinely public service.
+        #
+        # The rate limit is per source and deliberately generous — an office
+        # behind one NAT is many phones — so it is a ceiling on automation,
+        # not a policy about people. OpenSIPS's pike makes the finer judgment,
+        # because it can see that a source is sending REGISTERs for handles
+        # that do not exist, which a packet filter cannot.
+        udp dport 5060 ct state new limit rate 100/second burst 200 packets accept
+        udp dport 5060 accept
+
+        # TCP too. A customer configured for TCP against a firewall that only
+        # opens UDP gets no error at all — the connection just never
+        # establishes, which reads as "your server is down". Rate-limited on
+        # NEW connections only, so an established call's signalling is never
+        # throttled mid-conversation.
+        tcp dport 5060 ct state new limit rate 50/second burst 100 packets accept
+        tcp dport 5060 accept
+
+        # RTP. rtpengine allocates inside this range and nothing else lives
+        # here, so it is opened wholesale rather than tracked — conntrack
+        # entries for media streams are pure overhead on a switch.
+        udp dport 30000-31000 accept
+
+        # ICMP, because breaking path MTU discovery breaks calls in ways that
+        # look like a codec problem and get diagnosed for days.
+        ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded } accept
+        ip6 nexthdr icmpv6 accept
+
+        # Everything else is dropped, not rejected. A reject is a reply, and
+        # replying to a scan is answering it — MagnusBilling's instinct is to
+        # politely 403 everything, which confirms to a scanner that something
+        # is there and costs us a packet per probe.
+    }
+
+    # This box routes nothing. Media is relayed by rtpengine in userspace, so
+    # it arrives at input and leaves from output — never through forward.
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}

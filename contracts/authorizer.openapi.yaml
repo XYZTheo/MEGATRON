@@ -1,0 +1,577 @@
+openapi: 3.1.0
+
+# =============================================================================
+# MEGATRON — AUTHORIZER CONTRACT
+# =============================================================================
+#
+# This is the boundary between the SIP plane and the money plane, and it is the
+# most important interface in the system. Everything on the call path either
+# calls this or is called by it.
+#
+# -----------------------------------------------------------------------------
+# WHY HTTP/JSON AND NOT gRPC
+# -----------------------------------------------------------------------------
+# OpenSIPS has no gRPC client. The SIP core calls this service using the
+# `rest_client` module, which speaks HTTP and does so asynchronously — it
+# suspends the SIP transaction rather than blocking a worker, then resumes it
+# in a named route when the response arrives.
+#
+# That async property is not optional. A SIP worker blocked on a synchronous
+# call is a worker that cannot serve anyone: at 5,000 CPS with 64 workers, a
+# 20 ms blocking lookup caps the node at 3,200 CPS and one slow response stalls
+# everything.
+#
+# Internal service-to-service calls elsewhere in MEGATRON may use gRPC. This
+# particular boundary is HTTP because the client is OpenSIPS.
+#
+# -----------------------------------------------------------------------------
+# THE LATENCY BUDGET IS PART OF THE CONTRACT
+# -----------------------------------------------------------------------------
+# SIP Timer T1 is 500 ms — a caller that gets no response retransmits the
+# INVITE. `100 Trying` is sent by the core immediately, before calling us, to
+# stop retransmission pressure. That buys time, it does not buy unlimited time.
+#
+#   /authorize        p99 < 5 ms, hard ceiling 50 ms
+#   /session/update   p99 < 10 ms   (off the call-setup path)
+#   /session/end      p99 < 20 ms   (call already torn down)
+#
+# To hold 5 ms, /authorize MUST NOT query PostgreSQL. Tariff, routing and LCR
+# data are resident in the authorizer's process, rebuilt from a change stream.
+# The only external call permitted on this path is a single Redis Lua script
+# for balance reservation.
+#
+# -----------------------------------------------------------------------------
+# FAIL DIRECTION — A BUSINESS DECISION, NOT A DEFAULT
+# -----------------------------------------------------------------------------
+# When this service is unreachable or times out, the core applies a configured
+# policy. It is deliberately NOT uniform:
+#
+#   prepaid          -> FAIL CLOSED. Rejecting a call loses one call.
+#                       Allowing it can lose unbounded money to a fraudster.
+#   trusted postpaid -> FAIL OPEN. These customers are credit-checked and
+#                       contractually liable; refusing their traffic during our
+#                       outage is worse than billing them slightly late.
+#
+# This must be explicit in configuration. It must never happen by accident.
+#
+# -----------------------------------------------------------------------------
+# STATUS: contract design. No implementation exists yet.
+# =============================================================================
+
+info:
+  title: MEGATRON Authorizer API
+  version: 0.1.0
+  summary: Realtime call authorization, rating, and session lifecycle.
+  description: |
+    Called by the MEGATRON SIP core to decide whether a call may proceed, at
+    what rate, and for how long.
+
+    **Reachability:** this service binds to the private core network only. It is
+    never exposed to the internet, and the edge/shield tier cannot reach it —
+    the edge holds no credentials and asks the core, not the authorizer.
+
+    **Session lifecycle:**
+
+    ```
+    INVITE  ──▶ POST /v1/authorize      decision + rate + max duration
+    200 OK  ──▶ POST /v1/session/start  reservation becomes active
+      ...   ──▶ POST /v1/session/update periodic incremental debit
+    BYE     ──▶ POST /v1/session/end    final charge + CDR
+    ```
+
+    Modelled on the session lifecycle established by CGRateS
+    (Authorize → Initiate → Update → Terminate → ProcessCDR). The *model* is
+    taken from its public documentation; no CGRateS code is used — it is AGPLv3
+    and MEGATRON is proprietary.
+  license:
+    name: Proprietary
+    identifier: LicenseRef-MEGATRON-Proprietary
+
+servers:
+  - url: http://authorizer.megatron.internal:8080
+    description: Private core network only. Never internet-reachable.
+
+tags:
+  - name: session
+    description: Call authorization and session lifecycle.
+  - name: operations
+    description: Health and readiness.
+
+paths:
+
+  /v1/authorize:
+    post:
+      tags: [session]
+      operationId: authorizeCall
+      summary: May this call proceed, at what rate, and for how long?
+      description: |
+        Called on INVITE, after the core has authenticated the caller and
+        *before* it routes the call.
+
+        **This endpoint must not block on I/O beyond one Redis round trip.**
+
+        A successful `ALLOW` places a **credit reservation**, not a debit. The
+        reservation carries a TTL so that a crashed call, a dead core node, or a
+        lost BYE releases the customer's credit automatically instead of
+        stranding it. PostgreSQL remains the ledger of record; Redis holds only
+        working state.
+
+        The returned `maxDurationSeconds` is applied by the core via
+        `dlg_set_timeout()`. That gives a hard billable upper bound enforced by
+        the proxy at **zero ongoing cost** — no polling, no timers of ours.
+        Mid-call teardown is reserved for what genuinely cannot be predicted at
+        setup (a mid-call top-up, a tariff change, a fraud kill).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AuthorizeRequest' }
+      responses:
+        '200':
+          description: A decision was reached. Check `decision` — this is 200 for both ALLOW and DENY.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthorizeResponse' }
+        '400':
+          description: Malformed request. Indicates a bug in the core's config, not a call problem.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            Authorizer degraded — e.g. tariff data not yet loaded after restart.
+            The core applies its configured fail direction. Never guess here.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/session/start:
+    post:
+      tags: [session]
+      operationId: startSession
+      summary: The call was answered; convert the reservation to an active session.
+      description: |
+        Called on 200 OK. Billing starts here — **answer time, not invite time**.
+
+        If this never arrives (the call failed, or rang out), the reservation
+        expires on its TTL and the credit returns by itself. That self-healing
+        property is deliberate: it means no cleanup job is load-bearing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SessionStartRequest' }
+      responses:
+        '200':
+          description: Session active.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionStartResponse' }
+        '404':
+          description: Unknown session — reservation already expired or never existed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/session/update:
+    post:
+      tags: [session]
+      operationId: updateSession
+      summary: Incremental debit for a call in progress.
+      description: |
+        Called periodically for long calls to debit consumed time and extend the
+        reservation.
+
+        **This is the defence against the billing race that Magnus loses.**
+        Magnus computes the charge at hangup while checking limits at setup — so
+        an attacker firing many simultaneous long calls to a premium destination
+        runs a balance far past its credit limit before any single call ends and
+        debits. Incremental debit closes that window: exposure is bounded by the
+        update interval, not by call duration.
+
+        Returns `continue: false` when credit is exhausted, at which point the
+        core tears the call down with `dlg_bye()`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SessionUpdateRequest' }
+      responses:
+        '200':
+          description: Debit applied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionUpdateResponse' }
+        '404':
+          description: Unknown session.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/session/end:
+    post:
+      tags: [session]
+      operationId: endSession
+      summary: Final charge and CDR emission.
+      description: |
+        Called on BYE, CANCEL, or dialog timeout.
+
+        **`mediaStats` is required and load-bearing, not telemetry.** Signalling
+        alone will happily report a perfectly successful hour-long call that
+        carried no audio whatsoever. CDR truth is signalling *reconciled against*
+        rtpengine media statistics. A call with zero received packets is a
+        billing dispute, a broken route, or fraud — and must be flagged rather
+        than invoiced.
+
+        **This endpoint must never silently fail.** If the CDR cannot be
+        persisted, the call must be recorded as unbillable and alarmed. Silent
+        CDR loss ("call completed, no CDR") is one of Magnus's characteristic
+        revenue leaks and is explicitly designed against here.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SessionEndRequest' }
+      responses:
+        '200':
+          description: Final charge applied, CDR accepted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionEndResponse' }
+        '404':
+          description: |
+            Unknown session. Still emits an orphan CDR for reconciliation —
+            an unbillable call must be visible, never dropped.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /health/live:
+    get:
+      tags: [operations]
+      operationId: healthLive
+      summary: Process is up.
+      responses:
+        '200': { description: Alive. }
+
+  /health/ready:
+    get:
+      tags: [operations]
+      operationId: healthReady
+      summary: Ready to authorize calls.
+      description: |
+        Returns 503 until tariff and routing data are fully resident in memory
+        **and** JIT warmup has completed.
+
+        Warmup is part of readiness on purpose. A cold JVM instance visibly
+        misses its latency SLA for roughly its first minute while the JIT is
+        still compiling. An instance that joins the dispatcher pool before
+        warming up will time out real calls. Synthetic warmup traffic runs
+        before this endpoint reports ready.
+      responses:
+        '200': { description: Ready. }
+        '503': { description: Not ready — do not route calls here. }
+
+components:
+
+  schemas:
+
+    AuthorizeRequest:
+      type: object
+      required: [callId, tenantId, direction, source, calledNumber, edgeNode]
+      properties:
+        callId:
+          type: string
+          description: SIP Call-ID. **The correlation key across the entire platform** — edge, core, authorizer, CDR, invoice line. Being able to answer "why was this call billed this way" from one identifier is a deliberate differentiator.
+          examples: ['a84b4c76e66710@pc33.example.com']
+        tenantId:
+          type: string
+          format: uuid
+          description: Owning tenant. Never inferred, never optional — tenancy is explicit at every layer.
+        direction:
+          $ref: '#/components/schemas/Direction'
+        source:
+          $ref: '#/components/schemas/CallSource'
+        callingNumber:
+          type: string
+          description: E.164 where available. Presentation-restricted calls may omit it.
+          examples: ['+14155550101']
+        calledNumber:
+          type: string
+          description: E.164 destination, already normalised by the core.
+          examples: ['+442071838750']
+        edgeNode:
+          type: string
+          description: Which edge node relayed this. Used for fraud correlation and capacity attribution.
+        transport:
+          type: string
+          enum: [UDP, TCP, TLS, WSS]
+          description: TLS/TCP arrivals are inherently more trustworthy — a spoofed source cannot complete a handshake.
+        receivedAt:
+          type: string
+          format: date-time
+
+    CallSource:
+      type: object
+      description: How the caller was authenticated. The two modes are genuinely different trust models, which is why this is a discriminated union rather than a nullable field.
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [REGISTERED_SUBSCRIBER, IP_TRUNK]
+      oneOf:
+        - $ref: '#/components/schemas/RegisteredSubscriberSource'
+        - $ref: '#/components/schemas/IpTrunkSource'
+      discriminator:
+        propertyName: type
+        mapping:
+          REGISTERED_SUBSCRIBER: '#/components/schemas/RegisteredSubscriberSource'
+          IP_TRUNK: '#/components/schemas/IpTrunkSource'
+
+    RegisteredSubscriberSource:
+      type: object
+      description: Class-5 retail. Digest-authenticated. Higher fraud risk — credentials can be cracked or phished.
+      required: [type, accountId, contactIp]
+      properties:
+        type: { type: string, const: REGISTERED_SUBSCRIBER }
+        accountId: { type: string, format: uuid }
+        authUsername: { type: string }
+        contactIp: { type: string }
+
+    IpTrunkSource:
+      type: object
+      description: |
+        Class-4 wholesale. IP-authenticated peer.
+
+        Note the known limitation: IP authentication does not protect against a
+        multi-tenant third-party platform, since any user of that platform sends
+        from the same allowed address. Trunks therefore still get velocity and
+        destination controls — being a trunk is not a licence to dial anything.
+      required: [type, trunkId, sourceIp]
+      properties:
+        type: { type: string, const: IP_TRUNK }
+        trunkId: { type: string, format: uuid }
+        sourceIp: { type: string }
+        techPrefix: { type: string }
+
+    Direction:
+      type: string
+      enum: [OUTBOUND, INBOUND, TRANSIT]
+
+    AuthorizeResponse:
+      type: object
+      required: [decision, callId]
+      properties:
+        callId: { type: string }
+        decision:
+          type: string
+          enum: [ALLOW, DENY]
+        sessionId:
+          type: string
+          format: uuid
+          description: Present only when ALLOW. Required by all later lifecycle calls.
+        denyReason:
+          $ref: '#/components/schemas/DenyReason'
+        maxDurationSeconds:
+          type: integer
+          format: int32
+          minimum: 1
+          description: |
+            Hard billable upper bound, applied by the core via `dlg_set_timeout()`.
+            Derived from available credit at the quoted rate. Enforced by the proxy
+            at zero ongoing cost.
+          examples: [3600]
+        rating:
+          $ref: '#/components/schemas/RatingDecision'
+        routes:
+          type: array
+          description: LCR result, in preference order. The core tries them in sequence.
+          items: { $ref: '#/components/schemas/Route' }
+        reservationId:
+          type: string
+          description: Redis reservation handle. TTL-bounded, so stranded credit self-releases.
+        warnings:
+          type: array
+          description: Non-blocking risk signals (unusual destination, elevated velocity). Surfaced to fraud monitoring without refusing the call.
+          items: { type: string }
+
+    DenyReason:
+      type: string
+      description: |
+        Why the call was refused. Deliberately specific — an operator debugging a
+        customer complaint at 2am should not have to guess, and "call failed" is
+        the single most common support burden in this industry.
+      enum:
+        - INSUFFICIENT_BALANCE
+        - CREDIT_LIMIT_EXCEEDED
+        - CONCURRENCY_LIMIT_EXCEEDED
+        - VELOCITY_LIMIT_EXCEEDED
+        - DESTINATION_NOT_ALLOWED
+        - DESTINATION_BLOCKED_HIGH_RISK
+        - NO_ROUTE_AVAILABLE
+        - NO_RATE_FOR_DESTINATION
+        - ACCOUNT_SUSPENDED
+        - ACCOUNT_NOT_FOUND
+        - FRAUD_HOLD
+        - TENANT_SUSPENDED
+
+    RatingDecision:
+      type: object
+      description: |
+        All monetary values are **integer micro-units** (millionths of the
+        tenant's currency). Never floating point — a detekt rule bans `Double`
+        and `Float` in billing packages entirely.
+      required: [currency, ratePerMinuteMicros, billingIncrementSeconds]
+      properties:
+        currency: { type: string, examples: ['USD'] }
+        ratePerMinuteMicros:
+          type: integer
+          format: int64
+          description: 1_500_000 = 1.50 per minute.
+          examples: [1500000]
+        connectionFeeMicros: { type: integer, format: int64, default: 0 }
+        billingIncrementSeconds:
+          type: integer
+          description: Rounding increment after the first period (e.g. 1 for per-second, 60 for per-minute).
+          examples: [1]
+        firstPeriodSeconds:
+          type: integer
+          description: Minimum first billing period, often longer than the increment (e.g. 60/1 billing).
+          examples: [60]
+        tariffId: { type: string, format: uuid }
+        destinationPrefix:
+          type: string
+          description: The longest-prefix match that produced this rate. Included so a disputed charge is explainable without re-running the rating engine.
+          examples: ['4420']
+        destinationName: { type: string, examples: ['United Kingdom - London'] }
+
+    Route:
+      type: object
+      required: [gatewayId, priority]
+      properties:
+        gatewayId: { type: string, format: uuid }
+        gatewayUri: { type: string, examples: ['sip:1.2.3.4:5060'] }
+        priority: { type: integer }
+        techPrefix: { type: string }
+        costPerMinuteMicros:
+          type: integer
+          format: int64
+          description: Our cost, not the customer's rate. Used for margin enforcement.
+        anchorMedia:
+          type: boolean
+          default: true
+          description: |
+            Media anchoring is the default. Direct RTP is a per-route opt-in for
+            trusted public carrier transit only — skipping the anchor costs NAT
+            traversal, recording, SRTP bridging, transcoding, and any knowledge
+            of whether audio actually flowed.
+
+    SessionStartRequest:
+      type: object
+      required: [sessionId, callId, answeredAt]
+      properties:
+        sessionId: { type: string, format: uuid }
+        callId: { type: string }
+        answeredAt:
+          type: string
+          format: date-time
+          description: Billing starts here — answer time, never invite time.
+        selectedGatewayId: { type: string, format: uuid }
+
+    SessionStartResponse:
+      type: object
+      properties:
+        sessionId: { type: string, format: uuid }
+        nextUpdateInSeconds:
+          type: integer
+          description: When the core should next call /session/update. Shorter for higher-risk sessions — this is the knob that bounds fraud exposure on a single call.
+          examples: [60]
+
+    SessionUpdateRequest:
+      type: object
+      required: [sessionId, consumedSeconds]
+      properties:
+        sessionId: { type: string, format: uuid }
+        consumedSeconds: { type: integer, format: int64 }
+        mediaStats: { $ref: '#/components/schemas/MediaStats' }
+
+    SessionUpdateResponse:
+      type: object
+      required: [continue]
+      properties:
+        continue:
+          type: boolean
+          description: False means credit is exhausted; the core tears down with `dlg_bye()`.
+        remainingSeconds: { type: integer, format: int32 }
+        nextUpdateInSeconds: { type: integer }
+        terminationReason: { $ref: '#/components/schemas/DenyReason' }
+
+    SessionEndRequest:
+      type: object
+      required: [sessionId, callId, endedAt, durationSeconds, sipCause]
+      properties:
+        sessionId: { type: string, format: uuid }
+        callId: { type: string }
+        endedAt: { type: string, format: date-time }
+        durationSeconds:
+          type: integer
+          format: int64
+          description: Billable duration from answer. Zero for unanswered calls.
+        sipCause:
+          type: integer
+          description: Final SIP response code (200, 486, 480, 404…).
+        hangupParty:
+          type: string
+          enum: [CALLER, CALLEE, SYSTEM, TIMEOUT, MEDIA_TIMEOUT]
+          description: |
+            `TIMEOUT` and `MEDIA_TIMEOUT` mean no BYE was received and the call
+            was reaped by session timers or rtpengine media timeout. Those
+            calls need scrutiny — a lost BYE is the classic route to an
+            infinitely-billed call.
+        mediaStats:
+          $ref: '#/components/schemas/MediaStats'
+
+    SessionEndResponse:
+      type: object
+      properties:
+        sessionId: { type: string, format: uuid }
+        finalChargeMicros: { type: integer, format: int64 }
+        billedDurationSeconds: { type: integer, format: int64 }
+        cdrId: { type: string, format: uuid }
+        flagged:
+          type: boolean
+          description: True when the call needs human or automated review (media/signalling mismatch, suspicious destination, unusual duration).
+        flagReason: { type: string }
+
+    MediaStats:
+      type: object
+      description: |
+        From rtpengine. **Load-bearing for billing correctness, not telemetry.**
+
+        Signalling alone will report a flawless hour-long call that carried no
+        audio at all. Reconciling against these counters is what stops us
+        invoicing dead air — a failure mode Magnus has no defence against
+        because its CDRs never see the media plane.
+      properties:
+        packetsSent: { type: integer, format: int64 }
+        packetsReceived: { type: integer, format: int64 }
+        packetsLost: { type: integer, format: int64 }
+        jitterMs: { type: number }
+        mos:
+          type: number
+          description: Estimated Mean Opinion Score, where available.
+        oneWayAudio:
+          type: boolean
+          description: True when packets flowed in only one direction — a strong signal of a broken route.
+        silentCall:
+          type: boolean
+          description: True when essentially no RTP was exchanged despite a 200 OK. **Must be flagged rather than billed.**
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string, examples: ['TARIFF_NOT_LOADED'] }
+        message: { type: string }
+        callId: { type: string }
+        retryable: { type: boolean }
