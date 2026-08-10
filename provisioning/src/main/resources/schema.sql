@@ -192,7 +192,44 @@ CREATE TABLE IF NOT EXISTS trunks (
     remote_ips            TEXT NOT NULL,
     transport             TEXT NOT NULL,
     enabled               INTEGER NOT NULL DEFAULT 1,
-    max_concurrent_calls  INTEGER
+    max_concurrent_calls  INTEGER,
+
+    -- CREDENTIALS FOR TRUNKS THAT CHALLENGE US.
+    --
+    -- Plenty of carriers do not authenticate by IP: they hand you a username
+    -- and password and challenge every INVITE with a 407. A switch that can
+    -- only do IP-authenticated trunks cannot connect to them at all, which
+    -- rules out most of the small and mid-size providers an operator actually
+    -- buys from.
+    --
+    -- THIS PASSWORD IS STORED RECOVERABLE, AND HAS TO BE. Digest requires
+    -- either the plaintext or HA1, and unlike a customer credential we are the
+    -- CLIENT here — we must be able to answer a challenge whose nonce and
+    -- realm we do not choose. It is an operator secret, not a customer's: it
+    -- buys calls at the operator's own expense on a carrier they contracted
+    -- with.
+    --
+    -- It is therefore never returned by the API. See Trunk.authPassword.
+    auth_username         TEXT,
+    auth_password         TEXT,
+    -- The realm the carrier challenges with. Usually their SIP domain, and
+    -- NOT always the same as `host` — which is why it is stored rather than
+    -- derived.
+    auth_realm            TEXT,
+    -- Whether to REGISTER to them. Some carriers route inbound to wherever
+    -- you last registered from; others expect a static IP and never want a
+    -- REGISTER at all.
+    register              INTEGER NOT NULL DEFAULT 0,
+    -- Lower wins. Selection was "the lowest trunk id", which means the FIRST
+    -- trunk ever created wins forever -- so adding a carrier changed nothing
+    -- and the operator's calls kept going to whatever they set up first,
+    -- which is indistinguishable from the new trunk being broken.
+    priority              INTEGER NOT NULL DEFAULT 100,
+    -- The user part we put in From on calls to this carrier. NULL means pass
+    -- the customer's own through. Carriers that authenticate by account match
+    -- the peer on this and answer 403 when it names somebody they have never
+    -- heard of -- a correct password does not save you.
+    from_user             TEXT
 );
 
 -- Replay protection for mutating API calls.

@@ -762,6 +762,70 @@ abstract class StoreContractTest {
     }
 
     @Test
+    fun `a credentialed trunk presents its account name unless told otherwise`() {
+        val store = store()
+        // A carrier that issues a username matches the call by From user. If we
+        // send the customer's handle they answer 403 with the password right,
+        // so the account name is the default rather than something to remember.
+        val withAuth = store.createTrunk(
+            CreateTrunk(
+                name = "credentialed", direction = TrunkDirection.OUTBOUND,
+                host = "sip.carrier.example", remoteIps = listOf("198.51.100.7"),
+                authUsername = "acct7", authPassword = "carrier-password-here",
+            )
+        )
+        assertEquals("acct7", store.listTrunks().single { it.id == withAuth.id }.fromUser)
+
+        // An IP-authenticated carrier wants the originating number, not us.
+        val ipAuth = store.createTrunk(
+            CreateTrunk(
+                name = "ip-authed", direction = TrunkDirection.OUTBOUND,
+                host = "sip2.carrier.example", remoteIps = listOf("198.51.100.8"),
+            )
+        )
+        assertNull(store.listTrunks().single { it.id == ipAuth.id }.fromUser)
+
+        // And an explicit value beats both.
+        val explicit = store.createTrunk(
+            CreateTrunk(
+                name = "explicit", direction = TrunkDirection.OUTBOUND,
+                host = "sip3.carrier.example", remoteIps = listOf("198.51.100.9"),
+                authUsername = "acct9", authPassword = "another-carrier-password",
+                fromUser = "441632960999",
+            )
+        )
+        assertEquals("441632960999", store.listTrunks().single { it.id == explicit.id }.fromUser)
+    }
+
+    @Test
+    fun `a retired carrier is gone, and takes its password with it`() {
+        val store = store()
+        val trunk = store.createTrunk(
+            CreateTrunk(
+                name = "old-carrier",
+                direction = TrunkDirection.OUTBOUND,
+                host = "sip.carrier.example",
+                remoteIps = listOf("198.51.100.7"),
+                authUsername = "acct",
+                authPassword = "s3cret-carrier-pw",
+            )
+        )
+        assertEquals("acct", store.trunkCredentials(trunk.id)?.username)
+
+        store.deleteTrunk(trunk.id)
+
+        assertEquals(emptyList(), store.listTrunks())
+        // The point of deleting rather than disabling: the carrier's password
+        // is no longer on the box.
+        assertNull(store.trunkCredentials(trunk.id))
+    }
+
+    @Test
+    fun `retiring a carrier that was never there is a NotFound`() {
+        assertFailsWith<NotFound> { store().deleteTrunk("trunk-nope") }
+    }
+
+    @Test
     fun `a trunk with a bogus remote ip is refused`() {
         assertFailsWith<Invalid> {
             store().createTrunk(

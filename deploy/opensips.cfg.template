@@ -31,8 +31,23 @@ syslog_enabled=yes
 syslog_facility=LOG_LOCAL0
 
 udp_workers=2
+tcp_workers=2
 
 socket=udp:0.0.0.0:5060
+
+# TCP AS WELL AS UDP, ON THE SAME PORT.
+#
+# Not optional for a switch meant to replace an existing one. Plenty of
+# deployments hand their customers TCP — it is the default in several
+# softphones, and it is what survives a SIP message larger than a UDP
+# datagram, which REGISTERs with long Contact headers and INVITEs with fat SDP
+# both manage.
+#
+# A customer configured for TCP against a UDP-only switch does not get a
+# useful error. The softphone simply never connects, which reads as "your
+# server is down" rather than "your server does not speak the transport I was
+# told to use".
+socket=tcp:0.0.0.0:5060
 
 # WHAT THIS SWITCH TELLS THE WORLD ITS ADDRESS IS.
 #
@@ -51,6 +66,13 @@ advertised_address="@PUBLIC_IP@"
 mpath="/usr/lib/x86_64-linux-gnu/opensips/modules/"
 
 loadmodule "proto_udp.so"
+# REQUIRED even though proto_tcp.so does not exist as a file — TCP is compiled
+# into the core and this line is what enables it. Without it, the tcp socket
+# above is refused at startup with "no transport protocol loaded". A check
+# that verifies every loadmodule has a matching .so on disk reports these two
+# as missing, which is a false failure that has already cost this project a
+# day once.
+loadmodule "proto_tcp.so"
 loadmodule "signaling.so"
 loadmodule "sl.so"
 loadmodule "tm.so"
@@ -74,6 +96,43 @@ loadmodule "httpd.so"
 loadmodule "mi_http.so"
 
 # -- the login ---------------------------------------------------------------
+# -- authenticating OUTWARD, to a carrier that challenges us -----------------
+#
+# Not every carrier authenticates by IP. Plenty issue a username and password
+# and challenge every INVITE with a 407, and a switch that cannot answer that
+# cannot connect to them at all — which rules out most of the small and
+# mid-size providers an operator actually buys from.
+#
+# Credentials come per call from the authorizer, in AVPs, rather than from
+# `modparam("uac_auth","credential",...)`. Static credentials would mean every
+# carrier password lives in this file in clear and every trunk change needs a
+# config reload. This way they stay in the database, and adding a carrier is
+# an API call.
+# BOTH modules, and the split is not obvious. uac_auth.so is a LIBRARY -- it
+# exports uac_auth_bind for other modules and no script function at all. The
+# callable uac_auth() lives in uac.so, which binds to it. Loading only the one
+# named after the feature gives "unknown command <uac_auth>, missing
+# loadmodule?", which points at the module you already loaded.
+loadmodule "uac_auth.so"
+loadmodule "uac.so"
+modparam("uac_auth", "auth_username_avp", "$avp(auth_user)")
+modparam("uac_auth", "auth_password_avp", "$avp(auth_pass)")
+modparam("uac_auth", "auth_realm_avp", "$avp(auth_realm)")
+
+# HOW A REWRITTEN From GETS PUT BACK.
+#
+# uac_replace_from() changes what the carrier sees. Everything coming back —
+# the 200, the BYE, the CANCEL — quotes the value we sent, so without a restore
+# the replies belong to a dialog this switch no longer recognises and the call
+# is dropped at the moment it is answered.
+#
+# "auto" encodes the original in the Record-Route it already adds, so nothing
+# is stored per call: a restart in the middle of a call does not lose the
+# mapping. It needs rr loaded, which it is, and record_route() called, which
+# every call here does.
+modparam("uac", "restore_mode", "auto")
+modparam("uac", "rr_from_store_param", "vsf")
+
 loadmodule "db_text.so"
 loadmodule "auth.so"
 loadmodule "auth_db.so"
@@ -491,7 +550,90 @@ route[authorize] {
     $du = $var(route);
     xlog("L_INFO", "MEGATRON: routing $ci to $var(route)\n");
 
+    # CARRIER CREDENTIALS, KEPT FOR THE 407 THAT MAY FOLLOW.
+    #
+    # Stashed in AVPs rather than acted on now: we do not know yet whether this
+    # carrier will challenge. Sending credentials unprompted tells anyone who
+    # can see the INVITE that we have them, and answering a challenge we were
+    # not given is impossible anyway — the nonce is theirs.
+    #
+    # Deliberately NOT logged. The route and the account are; this is not.
+    $avp(auth_user)  = $json(rsp/route_auth/username);
+    $avp(auth_pass)  = $json(rsp/route_auth/password);
+    $avp(auth_realm) = $json(rsp/route_auth/realm);
+
+    # WHO WE ARE TO THE CARRIER, WHICH IS NOT WHO THE CALLER IS TO US.
+    #
+    # Until here From carries the customer's handle — that is who authenticated
+    # and who gets billed, and the spoof check above has already confirmed it.
+    # The carrier has never heard of that handle. An Asterisk-based provider
+    # looks up the peer by From user, finds nothing, and answers 403 Forbidden
+    # with our digest perfectly correct. This switch collected two of those
+    # before the cause was on the wire rather than in a guess.
+    #
+    # Safe to do here and not earlier: billing reads $au, the authenticated
+    # identity, and the anti-spoof check ran before this line. Rewriting From
+    # after both means the carrier sees an account it recognises while the bill
+    # still lands on the customer who placed the call.
+    #
+    # Null for IP-authenticated carriers, who want the caller's own number.
+    $var(from_user) = $json(rsp/route_from_user);
+    if ($var(from_user) != NULL && $var(from_user) != "") {
+        # Second argument only: the display name is left alone. uac_replace_from
+        # restores the original on the way back, so the customer's softphone
+        # still sees its own call.
+        # The DOMAIN stays ours ($fd). Only the user part is in question: an
+        # account-matching carrier looks up the peer by user and ignores the
+        # domain, while our own realm is a name we actually control and can be
+        # reached back at. Substituting the carrier's domain would mean claiming
+        # to be inside their system, which is both untrue and unnecessary.
+        uac_replace_from("", "sip:$var(from_user)@$fd");
+        xlog("L_INFO", "MEGATRON: presenting $var(from_user) to the carrier for $ci\n");
+    }
+
+    if ($avp(auth_user) != NULL) {
+        # Arm the failure route only when there is something to answer with.
+        # Without credentials a 407 is final and the customer should see it,
+        # rather than the switch silently retrying a challenge it cannot meet.
+        t_on_failure("carrier_auth");
+    }
+
     t_relay();
+}
+
+/**
+ * The carrier challenged us. Answer it once.
+ *
+ * ONCE, and the counter is what makes that true. A carrier that keeps
+ * challenging — because the password is wrong, or the realm is — would
+ * otherwise produce an endless INVITE/407 loop between two machines that both
+ * think they are being helpful. That is a self-inflicted flood, on a trunk,
+ * billed by whoever is upstream.
+ *
+ * A second challenge means the credentials are wrong. Letting it through is
+ * the honest outcome: the customer gets the carrier's own refusal, and the
+ * operator gets a log line naming the trunk rather than a mystery.
+ */
+failure_route[carrier_auth] {
+    if (!t_check_status("40[17]")) exit;
+
+    if ($avp(auth_attempted) != NULL) {
+        xlog("L_ERR", "MEGATRON: carrier rejected our credentials for $ci "
+             "(realm $avp(auth_realm), user $avp(auth_user)) -- check the trunk\n");
+        exit;
+    }
+    $avp(auth_attempted) = 1;
+
+    if (uac_auth()) {
+        xlog("L_INFO", "MEGATRON: answered carrier challenge for $ci\n");
+        # The same failure route stays armed, so the guard above is what stops
+        # a loop rather than the absence of a retry.
+        t_on_failure("carrier_auth");
+        t_relay();
+    } else {
+        xlog("L_ERR", "MEGATRON: could not build a digest for $ci -- no usable "
+             "credentials for realm $avp(auth_realm)\n");
+    }
 }
 
 onreply_route[handle_reply] {

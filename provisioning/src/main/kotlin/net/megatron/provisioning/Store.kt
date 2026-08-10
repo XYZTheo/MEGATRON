@@ -225,7 +225,49 @@ interface Store {
      * reading a log, not to the call.
      */
     fun customerForDid(number: String): Customer?
+
+    /**
+     * A trunk's carrier credentials, for the switch to answer a 407 with.
+     *
+     * SEPARATE FROM [listTrunks] ON PURPOSE. Trunk objects are returned by the
+     * API; this is not, and keeping the password off the type that gets
+     * serialised is what makes "the API never returns it" a structural fact
+     * rather than a habit.
+     *
+     * Null when the trunk authenticates by IP, which is the other half of the
+     * carriers out there.
+     */
+    fun trunkCredentials(trunkId: String): TrunkCredentials?
+
+    /**
+     * Retires a carrier.
+     *
+     * DELETE IS ALLOWED HERE, unlike customers. Nothing in this codebase
+     * deletes a customer, a transaction or a call record, because those are
+     * evidence and an audit trail that can be tidied proves nothing. A trunk
+     * is configuration: it says where calls go today, carries no history, and
+     * an operator who cannot remove a carrier they stopped buying from is
+     * stuck routing to it.
+     *
+     * The CDRs of calls that went over it are untouched — they name the call,
+     * not the trunk row.
+     */
+    fun deleteTrunk(id: String)
 }
+
+/**
+ * What the switch needs to authenticate to a carrier.
+ *
+ * Not `@Serializable`, deliberately: it must not be possible to return this
+ * from an HTTP route by accident. It reaches OpenSIPS through switch-api's
+ * authorize response over loopback — the same channel that already carries the
+ * route — and goes no further.
+ */
+data class TrunkCredentials(
+    val username: String,
+    val password: String,
+    val realm: String,
+)
 
 /**
  * Replay protection for mutating requests.
@@ -655,9 +697,39 @@ class InMemoryStore(
             transport = request.transport,
             enabled = true,
             maxConcurrentCalls = request.maxConcurrentCalls,
+            authUsername = request.authUsername,
+            authRealm = request.authRealm ?: request.host.takeIf { request.authUsername != null },
+            authenticated = request.authPassword != null,
+            register = request.register,
+            priority = request.priority,
+            // See CreateTrunk.fromUser: a credentialed carrier identifies the
+            // call by this, not by the digest alone.
+            fromUser = request.fromUser ?: request.authUsername,
         )
         trunks[trunk.id] = trunk
+        // Held apart from the Trunk object, which is what the API serialises.
+        // Keeping the password off that type is what makes "never returned" a
+        // structural fact rather than a habit.
+        request.authPassword?.let {
+            trunkSecrets[trunk.id] = TrunkCredentials(
+                username = request.authUsername
+                    ?: throw Invalid("a trunk password needs a username to go with it"),
+                password = it,
+                realm = trunk.authRealm ?: request.host,
+            )
+        }
         return trunk
+    }
+
+    private val trunkSecrets = ConcurrentHashMap<String, TrunkCredentials>()
+
+    override fun trunkCredentials(trunkId: String): TrunkCredentials? = trunkSecrets[trunkId]
+
+    override fun deleteTrunk(id: String) {
+        trunks.remove(id) ?: throw NotFound("trunk '$id'")
+        // The credential goes with it. Leaving it behind would keep a
+        // carrier's password in memory for a trunk that no longer exists.
+        trunkSecrets.remove(id)
     }
 
     override fun listTrunks(): List<Trunk> = trunks.values.sortedBy { it.id }

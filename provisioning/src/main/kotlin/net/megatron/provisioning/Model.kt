@@ -217,6 +217,63 @@ data class CreateTrunk(
     val transport: Transport = Transport.UDP,
     @SerialName("max_concurrent_calls") val maxConcurrentCalls: Int? = null,
     val codecs: List<String> = emptyList(),
+
+    // -- credentials, for carriers that challenge instead of allowlisting ----
+    //
+    // Plenty of carriers do not authenticate by IP: they issue a username and
+    // password and challenge every INVITE with a 407. A switch that only does
+    // IP-authenticated trunks cannot connect to them at all, which rules out
+    // most of the small and mid-size providers an operator actually buys from.
+    @SerialName("auth_username") val authUsername: String? = null,
+    /**
+     * Stored recoverable, and it has to be: digest needs the plaintext or HA1,
+     * and here WE are the client answering a challenge whose realm and nonce
+     * the carrier chooses. It is an operator secret — it buys calls at the
+     * operator's own expense — and it is never returned by the API.
+     */
+    @SerialName("auth_password") val authPassword: String? = null,
+    /**
+     * The realm the carrier challenges with. Usually their SIP domain, and not
+     * reliably the same as [host] — which is why it is given rather than
+     * guessed. Defaults to [host] when omitted.
+     */
+    @SerialName("auth_realm") val authRealm: String? = null,
+    /**
+     * Whether to REGISTER to them. Some carriers route inbound calls to
+     * wherever you last registered from; others expect a static address and
+     * never want a REGISTER.
+     */
+    val register: Boolean = false,
+    /**
+     * Lower wins. Default 100, so a trunk added later can be put in front of
+     * the existing ones without renumbering them.
+     *
+     * Selection used to be "the lowest trunk id", which is deterministic and
+     * WRONG: it means the first trunk ever created wins forever, so adding a
+     * carrier changes nothing and an operator's calls keep going to whatever
+     * they set up first. That is indistinguishable from the new trunk being
+     * broken.
+     */
+    val priority: Int = 100,
+    /**
+     * The user part MEGATRON puts in From on calls to this carrier.
+     *
+     * WHO WE ARE TO THE CARRIER IS NOT WHO THE CALLER IS TO US. Our From
+     * carries the customer's handle, because that is who authenticated. The
+     * carrier has never heard of that handle: an Asterisk-based provider looks
+     * up the peer by From user, fails to match, and answers 403 Forbidden even
+     * though the digest we sent was correct. That was not a hypothesis — it is
+     * what a real provider did to this switch, twice, with a valid password.
+     *
+     * Null means "send what the customer sent". That is right for carriers who
+     * authenticate by IP and want to see the originating number; wrong for
+     * carriers who authenticate by account, so for those [SqlStore] falls back
+     * to [authUsername] rather than leaving the operator to discover 403s.
+     *
+     * Magnus and VOS3000 both have this field, under other names. Anyone
+     * connecting a real carrier needs it.
+     */
+    @SerialName("from_user") val fromUser: String? = null,
 )
 
 @Serializable
@@ -231,6 +288,27 @@ data class Trunk(
     val enabled: Boolean,
     @SerialName("max_concurrent_calls") val maxConcurrentCalls: Int? = null,
     @SerialName("active_calls") val activeCalls: Int = 0,
+    @SerialName("auth_username") val authUsername: String? = null,
+    @SerialName("auth_realm") val authRealm: String? = null,
+    /**
+     * WHETHER there is a password, never what it is.
+     *
+     * The operator needs to know a trunk is credentialed — an unauthenticated
+     * trunk against a carrier that expects a login fails every call — and
+     * nobody needs it read back. There is no endpoint that returns it, which
+     * is a property worth keeping rather than a convenience worth adding.
+     */
+    val authenticated: Boolean = false,
+    val register: Boolean = false,
+    /** Lower wins. See [CreateTrunk.priority]. */
+    val priority: Int = 100,
+    /**
+     * What we present in From to this carrier. See [CreateTrunk.fromUser].
+     *
+     * Returned, unlike the password: it is not a secret, and an operator
+     * debugging a 403 needs to see it without guessing.
+     */
+    @SerialName("from_user") val fromUser: String? = null,
 )
 
 /** RFC 9457 problem details. The only error shape this API emits. */

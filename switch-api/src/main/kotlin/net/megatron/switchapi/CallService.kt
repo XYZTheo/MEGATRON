@@ -91,12 +91,17 @@ class CallService(
         //
         // 503, not 404: "we have no carrier configured" is our fault, and a
         // 404 would tell the caller their number was invalid.
-        val route = outboundRoute()
+        // Chosen ONCE. This used to call outboundTrunk() again further down for
+        // the credentials, so the route and the credentials were two separate
+        // reads of a table another request can change in between -- long
+        // enough to send carrier A's password to carrier B.
+        val trunk = outboundTrunk()
             ?: return reject(
                 Refusal.NO_RATE_FOR_DESTINATION,
                 "no enabled outbound trunk is configured",
                 503,
             )
+        val route = routeTo(trunk)
 
         // The Call-ID is the reservation id. A retransmitted INVITE therefore
         // cannot reserve twice — SIP retransmits by design, and without this
@@ -119,6 +124,10 @@ class CallService(
                     prefix = decision.prefix,
                     reservedMicros = decision.reserved.value,
                     route = route,
+                    routeAuth = store.trunkCredentials(trunk.id)?.let {
+                        RouteAuth(it.username, it.password, it.realm)
+                    },
+                    routeFromUser = trunk.fromUser,
                 )
             }
 
@@ -244,17 +253,26 @@ class CallService(
      * carrier is having an outage must stop receiving calls now, not at the
      * next restart.
      */
-    private fun outboundRoute(): String? {
-        val trunk = store.listTrunks()
+    /** The chosen carrier, or null when none is configured. */
+    private fun outboundTrunk(): net.megatron.provisioning.Trunk? =
+        store.listTrunks()
             .filter { it.enabled && it.direction == net.megatron.provisioning.TrunkDirection.OUTBOUND }
-            .minByOrNull { it.id }
-            ?: return null
+            // PRIORITY FIRST, id only to break a tie.
+            //
+            // This was `minByOrNull { it.id }` -- deterministic, and the wrong
+            // determinism: the FIRST trunk ever created won forever, so adding
+            // a carrier changed nothing and every call kept going to whatever
+            // was set up first. That is indistinguishable from the new trunk
+            // being broken, and it is exactly what happened the first time a
+            // real provider was added beside a leftover test one.
+            .minWithOrNull(compareBy({ it.priority }, { it.id }))
+
+    private fun routeTo(trunk: net.megatron.provisioning.Trunk): String =
         // The transport is named explicitly. Left off, OpenSIPS applies its
         // own default, which is UDP — so a TLS trunk would silently be dialled
         // in clear, which is both a security failure and one the carrier
         // reports as "we never received your call".
-        return "sip:${trunk.host}:${trunk.port};transport=${trunk.transport.name.lowercase()}"
-    }
+        "sip:${trunk.host}:${trunk.port};transport=${trunk.transport.name.lowercase()}"
 
     private fun rateTableFor(planId: String): RateTable? {
         val plan = store.listPlans().firstOrNull { it.id == planId } ?: return null

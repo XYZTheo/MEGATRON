@@ -55,6 +55,14 @@ table inet megatron {
         udp dport 5060 ct state new limit rate 100/second burst 200 packets accept
         udp dport 5060 accept
 
+        # TCP too. A customer configured for TCP against a firewall that only
+        # opens UDP gets no error at all — the connection just never
+        # establishes, which reads as "your server is down". Rate-limited on
+        # NEW connections only, so an established call's signalling is never
+        # throttled mid-conversation.
+        tcp dport 5060 ct state new limit rate 50/second burst 100 packets accept
+        tcp dport 5060 accept
+
         # RTP. rtpengine allocates inside this range and nothing else lives
         # here, so it is opened wholesale rather than tracked — conntrack
         # entries for media streams are pure overhead on a switch.

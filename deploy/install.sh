@@ -348,13 +348,25 @@ echo "firewall loaded"
 step "9/9  verify"
 
 fail=0
+
+# CHECKED WITH RETRIES, because "not up yet" is not "broken".
+#
+# The first version asked once, a few seconds after restarting everything, and
+# reported FAIL for a service that was mid-startup — on a restart the outgoing
+# process still holds the SQLite database, so the incoming one legitimately
+# fails its first attempt and succeeds on the next. An installer that calls
+# that a failure teaches the operator to ignore its own verification, which is
+# worse than not verifying.
 check() {
-    if eval "$2" >/dev/null 2>&1; then
-        echo "  ok    $1"
-    else
-        echo "  FAIL  $1"
-        fail=1
-    fi
+    for _ in $(seq 1 15); do
+        if eval "$2" >/dev/null 2>&1; then
+            echo "  ok    $1"
+            return
+        fi
+        sleep 2
+    done
+    echo "  FAIL  $1"
+    fail=1
 }
 
 check "provisioning answers"  "curl -sf -m 5 -H 'Authorization: Bearer $(grep MEGATRON_OPERATOR_TOKEN "$SECRETS" | cut -d= -f2)' http://127.0.0.1:8081/v1/customers"

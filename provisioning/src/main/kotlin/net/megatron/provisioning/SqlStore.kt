@@ -103,22 +103,73 @@ class SqlStore(
      * a database somebody cared about.
      */
     private fun migrate() {
-        val existing = query("PRAGMA table_info(customers)") { rs ->
-            buildSet { while (rs.next()) add(rs.getString("name").lowercase()) }
-        }
-        // Matches the DEFAULT in schema.sql, so a migrated row and a freshly
-        // created one are indistinguishable. A blank HA1 means "no working
-        // login yet", and SubscriberExport skips those rather than writing a
-        // credential everybody in that position would share.
-        if ("sip_ha1" !in existing) {
-            update("ALTER TABLE customers ADD COLUMN sip_ha1 TEXT NOT NULL DEFAULT ''")
+        // EVERY ADDITIVE COLUMN THIS SCHEMA HAS EVER GAINED, in one list.
+        //
+        // The first version of this hardcoded a single column, and the next
+        // feature to add one (trunk credentials) silently did not migrate —
+        // the table already existed, CREATE TABLE IF NOT EXISTS did nothing,
+        // and INSERT failed at runtime against a column that was only ever
+        // present on fresh databases. That is the same defect twice, so it is
+        // a list now rather than a special case.
+        //
+        // Additive only. Nothing here drops or rewrites a column, because a
+        // migration that can destroy data will eventually meet a database
+        // somebody cared about.
+        val additions = listOf(
+            Addition("customers", "sip_ha1", "TEXT NOT NULL DEFAULT ''",
+                "Existing customers have no SIP digest credential until their password " +
+                    "is rotated, and cannot register until then."),
+            Addition("trunks", "auth_username", "TEXT", null),
+            Addition("trunks", "auth_password", "TEXT", null),
+            Addition("trunks", "auth_realm", "TEXT", null),
+            Addition("trunks", "register", "INTEGER NOT NULL DEFAULT 0", null),
+            Addition("trunks", "priority", "INTEGER NOT NULL DEFAULT 100", null),
+            // Backfilled to the account name: an existing credentialed trunk
+            // was already presenting the wrong From, so leaving it NULL would
+            // preserve the bug across the upgrade that fixes it.
+            Addition(
+                "trunks", "from_user", "TEXT",
+                "Credentialed trunks now present their account name in From.",
+                backfill = "UPDATE trunks SET from_user = auth_username " +
+                    "WHERE auth_username IS NOT NULL",
+            ),
+        )
+
+        for (addition in additions) {
+            val columns = query("PRAGMA table_info(${addition.table})") { rs ->
+                buildSet { while (rs.next()) add(rs.getString("name").lowercase()) }
+            }
+            // An empty set means the table does not exist yet — schema.sql
+            // will have just created it with the column already present.
+            if (columns.isEmpty() || addition.column in columns) continue
+            update("ALTER TABLE ${addition.table} ADD COLUMN ${addition.column} ${addition.type}")
+            val filled = addition.backfill?.let { update(it) } ?: 0
             System.err.println(
-                "migrated: added customers.sip_ha1. Existing customers have no SIP digest " +
-                    "credential until their password is rotated, and cannot register until " +
-                    "then — rotate via POST /v1/customers/{id}/credentials."
+                "migrated: added ${addition.table}.${addition.column}" +
+                    (if (filled > 0) " (backfilled $filled row(s))" else "") +
+                    (addition.note?.let { ". $it" } ?: "")
             )
         }
     }
+
+    private data class Addition(
+        val table: String,
+        val column: String,
+        val type: String,
+        val note: String?,
+        /**
+         * Optional statement run once, immediately after the column is added,
+         * to give existing rows a sensible value.
+         *
+         * A column's DEFAULT only covers rows written afterwards. Where the
+         * right value for an existing row is derived from another column, the
+         * choice is this or leaving every pre-upgrade row wrong — and a
+         * migration that only fixes future rows is how a bug outlives its fix.
+         *
+         * Still additive: it may only fill in the column just added.
+         */
+        val backfill: String? = null,
+    )
 
     /**
      * Runs [block] as one atomic unit.
@@ -679,6 +730,9 @@ class SqlStore(
         }
         if (request.port !in 1..65535) throw Invalid("port must be 1-65535")
 
+        if (request.authPassword != null && request.authUsername == null) {
+            throw Invalid("a trunk password needs a username to go with it")
+        }
         val trunk = Trunk(
             id = nextId("trunk"),
             name = request.name,
@@ -689,13 +743,35 @@ class SqlStore(
             transport = request.transport,
             enabled = true,
             maxConcurrentCalls = request.maxConcurrentCalls,
+            authUsername = request.authUsername,
+            // Defaults to the host: most carriers challenge with their own SIP
+            // domain, and that is usually what you were told to connect to.
+            // Stored rather than derived at call time, because "usually" is
+            // not "always" and a wrong realm fails every call with a digest
+            // the carrier reads as a bad password.
+            authRealm = request.authRealm ?: request.host.takeIf { request.authUsername != null },
+            authenticated = request.authPassword != null,
+            register = request.register,
+            priority = request.priority,
+            // DEFAULTS TO THE ACCOUNT NAME ON A CREDENTIALED TRUNK, and the
+            // default is the whole point. A carrier that issues a username
+            // matches the call to that account by the From user; ours would
+            // carry the customer's handle, which means nothing to them, and
+            // they answer 403 with the password perfectly correct. Making the
+            // operator discover that for themselves is not a default, it is a
+            // trap. IP-authenticated trunks get null and pass the caller
+            // through, which is what those carriers want.
+            fromUser = request.fromUser ?: request.authUsername,
         )
         update(
             "INSERT INTO trunks (id, name, direction, host, port, remote_ips, transport, " +
-                "enabled, max_concurrent_calls) VALUES (?,?,?,?,?,?,?,?,?)",
+                "enabled, max_concurrent_calls, auth_username, auth_password, auth_realm, " +
+                "register, priority, from_user) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             trunk.id, trunk.name, trunk.direction.name, trunk.host, trunk.port,
             trunk.remoteIps.joinToString(","), trunk.transport.name, 1,
-            trunk.maxConcurrentCalls,
+            trunk.maxConcurrentCalls, request.authUsername, request.authPassword,
+            trunk.authRealm, if (request.register) 1 else 0, request.priority,
+            trunk.fromUser,
         )
         return trunk
     }
@@ -994,6 +1070,32 @@ class SqlStore(
             .digest("$username:$realm:$password".toByteArray())
             .joinToString("") { "%02x".format(it) }
 
+    /**
+     * Read separately from [listTrunks] on purpose: the password is not on the
+     * type the API serialises, so "never returned" is structural rather than a
+     * habit somebody has to remember.
+     */
+    override fun trunkCredentials(trunkId: String): TrunkCredentials? = query(
+        "SELECT auth_username, auth_password, auth_realm, host FROM trunks WHERE id = ?",
+        trunkId,
+    ) { rs ->
+        if (!rs.next()) return@query null
+        val username = rs.getString("auth_username") ?: return@query null
+        val password = rs.getString("auth_password") ?: return@query null
+        TrunkCredentials(
+            username = username,
+            password = password,
+            realm = rs.getString("auth_realm") ?: rs.getString("host"),
+        )
+    }
+
+    override fun deleteTrunk(id: String) {
+        // The row holds the carrier's password, so this is also the only way an
+        // operator can get that password off the box. A soft "enabled = 0" would
+        // leave it sitting in the table forever.
+        if (update("DELETE FROM trunks WHERE id = ?", id) == 0) throw NotFound("trunk '$id'")
+    }
+
     override fun listTrunks(): List<Trunk> =
         query("SELECT * FROM trunks ORDER BY id") { rs ->
             buildList {
@@ -1009,6 +1111,14 @@ class SqlStore(
                         enabled = rs.getInt("enabled") == 1,
                         maxConcurrentCalls = rs.getInt("max_concurrent_calls")
                             .let { if (rs.wasNull()) null else it },
+                        authUsername = rs.getString("auth_username"),
+                        authRealm = rs.getString("auth_realm"),
+                        // WHETHER there is a password, never what it is. This
+                        // is the type the API serialises.
+                        authenticated = rs.getString("auth_password") != null,
+                        register = rs.getInt("register") == 1,
+                        priority = rs.getInt("priority"),
+                        fromUser = rs.getString("from_user"),
                     )
                 )
             }

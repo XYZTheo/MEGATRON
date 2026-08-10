@@ -472,6 +472,16 @@ fun Application.provisioningModule(
                     call.idempotencyKey()
                     call.respond(HttpStatusCode.Created, store.createTrunk(call.receive()))
                 }
+                /**
+                 * Retiring a carrier. Operator-only, like everything else under
+                 * /trunks, and it takes the stored carrier password with it.
+                 */
+                delete("/{id}") {
+                    call.requireOperator(authenticator)
+                    val id = call.parameters["id"] ?: throw Invalid("id required")
+                    store.deleteTrunk(id)
+                    call.respond(HttpStatusCode.NoContent)
+                }
             }
 
             // ---- customer scope ------------------------------------------

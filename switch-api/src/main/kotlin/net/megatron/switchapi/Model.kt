@@ -54,6 +54,33 @@ data class AuthorizeResponse(
      * settled — so the authorizer refuses instead.
      */
     val route: String? = null,
+    /**
+     * Credentials for a carrier that challenges instead of allowlisting.
+     *
+     * Absent for IP-authenticated trunks, which is the other half of them.
+     *
+     * THIS CARRIES A PASSWORD, and it is the only response in the system that
+     * does. It is defensible only because of where it goes: switch-api binds
+     * loopback and refuses to start on a public interface, and the recipient
+     * is the switch on the same box, which is about to send that password to
+     * the carrier anyway. It is an operator secret — it buys calls at the
+     * operator's own expense — not a customer's.
+     *
+     * It is NOT logged: the switch's own log line prints the route and the
+     * account, never this.
+     */
+    @SerialName("route_auth") val routeAuth: RouteAuth? = null,
+    /**
+     * The user part to put in From on the leg to the carrier, or null to send
+     * the caller's own through untouched.
+     *
+     * SEPARATE FROM [routeAuth] ON PURPOSE. It is presentation, not a secret:
+     * it is logged, it is returned by the trunks API, and an IP-authenticated
+     * trunk with no credentials at all can still need it. Folding it into the
+     * credential object would make a non-secret inherit a secret's handling
+     * and tie it to trunks that happen to have a password.
+     */
+    @SerialName("route_from_user") val routeFromUser: String? = null,
     /** Machine-readable refusal, for the switch to map onto a SIP response. */
     val reason: String? = null,
     /**
@@ -110,6 +137,21 @@ data class EndSessionResponse(
      * being unable to tell is how it loses several.
      */
     @SerialName("no_media") val noMedia: Boolean = false,
+)
+
+/**
+ * What the switch needs to answer a carrier's 407.
+ *
+ * The realm is included rather than derived from the host: carriers challenge
+ * with their own SIP domain, which is not reliably what you were told to
+ * connect to, and a wrong realm produces a digest the carrier reads as a bad
+ * password — a failure that looks like wrong credentials and is not.
+ */
+@Serializable
+data class RouteAuth(
+    val username: String,
+    val password: String,
+    val realm: String,
 )
 
 /** A completed call, ready for the CDR pipeline. */
